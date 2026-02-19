@@ -89,3 +89,15 @@ fn test_seq_not_found() {
     let mgr = BlockManager::new(10, 16);
     assert!(mgr.get_block_table(999).is_err());
 }
+
+#[test]
+fn test_allocate_seq_duplicate_frees_old_blocks() {
+    let mut mgr = BlockManager::new(10, 4);
+    mgr.allocate_seq(1, 8).unwrap(); // 2 blocks
+    assert_eq!(mgr.free_count(), 8);
+
+    // Re-allocate same seq_id — old 2 blocks should be freed before allocating new ones
+    mgr.allocate_seq(1, 4).unwrap(); // 1 block
+    assert_eq!(mgr.free_count(), 9); // 10 - 1 = 9, not 10 - 3 = 7
+    assert_eq!(mgr.seq_len(1).unwrap(), 4);
+}

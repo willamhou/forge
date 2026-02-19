@@ -172,3 +172,90 @@ fn test_naive_attention_multi_head_layout() {
     assert!((result[2] - 30.0).abs() < 1e-3, "got {} expected 30.0", result[2]);
     assert!((result[3] - 40.0).abs() < 1e-3, "got {} expected 40.0", result[3]);
 }
+
+#[test]
+fn test_naive_attention_multi_head_multi_token() {
+    let backend = CudaBackend::new(0).unwrap();
+    // This is the critical test: seq_len > 1 AND num_heads > 1.
+    // Q, K, V: [1, 2, 2, 2] — batch=1, seq_len=2, heads=2, head_dim=2
+    //
+    // Memory layout (token-major): [t0h0, t0h1, t1h0, t1h1]
+    // V values chosen so each head+token combo is unique and verifiable.
+    //
+    // V: t0h0=[1,2], t0h1=[3,4], t1h0=[5,6], t1h1=[7,8]
+    // Using identity-like Q and K so softmax is uniform (kv_len=2 per head).
+
+    // Q: all ones — each head attends uniformly to both K tokens
+    let q = backend
+        .copy_from_host_f32(
+            &[
+                1.0, 1.0, // t0h0
+                1.0, 1.0, // t0h1
+                1.0, 1.0, // t1h0
+                1.0, 1.0, // t1h1
+            ],
+            &[1, 2, 2, 2],
+        )
+        .unwrap();
+    let k = backend
+        .copy_from_host_f32(
+            &[
+                1.0, 1.0, // t0h0
+                1.0, 1.0, // t0h1
+                1.0, 1.0, // t1h0
+                1.0, 1.0, // t1h1
+            ],
+            &[1, 2, 2, 2],
+        )
+        .unwrap();
+    let v = backend
+        .copy_from_host_f32(
+            &[
+                1.0, 2.0, // t0h0
+                3.0, 4.0, // t0h1
+                5.0, 6.0, // t1h0
+                7.0, 8.0, // t1h1
+            ],
+            &[1, 2, 2, 2],
+        )
+        .unwrap();
+
+    let scale = 1.0 / (2.0f32).sqrt();
+    let out = naive_attention(&backend, &q, &k, &v, scale).unwrap();
+    assert_eq!(out.shape(), &[1, 2, 2, 2]);
+
+    let result = backend.copy_to_host_f32(&out).unwrap();
+    // Head 0 sees V tokens: t0h0=[1,2], t1h0=[5,6] → uniform attn → mean = [3,4]
+    // Head 1 sees V tokens: t0h1=[3,4], t1h1=[7,8] → uniform attn → mean = [5,6]
+    // Both query tokens get the same result (uniform Q and K).
+    //
+    // Output layout [t0h0, t0h1, t1h0, t1h1]:
+    // t0h0 = [3,4], t0h1 = [5,6], t1h0 = [3,4], t1h1 = [5,6]
+    let expected = [3.0, 4.0, 5.0, 6.0, 3.0, 4.0, 5.0, 6.0];
+    for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-2,
+            "index {i}: got {got}, expected {exp}"
+        );
+    }
+}
+
+#[test]
+fn test_naive_attention_invalid_head_ratio() {
+    let backend = CudaBackend::new(0).unwrap();
+    // num_heads=3, num_kv_heads=2 — not evenly divisible, should error
+    let q = backend
+        .copy_from_host_f32(&[0.0; 12], &[1, 1, 3, 4])
+        .unwrap();
+    let k = backend
+        .copy_from_host_f32(&[0.0; 8], &[1, 1, 2, 4])
+        .unwrap();
+    let v = backend
+        .copy_from_host_f32(&[0.0; 8], &[1, 1, 2, 4])
+        .unwrap();
+
+    let result = naive_attention(&backend, &q, &k, &v, 1.0);
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(err_msg.contains("multiple"), "got: {err_msg}");
+}

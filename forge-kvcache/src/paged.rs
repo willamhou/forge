@@ -66,6 +66,12 @@ impl BlockManager {
     // Sequence-level operations
 
     pub fn allocate_seq(&mut self, seq_id: u64, initial_tokens: usize) -> Result<()> {
+        // Free existing blocks if this seq_id was already allocated (prevent leak)
+        if let Some(old_blocks) = self.seq_blocks.remove(&seq_id) {
+            let block_ids: Vec<usize> = old_blocks.into_iter().map(|(id, _)| id).collect();
+            self.free(&block_ids);
+        }
+
         let num_blocks = ((initial_tokens + self.block_size - 1) / self.block_size).max(1);
         let blocks = self.allocate(num_blocks)?;
         let mut remaining = initial_tokens;

@@ -750,18 +750,21 @@ impl Backend for CudaBackend {
             1
         };
 
-        // Validate inner dimensions match
+        // Validate all non-concat dimensions match element-wise
         for t in tensors.iter().skip(1) {
-            let t_inner: usize = if ndim > 1 {
-                t.shape()[1..].iter().product()
-            } else {
-                1
-            };
-            if t_inner != inner_size {
+            if t.shape().len() != ndim {
                 return Err(ForgeError::ShapeMismatch {
                     expected: tensors[0].shape().to_vec(),
                     got: t.shape().to_vec(),
                 });
+            }
+            for d in 1..ndim {
+                if t.shape()[d] != tensors[0].shape()[d] {
+                    return Err(ForgeError::ShapeMismatch {
+                        expected: tensors[0].shape().to_vec(),
+                        got: t.shape().to_vec(),
+                    });
+                }
             }
         }
 
