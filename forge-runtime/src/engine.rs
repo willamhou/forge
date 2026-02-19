@@ -1,12 +1,14 @@
 //! Engine: main inference runtime loop that orchestrates scheduling,
 //! model forward passes, and token sampling.
 
+use std::collections::HashMap;
+
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 use forge_core::{
-    Backend, FinishReason, KvCache, Model, ModelInput, Result, ScheduledSeq, Scheduler,
-    SeqMetadata,
+    Backend, FinishReason, InferenceRequest, KvCache, Model, ModelInput, Result, ScheduledSeq,
+    Scheduler, SeqMetadata,
 };
 
 use crate::sampling::CpuSampler;
@@ -29,6 +31,13 @@ pub enum EngineEvent {
     },
 }
 
+/// A request submitted to the engine via the request channel.
+pub struct EngineRequest {
+    pub inference_req: InferenceRequest,
+    /// Per-request channel for sending events back to the caller.
+    pub event_tx: mpsc::Sender<EngineEvent>,
+}
+
 /// The inference engine: ties together model, scheduler, KV cache, and sampler.
 pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     model: M,
@@ -36,7 +45,10 @@ pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     scheduler: Box<dyn Scheduler>,
     kv_cache: Box<dyn KvCache<T = B::Tensor>>,
     sampler: CpuSampler,
-    event_tx: mpsc::Sender<EngineEvent>,
+    /// Incoming request channel.
+    request_rx: mpsc::Receiver<EngineRequest>,
+    /// Per-sequence event senders (seq_id → event_tx).
+    event_senders: HashMap<u64, mpsc::Sender<EngineEvent>>,
 }
 
 impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
@@ -45,7 +57,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         backend: B,
         scheduler: Box<dyn Scheduler>,
         kv_cache: Box<dyn KvCache<T = B::Tensor>>,
-        event_tx: mpsc::Sender<EngineEvent>,
+        request_rx: mpsc::Receiver<EngineRequest>,
     ) -> Self {
         Self {
             model,
@@ -53,23 +65,33 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             scheduler,
             kv_cache,
             sampler: CpuSampler,
-            event_tx,
+            request_rx,
+            event_senders: HashMap::new(),
         }
     }
 
-    /// Access the scheduler (e.g., for enqueuing requests from the API layer).
-    pub fn scheduler_mut(&mut self) -> &mut dyn Scheduler {
-        &mut *self.scheduler
-    }
-
-    /// Main engine loop. Runs until the sender side is dropped.
+    /// Main engine loop. Runs until the request channel is closed.
     pub async fn run(&mut self) -> Result<()> {
         loop {
+            // Drain incoming requests (non-blocking)
+            let drained = self.drain_requests();
+
             let cache_usage = self.kv_cache.usage();
             let batch = self.scheduler.schedule(&cache_usage)?;
 
             if batch.is_empty() {
-                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                if drained == 0 {
+                    // No work and no new requests — wait for a request or short timeout
+                    tokio::select! {
+                        req = self.request_rx.recv() => {
+                            match req {
+                                Some(r) => self.enqueue_request(r),
+                                None => return Ok(()), // channel closed, shutdown
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
                 continue;
             }
 
@@ -79,23 +101,67 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             }
 
             // Phase 1: process one sequence at a time
-            let all_seqs: Vec<&ScheduledSeq> = batch
+            let all_seqs: Vec<ScheduledSeq> = batch
                 .prefill_seqs
-                .iter()
-                .chain(batch.decode_seqs.iter())
+                .into_iter()
+                .chain(batch.decode_seqs)
                 .collect();
 
             for seq in &all_seqs {
                 if let Err(e) = self.process_sequence(seq).await {
                     error!(seq_id = seq.seq_id, error = %e, "sequence processing failed");
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::Error {
+                    self.send_event(
+                        seq.seq_id,
+                        EngineEvent::Error {
                             seq_id: seq.seq_id,
                             error: e.to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
+                    // Clean up failed sequence
+                    let _ = self.scheduler.cancel(seq.seq_id);
+                    let _ = self.kv_cache.free(seq.seq_id);
+                    self.event_senders.remove(&seq.seq_id);
                 }
+            }
+        }
+    }
+
+    /// Drain all pending requests from the channel (non-blocking).
+    fn drain_requests(&mut self) -> usize {
+        let mut count = 0;
+        while let Ok(req) = self.request_rx.try_recv() {
+            self.enqueue_request(req);
+            count += 1;
+        }
+        count
+    }
+
+    /// Enqueue a request into the scheduler and register its event sender.
+    fn enqueue_request(&mut self, req: EngineRequest) {
+        match self.scheduler.enqueue(req.inference_req) {
+            Ok(handle) => {
+                self.event_senders.insert(handle.seq_id, req.event_tx);
+            }
+            Err(e) => {
+                // Best-effort error notification
+                let _ = req.event_tx.try_send(EngineEvent::Error {
+                    seq_id: 0,
+                    error: format!("failed to enqueue: {e}"),
+                });
+            }
+        }
+    }
+
+    /// Send an event to a specific sequence's consumer. If the consumer has
+    /// disconnected, cancel the sequence and clean up resources.
+    async fn send_event(&mut self, seq_id: u64, event: EngineEvent) {
+        if let Some(tx) = self.event_senders.get(&seq_id) {
+            if tx.send(event).await.is_err() {
+                warn!(seq_id, "event receiver dropped, cancelling sequence");
+                let _ = self.scheduler.cancel(seq_id);
+                let _ = self.kv_cache.free(seq_id);
+                self.event_senders.remove(&seq_id);
             }
         }
     }
@@ -135,22 +201,25 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             };
             self.scheduler.finish(seq.seq_id, reason)?;
             self.kv_cache.free(seq.seq_id)?;
-            let _ = self
-                .event_tx
-                .send(EngineEvent::Finish {
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Finish {
                     seq_id: seq.seq_id,
                     reason,
-                })
-                .await;
+                },
+            )
+            .await;
+            self.event_senders.remove(&seq.seq_id);
         } else {
-            let _ = self
-                .event_tx
-                .send(EngineEvent::Token {
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Token {
                     seq_id: seq.seq_id,
                     token_id,
-                    text: None, // decoded by the server/transport layer
-                })
-                .await;
+                    text: None, // decoded by the server layer
+                },
+            )
+            .await;
         }
 
         Ok(())
@@ -163,8 +232,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let (prompt_len, generated_len) = if seq.is_prefill {
             (seq.token_ids.len(), 0)
         } else {
-            // position_offset = prompt_len + generated_len - 1
-            // generated_len = gen_count (tokens generated so far, before this step)
+            // Invariant: position_offset = prompt_len + generated_len - 1
             let prompt_len = seq.position_offset + 1 - gen_count;
             (prompt_len, gen_count)
         };

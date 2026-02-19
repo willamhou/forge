@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -12,7 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 
 use forge_core::{FinishReason, InferenceRequest, SamplingParams};
-use forge_runtime::engine::EngineEvent;
+use forge_runtime::engine::{EngineEvent, EngineRequest};
 
 use crate::chat_template::ChatTemplate;
 use crate::tokenizer::ForgeTokenizer;
@@ -25,14 +26,7 @@ pub struct AppState {
     pub tokenizer: ForgeTokenizer,
     pub chat_template: ChatTemplate,
     /// Channel to submit requests to the engine.
-    pub request_tx: mpsc::Sender<SubmitRequest>,
-}
-
-/// A request submitted to the engine, with a channel for sending events back.
-pub struct SubmitRequest {
-    pub inference_req: InferenceRequest,
-    /// Engine sends events into this channel; the HTTP handler holds the receiver.
-    pub event_tx: mpsc::Sender<EngineEvent>,
+    pub request_tx: mpsc::Sender<EngineRequest>,
 }
 
 /// POST /v1/chat/completions
@@ -52,10 +46,13 @@ pub async fn chat_completions(
     let prompt = match state.chat_template.apply(&messages, true) {
         Ok(p) => p,
         Err(e) => {
-            return Json(serde_json::json!({
-                "error": { "message": format!("template error: {e}"), "type": "invalid_request_error" }
-            }))
-            .into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": format!("template error: {e}"), "type": "invalid_request_error" }
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -63,10 +60,13 @@ pub async fn chat_completions(
     let prompt_tokens = match state.tokenizer.encode(&prompt) {
         Ok(t) => t,
         Err(e) => {
-            return Json(serde_json::json!({
-                "error": { "message": format!("tokenizer error: {e}"), "type": "invalid_request_error" }
-            }))
-            .into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": format!("tokenizer error: {e}"), "type": "invalid_request_error" }
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -99,6 +99,9 @@ pub async fn chat_completions(
     if let Some(fp) = req.frequency_penalty {
         params.frequency_penalty = fp;
     }
+    if let Some(stop_strs) = req.stop {
+        params.stop_strings = stop_strs;
+    }
     // Add EOS token to stop list
     params
         .stop_token_ids
@@ -113,21 +116,24 @@ pub async fn chat_completions(
     // Create per-request event channel
     let (event_tx, event_rx) = mpsc::channel(256);
 
-    let submit = SubmitRequest {
+    let engine_req = EngineRequest {
         inference_req,
         event_tx,
     };
 
-    if state.request_tx.send(submit).await.is_err() {
-        return Json(serde_json::json!({
-            "error": { "message": "engine unavailable", "type": "server_error" }
-        }))
-        .into_response();
+    if state.request_tx.send(engine_req).await.is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": { "message": "engine unavailable", "type": "server_error" }
+            })),
+        )
+            .into_response();
     }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
 
     if is_stream {
@@ -154,9 +160,10 @@ async fn handle_non_streaming(
     model: String,
     prompt_len: usize,
     created: u64,
-) -> Json<ChatCompletionResponse> {
+) -> Response {
     let mut token_ids = Vec::new();
     let mut finish_reason = None;
+    let mut engine_error = None;
 
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -168,11 +175,21 @@ async fn handle_non_streaming(
                 break;
             }
             EngineEvent::Error { error, .. } => {
-                // Return what we have with an error finish
                 error!("engine error: {error}");
+                engine_error = Some(error);
                 break;
             }
         }
+    }
+
+    if let Some(err) = engine_error {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": { "message": err, "type": "server_error" }
+            })),
+        )
+            .into_response();
     }
 
     let text = tokenizer.decode(&token_ids).unwrap_or_default();
@@ -204,6 +221,7 @@ async fn handle_non_streaming(
             total_tokens: prompt_len + completion_tokens,
         },
     })
+    .into_response()
 }
 
 /// Stream tokens as SSE events.
@@ -232,8 +250,9 @@ fn handle_streaming(
             }],
         };
 
-        let data = serde_json::to_string(&initial_chunk).unwrap();
-        let _ = sse_tx.send(Ok(Event::default().data(data))).await;
+        if let Ok(data) = serde_json::to_string(&initial_chunk) {
+            let _ = sse_tx.send(Ok(Event::default().data(data))).await;
+        }
 
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -256,9 +275,10 @@ fn handle_streaming(
                             finish_reason: None,
                         }],
                     };
-                    let data = serde_json::to_string(&chunk).unwrap();
-                    if sse_tx.send(Ok(Event::default().data(data))).await.is_err() {
-                        break;
+                    if let Ok(data) = serde_json::to_string(&chunk) {
+                        if sse_tx.send(Ok(Event::default().data(data))).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 EngineEvent::Finish { reason, .. } => {
@@ -281,9 +301,9 @@ fn handle_streaming(
                             finish_reason: Some(reason_str.to_string()),
                         }],
                     };
-                    let data = serde_json::to_string(&chunk).unwrap();
-                    let _ = sse_tx.send(Ok(Event::default().data(data))).await;
-                    // Send [DONE]
+                    if let Ok(data) = serde_json::to_string(&chunk) {
+                        let _ = sse_tx.send(Ok(Event::default().data(data))).await;
+                    }
                     let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
                     break;
                 }
