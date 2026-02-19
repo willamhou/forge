@@ -140,3 +140,35 @@ fn test_naive_attention_single_head() {
     assert!(result[0] < result[4], "first token output should be closer to V[0]");
     assert!(result.len() == 8);
 }
+
+#[test]
+fn test_naive_attention_multi_head_layout() {
+    let backend = CudaBackend::new(0).unwrap();
+    // Q, K, V: [1, 1, 2, 2] — batch=1, seq_len=1, heads=2, head_dim=2
+    // Single token, 2 heads — tests that output is [batch, seq_len, num_heads, head_dim]
+    //
+    // Q layout [1,1,2,2]: token0_head0=[1,0], token0_head1=[0,1]
+    // K layout [1,1,2,2]: token0_head0=[1,0], token0_head1=[0,1]
+    // V layout [1,1,2,2]: token0_head0=[10,20], token0_head1=[30,40]
+    let q = backend
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
+        .unwrap();
+    let k = backend
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
+        .unwrap();
+    let v = backend
+        .copy_from_host_f32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 2, 2])
+        .unwrap();
+
+    let scale = 1.0 / (2.0f32).sqrt();
+    let out = naive_attention(&backend, &q, &k, &v, scale).unwrap();
+    assert_eq!(out.shape(), &[1, 1, 2, 2]);
+
+    let result = backend.copy_to_host_f32(&out).unwrap();
+    // With single KV token per head, softmax is trivially 1.0, so output = V
+    // Output layout should be: [token0_head0, token0_head1] = [10, 20, 30, 40]
+    assert!((result[0] - 10.0).abs() < 1e-3, "got {} expected 10.0", result[0]);
+    assert!((result[1] - 20.0).abs() < 1e-3, "got {} expected 20.0", result[1]);
+    assert!((result[2] - 30.0).abs() < 1e-3, "got {} expected 30.0", result[2]);
+    assert!((result[3] - 40.0).abs() < 1e-3, "got {} expected 40.0", result[3]);
+}

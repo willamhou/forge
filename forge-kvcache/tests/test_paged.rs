@@ -35,6 +35,7 @@ fn test_seq_allocate_and_free() {
     let mut mgr = BlockManager::new(100, 16);
     mgr.allocate_seq(1, 32).unwrap(); // 2 blocks for 32 tokens
     assert_eq!(mgr.free_count(), 98);
+    assert_eq!(mgr.seq_len(1).unwrap(), 32); // fill_counts should reflect initial_tokens
 
     let table = mgr.get_block_table(1).unwrap();
     assert_eq!(table.len(), 2);
@@ -44,12 +45,22 @@ fn test_seq_allocate_and_free() {
 }
 
 #[test]
+fn test_seq_allocate_initial_tokens() {
+    let mut mgr = BlockManager::new(100, 4); // block_size = 4
+    mgr.allocate_seq(1, 6).unwrap(); // 6 tokens -> 2 blocks (4 + 2)
+    assert_eq!(mgr.seq_len(1).unwrap(), 6);
+    assert_eq!(mgr.free_count(), 98);
+}
+
+#[test]
 fn test_append_token() {
     let mut mgr = BlockManager::new(100, 4); // block_size = 4
-    mgr.allocate_seq(1, 1).unwrap(); // 1 block
+    mgr.allocate_seq(1, 1).unwrap(); // 1 block, fill_count=1
 
-    // Fill the first block
-    for _ in 0..4 {
+    assert_eq!(mgr.seq_len(1).unwrap(), 1);
+
+    // Fill the rest of the first block (3 more tokens)
+    for _ in 0..3 {
         mgr.append_token(1).unwrap();
     }
     assert_eq!(mgr.seq_len(1).unwrap(), 4);

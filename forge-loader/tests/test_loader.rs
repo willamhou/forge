@@ -16,7 +16,7 @@ fn test_parse_llama_config() {
     let config: LlamaConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.hidden_size, 4096);
     assert_eq!(config.num_hidden_layers, 32);
-    assert_eq!(config.num_key_value_heads, 32);
+    assert_eq!(config.num_key_value_heads, Some(32));
     assert_eq!(config.vocab_size, 32000);
 }
 
@@ -31,7 +31,7 @@ fn test_config_defaults() {
         "max_position_embeddings": 2048
     }"#;
     let config: LlamaConfig = serde_json::from_str(json).unwrap();
-    assert_eq!(config.num_key_value_heads, 32); // default
+    assert!(config.num_key_value_heads.is_none()); // defaults to num_attention_heads in to_model_config
     assert!((config.rms_norm_eps - 1e-5).abs() < 1e-10);
     assert!((config.rope_theta - 10000.0).abs() < 1e-6);
     assert!(config.head_dim.is_none());
@@ -56,4 +56,20 @@ fn test_to_model_config() {
     assert_eq!(mc.num_key_value_heads, 8);
     assert!((mc.rms_norm_eps - 1e-6).abs() < 1e-10);
     assert!((mc.rope_theta - 500000.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_kv_heads_default_to_attention_heads() {
+    let json = r#"{
+        "hidden_size": 2048,
+        "intermediate_size": 5504,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "vocab_size": 32000,
+        "max_position_embeddings": 2048
+    }"#;
+    let config: LlamaConfig = serde_json::from_str(json).unwrap();
+    let mc = config.to_model_config();
+    // When num_key_value_heads is absent, it defaults to num_attention_heads (standard MHA)
+    assert_eq!(mc.num_key_value_heads, 16);
 }

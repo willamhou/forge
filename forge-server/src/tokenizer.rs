@@ -62,16 +62,29 @@ impl IncrementalDecoder {
         let decoded = tokenizer.decode(&self.pending_ids).ok()?;
 
         if decoded.ends_with('\u{FFFD}') {
-            return None; // incomplete UTF-8
+            return None; // incomplete UTF-8, keep accumulating
         }
 
         let new_text = decoded[self.prev_text_len..].to_string();
-        self.prev_text_len = decoded.len();
 
         if new_text.is_empty() {
-            None
-        } else {
-            Some(new_text)
+            return None;
         }
+
+        // Reset to avoid O(N^2) re-decoding. Keep the last token as context
+        // for multi-byte character boundaries.
+        if self.pending_ids.len() > 4 {
+            let keep = self.pending_ids.len().saturating_sub(2);
+            self.pending_ids.drain(..keep);
+            // Recompute prev_text_len relative to the trimmed buffer
+            self.prev_text_len = tokenizer
+                .decode(&self.pending_ids)
+                .map(|s| s.len())
+                .unwrap_or(0);
+        } else {
+            self.prev_text_len = decoded.len();
+        }
+
+        Some(new_text)
     }
 }

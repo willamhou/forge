@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use forge_core::{Backend, ForgeError, Result};
@@ -6,6 +7,8 @@ use safetensors::SafeTensors;
 
 pub struct SafeTensorsLoader {
     mmaps: Vec<Mmap>,
+    /// Maps tensor name -> mmap index for O(1) lookup.
+    tensor_index: HashMap<String, usize>,
 }
 
 impl SafeTensorsLoader {
@@ -34,36 +37,41 @@ impl SafeTensorsLoader {
                 let file = std::fs::File::open(path)?;
                 Ok(unsafe { Mmap::map(&file) }?)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
 
-        Ok(Self { mmaps })
+        // Build tensor name -> file index mapping
+        let mut tensor_index = HashMap::new();
+        for (idx, mmap) in mmaps.iter().enumerate() {
+            let tensors = SafeTensors::deserialize(mmap)
+                .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
+            for name in tensors.names() {
+                tensor_index.insert(name.to_string(), idx);
+            }
+        }
+
+        Ok(Self {
+            mmaps,
+            tensor_index,
+        })
     }
 
     /// Load a specific tensor by name.
     pub fn load_tensor<B: Backend>(&self, name: &str, backend: &B) -> Result<B::Tensor> {
-        for mmap in &self.mmaps {
-            let tensors = SafeTensors::deserialize(mmap)
-                .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
-            if let Ok(view) = tensors.tensor(name) {
-                let shape: Vec<usize> = view.shape().to_vec();
-                return view_to_tensor(view, &shape, backend);
-            }
-        }
-        Err(ForgeError::ModelLoad(format!(
-            "Tensor '{}' not found",
-            name
-        )))
+        let idx = self.tensor_index.get(name).ok_or_else(|| {
+            ForgeError::ModelLoad(format!("Tensor '{}' not found", name))
+        })?;
+        let tensors = SafeTensors::deserialize(&self.mmaps[*idx])
+            .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
+        let view = tensors
+            .tensor(name)
+            .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
+        let shape: Vec<usize> = view.shape().to_vec();
+        view_to_tensor(view, &shape, backend)
     }
 
     /// List all tensor names across all files.
-    pub fn tensor_names(&self) -> Result<Vec<String>> {
-        let mut names = Vec::new();
-        for mmap in &self.mmaps {
-            let tensors = SafeTensors::deserialize(mmap)
-                .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
-            names.extend(tensors.names().into_iter().map(String::from));
-        }
-        Ok(names)
+    pub fn tensor_names(&self) -> Vec<String> {
+        self.tensor_index.keys().cloned().collect()
     }
 }
 
@@ -75,15 +83,18 @@ fn view_to_tensor<B: Backend>(
     let data = view.data();
     match view.dtype() {
         safetensors::Dtype::F16 => {
-            let f16_data: &[half::f16] = bytemuck::cast_slice(data);
+            let f16_data: &[half::f16] = bytemuck::try_cast_slice(data)
+                .map_err(|e| ForgeError::ModelLoad(format!("F16 alignment error: {e}")))?;
             backend.copy_from_host_f16(f16_data, shape)
         }
         safetensors::Dtype::BF16 => {
-            let bf16_data: &[half::bf16] = bytemuck::cast_slice(data);
+            let bf16_data: &[half::bf16] = bytemuck::try_cast_slice(data)
+                .map_err(|e| ForgeError::ModelLoad(format!("BF16 alignment error: {e}")))?;
             backend.copy_from_host_bf16(bf16_data, shape)
         }
         safetensors::Dtype::F32 => {
-            let f32_data: &[f32] = bytemuck::cast_slice(data);
+            let f32_data: &[f32] = bytemuck::try_cast_slice(data)
+                .map_err(|e| ForgeError::ModelLoad(format!("F32 alignment error: {e}")))?;
             backend.copy_from_host_f32(f32_data, shape)
         }
         other => Err(ForgeError::ModelLoad(format!(

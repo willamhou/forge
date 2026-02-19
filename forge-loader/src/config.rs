@@ -7,8 +7,7 @@ pub struct LlamaConfig {
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
-    #[serde(default = "default_kv_heads")]
-    pub num_key_value_heads: usize,
+    pub num_key_value_heads: Option<usize>,
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
     #[serde(default = "default_rms_eps")]
@@ -19,9 +18,6 @@ pub struct LlamaConfig {
     pub head_dim: Option<usize>,
 }
 
-fn default_kv_heads() -> usize {
-    32
-}
 fn default_rms_eps() -> f32 {
     1e-5
 }
@@ -39,7 +35,7 @@ impl LlamaConfig {
             intermediate_size: self.intermediate_size,
             num_hidden_layers: self.num_hidden_layers,
             num_attention_heads: self.num_attention_heads,
-            num_key_value_heads: self.num_key_value_heads,
+            num_key_value_heads: self.num_key_value_heads.unwrap_or(self.num_attention_heads),
             vocab_size: self.vocab_size,
             max_position_embeddings: self.max_position_embeddings,
             head_dim,

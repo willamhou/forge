@@ -2,8 +2,11 @@
 //!
 //! This is the Level 1 attention from the design doc — correct but not optimized.
 //! Will be replaced by FlashAttention in Task 16.
+//!
+//! NOTE: Currently only supports F32 tensors. A cast layer will be added when
+//! the model forward pass is integrated (F16 weights will be cast to F32 for compute).
 
-use forge_core::{Backend, Result, Tensor};
+use forge_core::{Backend, DType, ForgeError, Result, Tensor};
 
 use crate::backend::CudaBackend;
 use crate::tensor::CudaTensor;
@@ -27,9 +30,28 @@ pub fn naive_attention(
 ) -> Result<CudaTensor> {
     let q_shape = q.shape();
     let k_shape = k.shape();
+    let v_shape = v.shape();
 
-    assert_eq!(q_shape.len(), 4, "Q must be 4D");
-    assert_eq!(k_shape.len(), 4, "K must be 4D");
+    if q_shape.len() != 4 {
+        return Err(ForgeError::InvalidArgument(
+            "Q must be 4D [batch, seq_len, heads, head_dim]".into(),
+        ));
+    }
+    if k_shape.len() != 4 {
+        return Err(ForgeError::InvalidArgument(
+            "K must be 4D [batch, kv_len, kv_heads, head_dim]".into(),
+        ));
+    }
+    if v_shape.len() != 4 {
+        return Err(ForgeError::InvalidArgument(
+            "V must be 4D [batch, kv_len, kv_heads, head_dim]".into(),
+        ));
+    }
+    if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
+        return Err(ForgeError::InvalidArgument(
+            "naive_attention currently only supports F32 tensors".into(),
+        ));
+    }
 
     let batch = q_shape[0];
     let seq_len = q_shape[1];
@@ -41,31 +63,35 @@ pub fn naive_attention(
     // For now, process one head at a time by reshaping into 2D matmuls.
     // This is correct but slow — FlashAttention will replace this.
 
-    // Flatten Q to [seq_len * num_heads, head_dim] for the batch=1 case
-    let q_2d = backend.reshape(q, &[seq_len * num_heads, head_dim])?;
-
-    // Handle GQA: if num_kv_heads < num_heads, repeat KV heads
     let heads_per_group = num_heads / num_kv_heads;
 
-    // K^T: [kv_len * num_kv_heads, head_dim] -> transpose -> [head_dim, kv_len * num_kv_heads]
+    // Flatten all tensors to 2D for slicing
+    // Q: [seq_len * num_heads, head_dim]
+    let q_2d = backend.reshape(q, &[seq_len * num_heads, head_dim])?;
+
+    // K: [kv_len * num_kv_heads, head_dim]
     let k_2d = backend.reshape(k, &[kv_len * num_kv_heads, head_dim])?;
     let k_t = backend.transpose(&k_2d, 0, 1)?; // [head_dim, kv_len * num_kv_heads]
 
     // V: [kv_len * num_kv_heads, head_dim]
     let v_2d = backend.reshape(v, &[kv_len * num_kv_heads, head_dim])?;
 
-    // For each query head, compute attention against its corresponding KV head
-    let mut head_outputs = Vec::with_capacity(num_heads);
+    // Process per-token, per-head to produce correct interleaved layout.
+    // Output layout: [seq_len, num_heads, head_dim] which reshapes to [batch, seq_len, num_heads, head_dim].
+    //
+    // We compute each head's attention and collect results in token-first order.
+    // Each head output is [seq_len, head_dim], but we need to interleave by token.
+
+    // Compute all head outputs first
+    let mut head_outputs_data: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
 
     for h in 0..num_heads {
         let kv_h = h / heads_per_group;
 
-        // Extract Q slice for this head: rows [seq_len*h .. seq_len*(h+1)] of q_2d
-        // For batch=1, each head has seq_len rows
+        // Extract Q slice for this head: rows [seq_len*h .. seq_len*(h+1)]
         let q_head = extract_rows(backend, &q_2d, h * seq_len, seq_len, head_dim)?;
 
         // Extract K^T slice for this KV head: cols [kv_len*kv_h .. kv_len*(kv_h+1)]
-        // K^T is [head_dim, kv_len*num_kv_heads], we need columns for this head
         let k_t_head = extract_cols(backend, &k_t, kv_h * kv_len, kv_len, head_dim)?;
 
         // Extract V slice for this KV head
@@ -80,16 +106,21 @@ pub fn naive_attention(
 
         // output = attn_weights @ V: [seq_len, kv_len] @ [kv_len, head_dim] = [seq_len, head_dim]
         let head_out = backend.matmul(&attn_weights, &v_head)?;
-        head_outputs.push(head_out);
+        let data = backend.copy_to_host_f32(&head_out)?;
+        head_outputs_data.push(data);
     }
 
-    // Concatenate all heads: each is [seq_len, head_dim]
-    // Result shape: [seq_len * num_heads, head_dim]
-    let refs: Vec<&CudaTensor> = head_outputs.iter().collect();
-    let concatenated = backend.cat(&refs, 0)?;
+    // Interleave: build output in [seq_len, num_heads, head_dim] order
+    let mut result = Vec::with_capacity(seq_len * num_heads * head_dim);
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let offset = t * head_dim;
+            result.extend_from_slice(&head_outputs_data[h][offset..offset + head_dim]);
+        }
+    }
 
-    // Reshape to [batch, seq_len, num_heads, head_dim]
-    backend.reshape(&concatenated, &[batch, seq_len, num_heads, head_dim])
+    let out = backend.copy_from_host_f32(&result, &[batch, seq_len, num_heads, head_dim])?;
+    Ok(out)
 }
 
 /// Extract `num_rows` rows starting at `start_row` from a 2D tensor.

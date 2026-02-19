@@ -35,6 +35,10 @@ impl BlockManager {
     }
 
     pub fn free(&mut self, blocks: &[usize]) {
+        debug_assert!(
+            blocks.iter().all(|b| *b < self.total_blocks),
+            "invalid block ID in free()"
+        );
         self.free_blocks.extend(blocks);
     }
 
@@ -64,7 +68,15 @@ impl BlockManager {
     pub fn allocate_seq(&mut self, seq_id: u64, initial_tokens: usize) -> Result<()> {
         let num_blocks = ((initial_tokens + self.block_size - 1) / self.block_size).max(1);
         let blocks = self.allocate(num_blocks)?;
-        let seq_blocks = blocks.into_iter().map(|b| (b, 0)).collect();
+        let mut remaining = initial_tokens;
+        let seq_blocks = blocks
+            .into_iter()
+            .map(|b| {
+                let fill = remaining.min(self.block_size);
+                remaining -= fill;
+                (b, fill)
+            })
+            .collect();
         self.seq_blocks.insert(seq_id, seq_blocks);
         Ok(())
     }

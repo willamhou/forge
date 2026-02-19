@@ -1,6 +1,20 @@
 use forge_core::{ForgeError, Result};
 use minijinja::Environment;
 
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+}
+
 pub struct ChatTemplate {
     env: Environment<'static>,
 }
@@ -26,6 +40,30 @@ impl ChatTemplate {
         let msgs: Vec<minijinja::Value> = messages
             .iter()
             .map(|(role, content)| minijinja::context! { role => *role, content => *content })
+            .collect();
+
+        tmpl.render(minijinja::context! {
+            messages => msgs,
+            add_generation_prompt => add_generation_prompt,
+        })
+        .map_err(|e| ForgeError::Internal(e.to_string()))
+    }
+
+    pub fn apply_messages(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        let tmpl = self
+            .env
+            .get_template("chat")
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let msgs: Vec<minijinja::Value> = messages
+            .iter()
+            .map(|m| {
+                minijinja::context! { role => m.role.as_str(), content => m.content.as_str() }
+            })
             .collect();
 
         tmpl.render(minijinja::context! {
