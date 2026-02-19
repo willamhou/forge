@@ -20,5 +20,5 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-minijinja = "2.12"
+minijinja = { version = "2.12", features = ["loader"] }
 tokenizers = "0.21"
