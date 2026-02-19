@@ -7,5 +7,5 @@ license.workspace = true
 [dependencies]
 forge-core.workspace = true
 forge-kernels.workspace = true
-cudarc = { version = "0.17", features = ["cublas", "cuda-version-from-build-system"] }
+cudarc = { version = "0.17", features = ["cublas", "nvrtc", "f16", "cuda-version-from-build-system"] }
 half.workspace = true
