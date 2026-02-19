@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 forge-core.workspace = true
+forge-loader.workspace = true
 tracing.workspace = true
