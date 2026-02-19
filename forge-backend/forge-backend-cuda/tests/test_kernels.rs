@@ -1,5 +1,6 @@
+use forge_backend_cuda::attention::naive_attention;
 use forge_backend_cuda::CudaBackend;
-use forge_core::Backend;
+use forge_core::{Backend, Tensor};
 
 #[test]
 fn test_rms_norm() {
@@ -103,4 +104,39 @@ fn test_embedding() {
     let out = backend.embedding(&weight, &[2, 0, 3]).unwrap();
     let result = backend.copy_to_host_f32(&out).unwrap();
     assert_eq!(result, vec![7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0]);
+}
+
+#[test]
+fn test_naive_attention_single_head() {
+    let backend = CudaBackend::new(0).unwrap();
+    // Q, K, V: [1, 2, 1, 4] — batch=1, seq_len=2, heads=1, head_dim=4
+    let q = backend
+        .copy_from_host_f32(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            &[1, 2, 1, 4],
+        )
+        .unwrap();
+    let k = backend
+        .copy_from_host_f32(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            &[1, 2, 1, 4],
+        )
+        .unwrap();
+    let v = backend
+        .copy_from_host_f32(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            &[1, 2, 1, 4],
+        )
+        .unwrap();
+
+    let scale = 1.0 / (4.0f32).sqrt(); // 1/sqrt(head_dim)
+    let out = naive_attention(&backend, &q, &k, &v, scale).unwrap();
+    let result = backend.copy_to_host_f32(&out).unwrap();
+
+    assert_eq!(out.shape(), &[1, 2, 1, 4]);
+    // Q[0] = [1,0,0,0] should attend more to K[0] = [1,0,0,0]
+    // Q[1] = [0,1,0,0] should attend more to K[1] = [0,1,0,0]
+    // So output[0] should be closer to V[0] and output[1] closer to V[1]
+    assert!(result[0] < result[4], "first token output should be closer to V[0]");
+    assert!(result.len() == 8);
 }

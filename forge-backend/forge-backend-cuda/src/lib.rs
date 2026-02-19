@@ -1,5 +1,6 @@
 //! Forge CUDA backend using cudarc.
 
+pub mod attention;
 pub mod backend;
 pub mod tensor;
 
