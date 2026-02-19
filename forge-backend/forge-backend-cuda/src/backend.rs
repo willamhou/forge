@@ -250,6 +250,12 @@ impl CudaBackend {
     }
 }
 
+/// Round up to the next power of 2 (minimum 32 for warp size).
+fn next_power_of_2(n: u32) -> u32 {
+    let n = n.max(32);
+    1u32 << (32 - (n - 1).leading_zeros())
+}
+
 impl Backend for CudaBackend {
     type Tensor = CudaTensor;
 
@@ -548,7 +554,7 @@ impl Backend for CudaBackend {
             .alloc_zeros::<f32>(rows * cols)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
-        let block_dim = 256u32.min(cols as u32);
+        let block_dim = next_power_of_2(256u32.min(cols as u32));
         let shared_mem = block_dim * 4; // sizeof(f32) per thread
 
         let mut builder = self.stream.launch_builder(&self.kernels.rms_norm_f32);
@@ -640,7 +646,7 @@ impl Backend for CudaBackend {
             .alloc_zeros::<f32>(rows * cols)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
-        let block_dim = 256u32.min(cols as u32);
+        let block_dim = next_power_of_2(256u32.min(cols as u32));
         let shared_mem = block_dim * 4;
 
         let mut builder = self.stream.launch_builder(&self.kernels.softmax_f32);
