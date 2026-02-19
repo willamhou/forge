@@ -47,7 +47,7 @@ impl BlockManager {
     }
 
     pub fn can_allocate(&self, num_tokens: usize) -> bool {
-        let blocks_needed = (num_tokens + self.block_size - 1) / self.block_size;
+        let blocks_needed = ((num_tokens + self.block_size - 1) / self.block_size).max(1);
         self.free_blocks.len() >= blocks_needed
     }
 

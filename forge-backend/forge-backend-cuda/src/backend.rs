@@ -517,6 +517,12 @@ impl Backend for CudaBackend {
     fn rms_norm(&self, x: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
         let shape = x.shape();
         let cols = *shape.last().unwrap();
+        if weight.len() != cols {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: weight.shape().to_vec(),
+            });
+        }
         let rows = x.len() / cols;
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
@@ -565,7 +571,21 @@ impl Backend for CudaBackend {
         let seq_len = shape[1] as u32;
         let num_heads = shape[2] as u32;
         let head_dim = shape[3] as u32;
+        if head_dim % 2 != 0 {
+            return Err(ForgeError::InvalidArgument(
+                "rope requires even head_dim".into(),
+            ));
+        }
         let half_dim = head_dim / 2;
+        let expected_freq_len = (seq_len * half_dim) as usize;
+        if freqs_cos.len() < expected_freq_len || freqs_sin.len() < expected_freq_len {
+            return Err(ForgeError::InvalidArgument(format!(
+                "freq tensors need at least {} elements, got cos={} sin={}",
+                expected_freq_len,
+                freqs_cos.len(),
+                freqs_sin.len()
+            )));
+        }
         let total = batch * seq_len * num_heads * half_dim;
 
         let mut out = self

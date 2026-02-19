@@ -60,6 +60,13 @@ pub fn naive_attention(
     let kv_len = k_shape[1];
     let num_kv_heads = k_shape[2];
 
+    if k_shape[3] != head_dim || v_shape[3] != head_dim {
+        return Err(ForgeError::InvalidArgument(format!(
+            "Q/K/V head_dim must match: Q={}, K={}, V={}",
+            head_dim, k_shape[3], v_shape[3]
+        )));
+    }
+
     // For now, process one head at a time by reshaping into 2D matmuls.
     // This is correct but slow — FlashAttention will replace this.
 

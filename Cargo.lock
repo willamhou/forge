@@ -501,6 +501,7 @@ name = "forge-model-llama"
 version = "0.1.0"
 dependencies = [
  "forge-core",
+ "forge-loader",
  "tracing",
 ]
 
