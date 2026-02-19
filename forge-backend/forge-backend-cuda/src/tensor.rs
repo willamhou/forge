@@ -1,11 +1,16 @@
 use cudarc::driver::CudaSlice;
-use forge_core::{DType, Tensor};
+use forge_core::{DType, ForgeError, Result, Tensor};
+
+#[derive(Debug, Clone)]
+pub(crate) enum TensorData {
+    F32(CudaSlice<f32>),
+    F16(CudaSlice<half::f16>),
+    BF16(CudaSlice<half::bf16>),
+}
 
 #[derive(Debug, Clone)]
 pub struct CudaTensor {
-    pub(crate) data_f32: Option<CudaSlice<f32>>,
-    pub(crate) data_f16: Option<CudaSlice<half::f16>>,
-    pub(crate) data_bf16: Option<CudaSlice<half::bf16>>,
+    pub(crate) data: TensorData,
     pub(crate) shape: Vec<usize>,
     pub(crate) dtype: DType,
 }
@@ -15,28 +20,67 @@ impl CudaTensor {
         shape.iter().product()
     }
 
-    pub(crate) fn f32_slice(&self) -> &CudaSlice<f32> {
-        self.data_f32.as_ref().expect("expected f32 tensor")
+    pub(crate) fn f32_data(data: CudaSlice<f32>, shape: Vec<usize>) -> Self {
+        Self {
+            data: TensorData::F32(data),
+            shape,
+            dtype: DType::F32,
+        }
     }
 
-    pub(crate) fn f32_slice_mut(&mut self) -> &mut CudaSlice<f32> {
-        self.data_f32.as_mut().expect("expected f32 tensor")
+    pub(crate) fn f16_data(data: CudaSlice<half::f16>, shape: Vec<usize>) -> Self {
+        Self {
+            data: TensorData::F16(data),
+            shape,
+            dtype: DType::F16,
+        }
     }
 
-    pub(crate) fn f16_slice(&self) -> &CudaSlice<half::f16> {
-        self.data_f16.as_ref().expect("expected f16 tensor")
+    pub(crate) fn bf16_data(data: CudaSlice<half::bf16>, shape: Vec<usize>) -> Self {
+        Self {
+            data: TensorData::BF16(data),
+            shape,
+            dtype: DType::BF16,
+        }
     }
 
-    pub(crate) fn bf16_slice(&self) -> &CudaSlice<half::bf16> {
-        self.data_bf16.as_ref().expect("expected bf16 tensor")
+    pub(crate) fn f32_slice(&self) -> Result<&CudaSlice<f32>> {
+        match &self.data {
+            TensorData::F32(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected f32 tensor, got {:?}",
+                self.dtype
+            ))),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn f16_slice(&self) -> Result<&CudaSlice<half::f16>> {
+        match &self.data {
+            TensorData::F16(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected f16 tensor, got {:?}",
+                self.dtype
+            ))),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn bf16_slice(&self) -> Result<&CudaSlice<half::bf16>> {
+        match &self.data {
+            TensorData::BF16(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected bf16 tensor, got {:?}",
+                self.dtype
+            ))),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        match self.dtype {
-            DType::F32 => self.data_f32.as_ref().map_or(0, |s| s.len()),
-            DType::F16 => self.data_f16.as_ref().map_or(0, |s| s.len()),
-            DType::BF16 => self.data_bf16.as_ref().map_or(0, |s| s.len()),
-            _ => 0,
+        match &self.data {
+            TensorData::F32(s) => s.len(),
+            TensorData::F16(s) => s.len(),
+            TensorData::BF16(s) => s.len(),
         }
     }
 }

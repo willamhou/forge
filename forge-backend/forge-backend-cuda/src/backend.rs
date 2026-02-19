@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::compile_ptx;
 use forge_core::{Backend, DType, ForgeError, Result, Tensor};
 
@@ -52,7 +54,6 @@ extern "C" __global__ void rms_norm_f32(
     const float* x = input + row * cols;
     float* o = out + row * cols;
 
-    // Compute sum of squares using shared memory reduction
     extern __shared__ float shared[];
 
     float local_ss = 0.0f;
@@ -64,7 +65,6 @@ extern "C" __global__ void rms_norm_f32(
     shared[threadIdx.x] = local_ss;
     __syncthreads();
 
-    // Block reduction
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             shared[threadIdx.x] += shared[threadIdx.x + s];
@@ -141,12 +141,15 @@ extern "C" __global__ void embedding_f32(
     const float* weight,
     const unsigned int* indices,
     unsigned int num_indices,
-    unsigned int embedding_dim
+    unsigned int embedding_dim,
+    unsigned int vocab_size
 ) {
     unsigned int idx = blockIdx.x;
     if (idx >= num_indices) return;
 
     unsigned int token_id = indices[idx];
+    if (token_id >= vocab_size) return;
+
     const float* src = weight + token_id * embedding_dim;
     float* dst = out + idx * embedding_dim;
 
@@ -188,6 +191,17 @@ extern "C" __global__ void rope_f32(
     out[base + h] = x0 * cos_val - x1 * sin_val;
     out[base + h + half_dim] = x0 * sin_val + x1 * cos_val;
 }
+
+extern "C" __global__ void transpose_f32(
+    float* out, const float* in_data,
+    unsigned int rows, unsigned int cols
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    unsigned int r = i / cols;
+    unsigned int c = i % cols;
+    out[c * rows + r] = in_data[r * cols + c];
+}
 "#;
 
 struct KernelFunctions {
@@ -199,8 +213,10 @@ struct KernelFunctions {
     softmax_f32: CudaFunction,
     embedding_f32: CudaFunction,
     rope_f32: CudaFunction,
+    transpose_f32: CudaFunction,
 }
 
+#[allow(dead_code)]
 pub struct CudaBackend {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
@@ -238,6 +254,7 @@ impl CudaBackend {
             softmax_f32: load("softmax_f32")?,
             embedding_f32: load("embedding_f32")?,
             rope_f32: load("rope_f32")?,
+            transpose_f32: load("transpose_f32")?,
         };
 
         Ok(Self {
@@ -254,6 +271,27 @@ impl CudaBackend {
 fn next_power_of_2(n: u32) -> u32 {
     let n = n.max(32);
     1u32 << (32 - (n - 1).leading_zeros())
+}
+
+fn validate_shape(data_len: usize, shape: &[usize]) -> Result<()> {
+    let expected: usize = shape.iter().product();
+    if data_len != expected {
+        return Err(ForgeError::ShapeMismatch {
+            expected: shape.to_vec(),
+            got: vec![data_len],
+        });
+    }
+    Ok(())
+}
+
+fn validate_same_len(a: &CudaTensor, b: &CudaTensor) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(ForgeError::ShapeMismatch {
+            expected: a.shape().to_vec(),
+            got: b.shape().to_vec(),
+        });
+    }
+    Ok(())
 }
 
 impl Backend for CudaBackend {
@@ -275,39 +313,21 @@ impl Backend for CudaBackend {
                     .stream
                     .alloc_zeros::<f32>(numel)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                Ok(CudaTensor {
-                    data_f32: Some(data),
-                    data_f16: None,
-                    data_bf16: None,
-                    shape: shape.to_vec(),
-                    dtype,
-                })
+                Ok(CudaTensor::f32_data(data, shape.to_vec()))
             }
             DType::F16 => {
                 let data = self
                     .stream
                     .alloc_zeros::<half::f16>(numel)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                Ok(CudaTensor {
-                    data_f32: None,
-                    data_f16: Some(data),
-                    data_bf16: None,
-                    shape: shape.to_vec(),
-                    dtype,
-                })
+                Ok(CudaTensor::f16_data(data, shape.to_vec()))
             }
             DType::BF16 => {
                 let data = self
                     .stream
                     .alloc_zeros::<half::bf16>(numel)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                Ok(CudaTensor {
-                    data_f32: None,
-                    data_f16: None,
-                    data_bf16: Some(data),
-                    shape: shape.to_vec(),
-                    dtype,
-                })
+                Ok(CudaTensor::bf16_data(data, shape.to_vec()))
             }
             _ => Err(ForgeError::UnsupportedDtype(dtype)),
         }
@@ -318,49 +338,34 @@ impl Backend for CudaBackend {
     }
 
     fn copy_from_host_f32(&self, data: &[f32], shape: &[usize]) -> Result<CudaTensor> {
+        validate_shape(data.len(), shape)?;
         let slice = self
             .stream
             .memcpy_stod(data)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-        Ok(CudaTensor {
-            data_f32: Some(slice),
-            data_f16: None,
-            data_bf16: None,
-            shape: shape.to_vec(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(slice, shape.to_vec()))
     }
 
     fn copy_from_host_f16(&self, data: &[half::f16], shape: &[usize]) -> Result<CudaTensor> {
+        validate_shape(data.len(), shape)?;
         let slice = self
             .stream
             .memcpy_stod(data)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-        Ok(CudaTensor {
-            data_f32: None,
-            data_f16: Some(slice),
-            data_bf16: None,
-            shape: shape.to_vec(),
-            dtype: DType::F16,
-        })
+        Ok(CudaTensor::f16_data(slice, shape.to_vec()))
     }
 
     fn copy_from_host_bf16(&self, data: &[half::bf16], shape: &[usize]) -> Result<CudaTensor> {
+        validate_shape(data.len(), shape)?;
         let slice = self
             .stream
             .memcpy_stod(data)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-        Ok(CudaTensor {
-            data_f32: None,
-            data_f16: None,
-            data_bf16: Some(slice),
-            shape: shape.to_vec(),
-            dtype: DType::BF16,
-        })
+        Ok(CudaTensor::bf16_data(slice, shape.to_vec()))
     }
 
     fn copy_to_host_f32(&self, tensor: &CudaTensor) -> Result<Vec<f32>> {
-        let slice = tensor.f32_slice();
+        let slice = tensor.f32_slice()?;
         self.stream
             .memcpy_dtov(slice)
             .map_err(|e| ForgeError::Cuda(e.to_string()))
@@ -414,23 +419,18 @@ impl Backend for CudaBackend {
                         beta: 0.0f32,
                         ldc: n as i32,
                     },
-                    b.f32_slice(),
-                    a.f32_slice(),
+                    b.f32_slice()?,
+                    a.f32_slice()?,
                     &mut c,
                 )
                 .map_err(|e| ForgeError::Cuda(format!("gemm: {e}")))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(c),
-            data_f16: None,
-            data_bf16: None,
-            shape: vec![m, n],
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(c, vec![m, n]))
     }
 
     fn add(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+        validate_same_len(a, b)?;
         let n = a.len() as u32;
         let mut out = self
             .stream
@@ -439,8 +439,8 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.add_f32);
         builder.arg(&mut out);
-        builder.arg(a.f32_slice());
-        builder.arg(b.f32_slice());
+        builder.arg(a.f32_slice()?);
+        builder.arg(b.f32_slice()?);
         builder.arg(&n);
         unsafe {
             builder
@@ -448,16 +448,11 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: a.shape.clone(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, a.shape.clone()))
     }
 
     fn mul(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
+        validate_same_len(a, b)?;
         let n = a.len() as u32;
         let mut out = self
             .stream
@@ -466,8 +461,8 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.mul_f32);
         builder.arg(&mut out);
-        builder.arg(a.f32_slice());
-        builder.arg(b.f32_slice());
+        builder.arg(a.f32_slice()?);
+        builder.arg(b.f32_slice()?);
         builder.arg(&n);
         unsafe {
             builder
@@ -475,13 +470,7 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: a.shape.clone(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, a.shape.clone()))
     }
 
     fn mul_scalar(&self, a: &CudaTensor, scalar: f32) -> Result<CudaTensor> {
@@ -493,7 +482,7 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.mul_scalar_f32);
         builder.arg(&mut out);
-        builder.arg(a.f32_slice());
+        builder.arg(a.f32_slice()?);
         builder.arg(&scalar);
         builder.arg(&n);
         unsafe {
@@ -502,13 +491,7 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: a.shape.clone(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, a.shape.clone()))
     }
 
     fn silu(&self, a: &CudaTensor) -> Result<CudaTensor> {
@@ -520,7 +503,7 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.silu_f32);
         builder.arg(&mut out);
-        builder.arg(a.f32_slice());
+        builder.arg(a.f32_slice()?);
         builder.arg(&n);
         unsafe {
             builder
@@ -528,21 +511,10 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: a.shape.clone(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, a.shape.clone()))
     }
 
-    fn rms_norm(
-        &self,
-        x: &CudaTensor,
-        weight: &CudaTensor,
-        eps: f32,
-    ) -> Result<CudaTensor> {
+    fn rms_norm(&self, x: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
         let shape = x.shape();
         let cols = *shape.last().unwrap();
         let rows = x.len() / cols;
@@ -559,8 +531,8 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.rms_norm_f32);
         builder.arg(&mut out);
-        builder.arg(x.f32_slice());
-        builder.arg(weight.f32_slice());
+        builder.arg(x.f32_slice()?);
+        builder.arg(weight.f32_slice()?);
         builder.arg(&eps);
         builder.arg(&rows_u32);
         builder.arg(&cols_u32);
@@ -574,13 +546,7 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: shape.to_vec(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, shape.to_vec()))
     }
 
     fn rope(
@@ -590,7 +556,6 @@ impl Backend for CudaBackend {
         freqs_sin: &CudaTensor,
     ) -> Result<CudaTensor> {
         let shape = x.shape();
-        // Expect shape [batch, seq_len, num_heads, head_dim]
         if shape.len() != 4 {
             return Err(ForgeError::InvalidArgument(
                 "rope expects 4D tensor [batch, seq_len, heads, head_dim]".into(),
@@ -610,9 +575,9 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.rope_f32);
         builder.arg(&mut out);
-        builder.arg(x.f32_slice());
-        builder.arg(freqs_cos.f32_slice());
-        builder.arg(freqs_sin.f32_slice());
+        builder.arg(x.f32_slice()?);
+        builder.arg(freqs_cos.f32_slice()?);
+        builder.arg(freqs_sin.f32_slice()?);
         builder.arg(&batch);
         builder.arg(&seq_len);
         builder.arg(&num_heads);
@@ -623,23 +588,23 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: shape.to_vec(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, shape.to_vec()))
     }
 
     fn softmax(&self, x: &CudaTensor, dim: i32) -> Result<CudaTensor> {
         let shape = x.shape();
+        let ndim = shape.len() as i32;
+        let normalized_dim = if dim < 0 { ndim + dim } else { dim };
+        if normalized_dim != ndim - 1 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "softmax only supports last dimension (got dim={dim}, ndim={ndim})"
+            )));
+        }
+
         let cols = *shape.last().unwrap();
         let rows = x.len() / cols;
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
-
-        let _ = dim; // We always softmax over the last dim
 
         let mut out = self
             .stream
@@ -651,7 +616,7 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.softmax_f32);
         builder.arg(&mut out);
-        builder.arg(x.f32_slice());
+        builder.arg(x.f32_slice()?);
         builder.arg(&rows_u32);
         builder.arg(&cols_u32);
         unsafe {
@@ -664,21 +629,32 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: shape.to_vec(),
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, shape.to_vec()))
     }
 
     fn embedding(&self, weight: &CudaTensor, indices: &[u32]) -> Result<CudaTensor> {
         let weight_shape = weight.shape();
-        let embedding_dim = weight_shape[weight_shape.len() - 1];
+        if weight_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "embedding weight must be 2D [vocab_size, embedding_dim]".into(),
+            ));
+        }
+        let vocab_size = weight_shape[0];
+        let embedding_dim = weight_shape[1];
         let num_indices = indices.len();
+
+        // Validate indices are in range (CPU-side check)
+        for &idx in indices {
+            if idx as usize >= vocab_size {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "embedding index {idx} out of range (vocab_size={vocab_size})"
+                )));
+            }
+        }
+
         let num_indices_u32 = num_indices as u32;
         let embedding_dim_u32 = embedding_dim as u32;
+        let vocab_size_u32 = vocab_size as u32;
 
         let indices_dev = self
             .stream
@@ -692,10 +668,11 @@ impl Backend for CudaBackend {
 
         let mut builder = self.stream.launch_builder(&self.kernels.embedding_f32);
         builder.arg(&mut out);
-        builder.arg(weight.f32_slice());
+        builder.arg(weight.f32_slice()?);
         builder.arg(&indices_dev);
         builder.arg(&num_indices_u32);
         builder.arg(&embedding_dim_u32);
+        builder.arg(&vocab_size_u32);
         unsafe {
             builder
                 .launch(LaunchConfig {
@@ -706,13 +683,7 @@ impl Backend for CudaBackend {
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: vec![num_indices, embedding_dim],
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, vec![num_indices, embedding_dim]))
     }
 
     fn reshape(&self, x: &CudaTensor, shape: &[usize]) -> Result<CudaTensor> {
@@ -723,18 +694,14 @@ impl Backend for CudaBackend {
                 got: x.shape.clone(),
             });
         }
-        // Reshape is a view-only operation; clone data with new shape
         Ok(CudaTensor {
-            data_f32: x.data_f32.clone(),
-            data_f16: x.data_f16.clone(),
-            data_bf16: x.data_bf16.clone(),
+            data: x.data.clone(),
             shape: shape.to_vec(),
             dtype: x.dtype,
         })
     }
 
     fn transpose(&self, x: &CudaTensor, dim0: usize, dim1: usize) -> Result<CudaTensor> {
-        // For now, only support 2D transpose
         let shape = x.shape();
         if shape.len() != 2 || !((dim0 == 0 && dim1 == 1) || (dim0 == 1 && dim1 == 0)) {
             return Err(ForgeError::InvalidArgument(
@@ -745,41 +712,16 @@ impl Backend for CudaBackend {
         let cols = shape[1];
         let n = (rows * cols) as u32;
 
-        // Compile a transpose kernel on the fly (simple for now)
-        let ptx = compile_ptx(&format!(
-            r#"
-extern "C" __global__ void transpose_f32(
-    float* out, const float* in_data,
-    unsigned int rows, unsigned int cols
-) {{
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    unsigned int r = i / cols;
-    unsigned int c = i % cols;
-    out[c * rows + r] = in_data[r * cols + c];
-}}
-"#
-        ))
-        .map_err(|e| ForgeError::Cuda(format!("nvrtc transpose: {e}")))?;
-
-        let module = self
-            .ctx
-            .load_module(ptx)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-        let func = module
-            .load_function("transpose_f32")
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
         let mut out = self
             .stream
-            .alloc_zeros::<f32>((rows * cols) as usize)
+            .alloc_zeros::<f32>(rows * cols)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
-        let mut builder = self.stream.launch_builder(&func);
+        let mut builder = self.stream.launch_builder(&self.kernels.transpose_f32);
         builder.arg(&mut out);
-        builder.arg(x.f32_slice());
+        builder.arg(x.f32_slice()?);
         builder.arg(&rows_u32);
         builder.arg(&cols_u32);
         unsafe {
@@ -788,13 +730,7 @@ extern "C" __global__ void transpose_f32(
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: vec![cols, rows],
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, vec![cols, rows]))
     }
 
     fn cat(&self, tensors: &[&CudaTensor], dim: usize) -> Result<CudaTensor> {
@@ -807,8 +743,29 @@ extern "C" __global__ void transpose_f32(
             ));
         }
 
+        let ndim = tensors[0].shape().len();
+        let inner_size: usize = if ndim > 1 {
+            tensors[0].shape()[1..].iter().product()
+        } else {
+            1
+        };
+
+        // Validate inner dimensions match
+        for t in tensors.iter().skip(1) {
+            let t_inner: usize = if ndim > 1 {
+                t.shape()[1..].iter().product()
+            } else {
+                1
+            };
+            if t_inner != inner_size {
+                return Err(ForgeError::ShapeMismatch {
+                    expected: tensors[0].shape().to_vec(),
+                    got: t.shape().to_vec(),
+                });
+            }
+        }
+
         let mut total_first_dim = 0usize;
-        let inner_size: usize = tensors[0].shape()[1..].iter().product();
         for t in tensors {
             total_first_dim += t.shape()[0];
         }
@@ -822,7 +779,7 @@ extern "C" __global__ void transpose_f32(
         let mut offset = 0usize;
         for t in tensors {
             let len = t.len();
-            let src = t.f32_slice();
+            let src = t.f32_slice()?;
             self.stream
                 .memcpy_dtod(src, &mut out.slice_mut(offset..offset + len))
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
@@ -832,12 +789,6 @@ extern "C" __global__ void transpose_f32(
         let mut out_shape = tensors[0].shape().to_vec();
         out_shape[0] = total_first_dim;
 
-        Ok(CudaTensor {
-            data_f32: Some(out),
-            data_f16: None,
-            data_bf16: None,
-            shape: out_shape,
-            dtype: DType::F32,
-        })
+        Ok(CudaTensor::f32_data(out, out_shape))
     }
 }
