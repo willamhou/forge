@@ -32,6 +32,10 @@ pub trait KvCache: Send + Sync {
         value: &Self::T,
     ) -> Result<()>;
 
+    /// Retrieve the full cached K and V for a specific layer.
+    /// Returns (key, value) where each is [total_cached_len, num_kv_heads * head_dim].
+    fn get_kv(&self, seq_id: u64, layer: usize) -> Result<(Self::T, Self::T)>;
+
     /// Get block table for a sequence (PagedAttention).
     fn get_block_table(&self, seq_id: u64) -> Result<Vec<usize>>;
 

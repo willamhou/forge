@@ -68,12 +68,11 @@ impl Scheduler for ContinuousBatchingScheduler {
     }
 
     fn cancel(&mut self, seq_id: u64) -> Result<()> {
-        let seq = self
-            .sequences
-            .get_mut(&seq_id)
-            .ok_or(ForgeError::SeqNotFound(seq_id))?;
-        seq.state = SeqState::Finished;
+        if self.sequences.remove(&seq_id).is_none() {
+            return Err(ForgeError::SeqNotFound(seq_id));
+        }
         self.running.retain(|&id| id != seq_id);
+        self.waiting.retain(|&id| id != seq_id);
         Ok(())
     }
 
@@ -90,8 +89,11 @@ impl Scheduler for ContinuousBatchingScheduler {
                 if batch.total_seqs() >= self.config.max_batch_size {
                     break;
                 }
-                // Decode: send the last generated token
-                let last_token = *seq.generated_tokens.last().unwrap_or(&0);
+                // Decode: send the last generated token (skip if none yet)
+                let last_token = match seq.generated_tokens.last() {
+                    Some(&t) => t,
+                    None => continue, // no token generated yet, skip decode
+                };
                 batch.decode_seqs.push(ScheduledSeq {
                     seq_id,
                     token_ids: vec![last_token],
@@ -161,11 +163,9 @@ impl Scheduler for ContinuousBatchingScheduler {
     }
 
     fn finish(&mut self, seq_id: u64, _reason: FinishReason) -> Result<()> {
-        let seq = self
-            .sequences
-            .get_mut(&seq_id)
-            .ok_or(ForgeError::SeqNotFound(seq_id))?;
-        seq.state = SeqState::Finished;
+        if self.sequences.remove(&seq_id).is_none() {
+            return Err(ForgeError::SeqNotFound(seq_id));
+        }
         self.running.retain(|&id| id != seq_id);
         Ok(())
     }

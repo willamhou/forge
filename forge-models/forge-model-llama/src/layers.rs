@@ -35,14 +35,14 @@ impl<B: Backend> LlamaMLP<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
-        // gate = silu(x @ gate_proj^T)
+        // gate = silu(x @ gate_proj)  — weights already transposed at load
         let gate = backend.matmul(x, &self.gate_proj)?;
         let gate = backend.silu(&gate)?;
 
-        // up = x @ up_proj^T
+        // up = x @ up_proj
         let up = backend.matmul(x, &self.up_proj)?;
 
-        // output = (gate * up) @ down_proj^T
+        // output = (gate * up) @ down_proj
         let fused = backend.mul(&gate, &up)?;
         backend.matmul(&fused, &self.down_proj)
     }
@@ -50,9 +50,9 @@ impl<B: Backend> LlamaMLP<B> {
 
 /// Self-attention with GQA and RoPE.
 ///
-/// For Phase 1, computes attention using basic backend ops (matmul + softmax).
-/// KV caching is prepared but the naive path computes full attention each time.
-/// FlashAttention integration in Task 16 will replace the inner loop.
+/// Weights are stored as [in_features, out_features] (transposed at load time).
+/// KV cache is used: during prefill, K/V are appended to cache; during decode,
+/// cached K/V are retrieved so attention sees the full context.
 pub struct LlamaAttention<B: Backend> {
     wq: B::Tensor,
     wk: B::Tensor,
@@ -86,44 +86,59 @@ impl<B: Backend> LlamaAttention<B> {
     ///
     /// Input `x`: [seq_len, hidden_size]
     /// Output: [seq_len, hidden_size]
+    ///
+    /// `pos_offset`: the starting position index for RoPE (0 for prefill,
+    /// cached_len for decode).
     pub fn forward(
         &self,
         x: &B::Tensor,
         rope_freqs: &RopeFreqs<B>,
-        _kv_cache: &mut dyn KvCache<T = B::Tensor>,
-        _seq_id: u64,
-        _layer_idx: usize,
+        pos_offset: usize,
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        seq_id: u64,
+        layer_idx: usize,
         backend: &B,
     ) -> Result<B::Tensor> {
         let shape = x.shape();
         let seq_len = shape[0];
 
-        // Q, K, V projections
+        // Q, K, V projections — weights are [hidden_size, proj_size] after transpose
         let q = backend.matmul(x, &self.wq)?; // [seq_len, num_heads * head_dim]
         let k = backend.matmul(x, &self.wk)?; // [seq_len, num_kv_heads * head_dim]
         let v = backend.matmul(x, &self.wv)?; // [seq_len, num_kv_heads * head_dim]
 
-        // Reshape for RoPE and attention
+        // Reshape for RoPE: [1, seq_len, num_heads/kv_heads, head_dim]
         let q = backend.reshape(&q, &[1, seq_len, self.num_heads, self.head_dim])?;
         let k = backend.reshape(&k, &[1, seq_len, self.num_kv_heads, self.head_dim])?;
         let v = backend.reshape(&v, &[1, seq_len, self.num_kv_heads, self.head_dim])?;
 
-        // Apply RoPE to Q and K
-        let q = rope_freqs.apply(&q, backend)?;
-        let k = rope_freqs.apply(&k, backend)?;
+        // Apply RoPE with position offset
+        let q = rope_freqs.apply_with_offset(&q, pos_offset, backend)?;
+        let k = rope_freqs.apply_with_offset(&k, pos_offset, backend)?;
 
-        // TODO: In Task 16, KV cache append/retrieval will be wired here.
-        // For now, compute attention over the full current K,V.
+        // Flatten K, V back to 2D for cache: [seq_len, num_kv_heads * head_dim]
+        let k_flat = backend.reshape(&k, &[seq_len, self.num_kv_heads * self.head_dim])?;
+        let v_flat = backend.reshape(&v, &[seq_len, self.num_kv_heads * self.head_dim])?;
 
-        // Per-head attention using backend ops.
-        // This calls the standalone attention helper that uses only Backend trait methods.
-        let attn_out = self.compute_attention(&q, &k, &v, seq_len, backend)?;
+        // Append new K, V to cache
+        kv_cache.append(seq_id, layer_idx, &k_flat, &v_flat)?;
+
+        // Retrieve full cached K, V (includes all prior + current tokens)
+        let (k_full, v_full) = kv_cache.get_kv(seq_id, layer_idx)?;
+
+        // Reshape to 4D for attention: [1, kv_len, num_kv_heads, head_dim]
+        let kv_len = k_full.shape()[0];
+        let k_4d = backend.reshape(&k_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
+        let v_4d = backend.reshape(&v_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
+
+        // Compute attention with Q over full K,V (including cached)
+        let attn_out = self.compute_attention(&q, &k_4d, &v_4d, seq_len, kv_len, backend)?;
 
         // Output projection: [seq_len, num_heads * head_dim] @ wo
         backend.matmul(&attn_out, &self.wo)
     }
 
-    /// Compute scaled dot-product attention per head using only Backend trait ops.
+    /// Compute scaled dot-product attention per head.
     ///
     /// Q: [1, seq_len, num_heads, head_dim]
     /// K: [1, kv_len, num_kv_heads, head_dim]
@@ -136,9 +151,9 @@ impl<B: Backend> LlamaAttention<B> {
         k: &B::Tensor,
         v: &B::Tensor,
         seq_len: usize,
+        kv_len: usize,
         backend: &B,
     ) -> Result<B::Tensor> {
-        let kv_len = k.shape()[1];
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let heads_per_group = self.num_heads / self.num_kv_heads;
 
@@ -227,6 +242,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         &self,
         x: &B::Tensor,
         rope_freqs: &RopeFreqs<B>,
+        pos_offset: usize,
         kv_cache: &mut dyn KvCache<T = B::Tensor>,
         seq_id: u64,
         layer_idx: usize,
@@ -234,9 +250,15 @@ impl<B: Backend> LlamaDecoderLayer<B> {
     ) -> Result<B::Tensor> {
         // Pre-attention norm + attention + residual
         let normed = self.input_layernorm.forward(x, backend)?;
-        let attn_out =
-            self.self_attn
-                .forward(&normed, rope_freqs, kv_cache, seq_id, layer_idx, backend)?;
+        let attn_out = self.self_attn.forward(
+            &normed,
+            rope_freqs,
+            pos_offset,
+            kv_cache,
+            seq_id,
+            layer_idx,
+            backend,
+        )?;
         let x = backend.add(x, &attn_out)?;
 
         // Post-attention norm + MLP + residual

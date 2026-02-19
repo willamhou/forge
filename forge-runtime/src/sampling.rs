@@ -207,9 +207,11 @@ fn apply_top_k(probs: &mut [f32], k: usize) {
     }
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = indexed[k - 1].1;
-    for p in probs.iter_mut() {
-        if *p < threshold {
+    // Collect the indices to keep (exactly the top k)
+    let keep: std::collections::HashSet<usize> =
+        indexed[..k].iter().map(|&(idx, _)| idx).collect();
+    for (i, p) in probs.iter_mut().enumerate() {
+        if !keep.contains(&i) {
             *p = 0.0;
         }
     }
