@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "forge-core",
+    "forge-server",
+    "forge-backend",
+    "forge-backend/forge-backend-cuda",
+    "forge-runtime",
+    "forge-scheduler",
+    "forge-kvcache",
+    "forge-models/forge-model-llama",
+    "forge-loader",
+    "forge-kernels",
+    "forge-transport",
+    "forge-quantize",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/user/forge"
+
+[workspace.dependencies]
+# Internal crates
+forge-core = { path = "forge-core" }
+forge-backend-cuda = { path = "forge-backend/forge-backend-cuda" }
+forge-runtime = { path = "forge-runtime" }
+forge-scheduler = { path = "forge-scheduler" }
+forge-kvcache = { path = "forge-kvcache" }
+forge-model-llama = { path = "forge-models/forge-model-llama" }
+forge-loader = { path = "forge-loader" }
+forge-kernels = { path = "forge-kernels" }
+forge-transport = { path = "forge-transport" }
+forge-quantize = { path = "forge-quantize" }
+
+# External dependencies
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = { version = "2", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"

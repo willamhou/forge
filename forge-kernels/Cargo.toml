@@ -1,0 +1,8 @@
+[package]
+name = "forge-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cudarc = { version = "0.17", features = ["cuda-version-from-build-system"] }

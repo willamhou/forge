@@ -1,0 +1,12 @@
+[package]
+name = "forge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true

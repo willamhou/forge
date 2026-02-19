@@ -1,0 +1,24 @@
+[package]
+name = "forge-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+forge-runtime.workspace = true
+forge-loader.workspace = true
+forge-model-llama.workspace = true
+forge-backend-cuda.workspace = true
+forge-scheduler.workspace = true
+forge-kvcache.workspace = true
+forge-transport.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+minijinja = "2.12"
+tokenizers = "0.21"

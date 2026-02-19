@@ -1,0 +1,10 @@
+[package]
+name = "forge-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
