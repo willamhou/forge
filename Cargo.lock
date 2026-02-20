@@ -774,6 +774,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "forge-backend-cpu",
  "forge-backend-cuda",
  "forge-core",
  "forge-kvcache",

@@ -16,7 +16,7 @@ use forge_core::{FinishReason, InferenceRequest, SamplingParams};
 use forge_runtime::engine::{EngineEvent, EngineRequest};
 
 use crate::chat_template::ChatTemplate;
-use crate::tokenizer::ForgeTokenizer;
+use crate::tokenizer::{ForgeTokenizer, IncrementalDecoder};
 
 use super::types::*;
 
@@ -137,7 +137,8 @@ pub async fn chat_completions(
         .as_secs();
 
     if is_stream {
-        handle_streaming(event_rx, request_id, state.model_name.clone(), now).into_response()
+        handle_streaming(event_rx, state.clone(), request_id, state.model_name.clone(), now)
+            .into_response()
     } else {
         handle_non_streaming(
             event_rx,
@@ -227,6 +228,7 @@ async fn handle_non_streaming(
 /// Stream tokens as SSE events.
 fn handle_streaming(
     mut event_rx: mpsc::Receiver<EngineEvent>,
+    state: Arc<AppState>,
     request_id: String,
     model: String,
     created: u64,
@@ -235,6 +237,8 @@ fn handle_streaming(
         mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(256);
 
     tokio::spawn(async move {
+        let mut decoder = IncrementalDecoder::new();
+
         let initial_chunk = ChatCompletionChunk {
             id: request_id.clone(),
             object: "chat.completion.chunk",
@@ -256,11 +260,12 @@ fn handle_streaming(
 
         while let Some(event) = event_rx.recv().await {
             match event {
-                EngineEvent::Token { text, .. } => {
-                    let content = text.unwrap_or_default();
-                    if content.is_empty() {
-                        continue;
-                    }
+                EngineEvent::Token { token_id, text, .. } => {
+                    let content = text.or_else(|| decoder.add_token(token_id, &state.tokenizer));
+                    let content = match content {
+                        Some(c) if !c.is_empty() => c,
+                        _ => continue,
+                    };
                     let chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk",

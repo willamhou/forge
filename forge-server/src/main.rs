@@ -191,7 +191,15 @@ fn load_chat_template(model_path: &Path) -> anyhow::Result<ChatTemplate> {
         let text = std::fs::read_to_string(&config_path)?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if let Some(tmpl) = value.get("chat_template").and_then(|v| v.as_str()) {
-            return Ok(ChatTemplate::new(tmpl)?);
+            let bos_token = value
+                .get("bos_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let eos_token = value
+                .get("eos_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return Ok(ChatTemplate::with_tokens(tmpl, bos_token, eos_token)?);
         }
     }
     // Fallback to ChatML
