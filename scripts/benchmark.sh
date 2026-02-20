@@ -23,7 +23,7 @@ echo "Port:         ${PORT}"
 echo ""
 
 # Start server in background
-cargo run --release -- serve --model "${MODEL_PATH}" --port "${PORT}" &
+cargo run --release -p forge-server -- --model-path "${MODEL_PATH}" --port "${PORT}" &
 SERVER_PID=$!
 trap "kill ${SERVER_PID} 2>/dev/null || true" EXIT
 

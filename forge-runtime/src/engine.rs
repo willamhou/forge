@@ -256,9 +256,23 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         self.scheduler.append_token(seq.seq_id, token_id)?;
 
         // Advance FSM state if constraint is active
+        let mut fsm_finished = false;
         if let Some(seq_constraint) = self.constraints.get_mut(&seq.seq_id) {
             match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
-                Some(next) => seq_constraint.state = next,
+                Some(next) => {
+                    seq_constraint.state = next;
+                    // If the FSM reached a final state and has no further transitions,
+                    // the structured output is complete.
+                    if seq_constraint.fsm.is_final_state(next) {
+                        let has_transitions = seq_constraint
+                            .fsm
+                            .allowed_tokens(next)
+                            .is_some_and(|t| !t.is_empty());
+                        if !has_transitions {
+                            fsm_finished = true;
+                        }
+                    }
+                }
                 None => {
                     warn!(
                         seq_id = seq.seq_id,
@@ -292,13 +306,16 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             None
         };
 
-        let should_finish = stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false);
+        let should_finish =
+            stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false) || fsm_finished;
 
         if should_finish {
             let reason = if stop_token_hit {
                 FinishReason::EosToken
             } else if stop_string_hit.unwrap_or(false) {
                 FinishReason::StopString
+            } else if fsm_finished {
+                FinishReason::EosToken
             } else {
                 FinishReason::MaxTokens
             };

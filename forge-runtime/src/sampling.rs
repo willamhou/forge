@@ -91,7 +91,8 @@ impl CpuSampler {
     /// Sample a single token with an optional FSM constraint.
     ///
     /// The constraint mask is applied in the logit domain (before softmax),
-    /// after penalties and temperature scaling.
+    /// after penalties and temperature scaling. The generation step count is
+    /// mixed into seeded RNG so each step produces a different draw.
     pub fn sample_with_constraint(
         &self,
         logits: &[f32],
@@ -144,10 +145,15 @@ impl CpuSampler {
             for p in probs.iter_mut() {
                 *p /= sum;
             }
+        } else {
+            // All probability mass was zeroed (e.g. FSM constraint eliminated all
+            // candidates after top-k/top-p). Fall back to greedy over the
+            // post-penalty logits to avoid sampling from an all-zero distribution.
+            return self.greedy(&processed);
         }
 
-        // Multinomial sampling
-        self.multinomial(&probs, params.seed)
+        // Multinomial sampling — pass step count so seeded RNG advances
+        self.multinomial(&probs, params.seed, generated_tokens.len())
     }
 
     fn greedy(&self, logits: &[f32]) -> forge_core::Result<SampleResult> {
@@ -169,11 +175,16 @@ impl CpuSampler {
         &self,
         probs: &[f32],
         seed: Option<u64>,
+        step: usize,
     ) -> forge_core::Result<SampleResult> {
         use rand::prelude::*;
 
         let mut rng: Box<dyn RngCore> = match seed {
-            Some(s) => Box::new(rand::rngs::StdRng::seed_from_u64(s)),
+            // Mix the step counter into the seed so each generation step
+            // produces a different but deterministic random draw.
+            Some(s) => Box::new(rand::rngs::StdRng::seed_from_u64(
+                s.wrapping_add(step as u64),
+            )),
             None => Box::new(rand::thread_rng()),
         };
 

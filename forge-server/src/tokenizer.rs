@@ -12,12 +12,33 @@ impl ForgeTokenizer {
     pub fn from_file(path: &Path) -> Result<Self> {
         let inner =
             HfTokenizer::from_file(path).map_err(|e| ForgeError::Tokenizer(e.to_string()))?;
-        // Try to find EOS token id from common conventions
-        let eos_token_id = inner
-            .token_to_id("</s>")
+
+        // Try to read eos_token_id from tokenizer_config.json (most reliable source).
+        let config_eos = path.parent().and_then(|dir| {
+            let config_path = dir.join("tokenizer_config.json");
+            let text = std::fs::read_to_string(config_path).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+            // Try numeric eos_token_id first, then resolve eos_token string
+            if let Some(id) = value.get("eos_token_id").and_then(|v| v.as_u64()) {
+                return Some(id as u32);
+            }
+            // eos_token can be a string or {"content": "..."} object
+            let eos_str = value.get("eos_token").and_then(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .or_else(|| v.get("content").and_then(|c| c.as_str()).map(String::from))
+            })?;
+            inner.token_to_id(&eos_str)
+        });
+
+        // Fall back to common token strings, then to id 2
+        let eos_token_id = config_eos
+            .or_else(|| inner.token_to_id("</s>"))
             .or_else(|| inner.token_to_id("<|endoftext|>"))
             .or_else(|| inner.token_to_id("<|im_end|>"))
-            .unwrap_or(2); // fallback
+            .or_else(|| inner.token_to_id("<|eot_id|>"))
+            .unwrap_or(2);
+
         Ok(Self {
             inner,
             eos_token_id,
