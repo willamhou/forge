@@ -1,0 +1,11 @@
+[package]
+name = "forge-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+half.workspace = true
+cblas = "0.4"
+openblas-src = { version = "0.10", features = ["cblas", "system"] }

@@ -5,6 +5,7 @@ members = [
     "forge-server",
     "forge-backend",
     "forge-backend/forge-backend-cuda",
+    "forge-backend/forge-backend-cpu",
     "forge-runtime",
     "forge-scheduler",
     "forge-kvcache",
@@ -25,6 +26,7 @@ repository = "https://github.com/user/forge"
 # Internal crates
 forge-core = { path = "forge-core" }
 forge-backend-cuda = { path = "forge-backend/forge-backend-cuda" }
+forge-backend-cpu = { path = "forge-backend/forge-backend-cpu" }
 forge-runtime = { path = "forge-runtime" }
 forge-scheduler = { path = "forge-scheduler" }
 forge-kvcache = { path = "forge-kvcache" }
