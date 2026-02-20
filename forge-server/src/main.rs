@@ -15,6 +15,7 @@ use forge_backend_cpu::CpuBackend;
 use forge_backend_cuda::CudaBackend;
 use forge_core::{Backend, ModelConfig};
 use forge_kvcache::naive::NaiveKvCache;
+use forge_kvcache::paged_cache::PagedKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
 use forge_model_llama::load_llama_model;
 use forge_runtime::constraints::fsm::TokenVocab;
@@ -50,6 +51,18 @@ struct Cli {
     /// Backend to use: "cuda" or "cpu"
     #[arg(long, default_value = "cuda")]
     backend: String,
+
+    /// KV cache type: "naive" or "paged"
+    #[arg(long, default_value = "paged")]
+    kv_cache: String,
+
+    /// Block size for paged KV cache (tokens per block)
+    #[arg(long, default_value = "16")]
+    block_size: usize,
+
+    /// Total number of KV cache blocks (paged cache only)
+    #[arg(long, default_value = "2048")]
+    num_blocks: usize,
 }
 
 #[tokio::main]
@@ -114,8 +127,36 @@ async fn run_server<B: Backend + Clone>(
     info!("Chat template loaded");
 
     // --- Create engine components ---
-    let kv_cache =
-        NaiveKvCache::new(backend.clone(), model_config.num_hidden_layers, cli.max_batch_size);
+    let kv_cache: Box<dyn forge_core::KvCache<T = B::Tensor> + Send + Sync> =
+        match cli.kv_cache.as_str() {
+            "paged" => {
+                let cache = PagedKvCache::new(
+                    backend.clone(),
+                    cli.num_blocks,
+                    cli.block_size,
+                    model_config.num_hidden_layers,
+                    model_config.num_key_value_heads,
+                    model_config.head_dim,
+                );
+                info!(
+                    "Paged KV cache: {} blocks x {} tokens, kv_dim={}",
+                    cli.num_blocks,
+                    cli.block_size,
+                    model_config.num_key_value_heads * model_config.head_dim,
+                );
+                Box::new(cache)
+            }
+            "naive" => {
+                let cache = NaiveKvCache::new(
+                    backend.clone(),
+                    model_config.num_hidden_layers,
+                    cli.max_batch_size,
+                );
+                info!("Naive KV cache (CPU-side, max {} sequences)", cli.max_batch_size);
+                Box::new(cache)
+            }
+            other => anyhow::bail!("Unknown kv-cache type: {other}. Use 'naive' or 'paged'."),
+        };
     let scheduler_config = SchedulerConfig {
         max_batch_size: cli.max_batch_size,
         max_prefill_tokens: cli.max_prefill_tokens,
@@ -129,7 +170,7 @@ async fn run_server<B: Backend + Clone>(
         model,
         backend,
         Box::new(scheduler),
-        Box::new(kv_cache),
+        kv_cache,
         request_rx,
     );
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);

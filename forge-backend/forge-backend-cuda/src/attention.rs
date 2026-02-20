@@ -6,7 +6,7 @@
 //! NOTE: Currently only supports F32 tensors. A cast layer will be added when
 //! the model forward pass is integrated (F16 weights will be cast to F32 for compute).
 
-use forge_core::{Backend, DType, ForgeError, Result, Tensor};
+use forge_core::{Backend, ForgeError, Result, Tensor};
 
 use crate::backend::CudaBackend;
 use crate::tensor::CudaTensor;
@@ -47,11 +47,8 @@ pub fn naive_attention(
             "V must be 4D [batch, kv_len, kv_heads, head_dim]".into(),
         ));
     }
-    if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
-        return Err(ForgeError::InvalidArgument(
-            "naive_attention currently only supports F32 tensors".into(),
-        ));
-    }
+    // F16 tensors are automatically cast via copy_to_host_f32; compute is done in F32 on CPU.
+    // FlashAttention will eliminate this CPU roundtrip for both F16 and F32.
 
     let batch = q_shape[0];
     let seq_len = q_shape[1];

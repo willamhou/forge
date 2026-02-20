@@ -43,4 +43,7 @@ pub trait Backend: Send + Sync + 'static {
     fn reshape(&self, x: &Self::Tensor, shape: &[usize]) -> Result<Self::Tensor>;
     fn transpose(&self, x: &Self::Tensor, dim0: usize, dim1: usize) -> Result<Self::Tensor>;
     fn cat(&self, tensors: &[&Self::Tensor], dim: usize) -> Result<Self::Tensor>;
+
+    /// Cast a tensor to a different dtype. Returns the input unchanged if already the target dtype.
+    fn cast(&self, x: &Self::Tensor, dtype: DType) -> Result<Self::Tensor>;
 }

@@ -375,4 +375,9 @@ impl Backend for CpuBackend {
         out_shape[0] = total_first_dim;
         Ok(CpuTensor::new(all_data, out_shape))
     }
+
+    fn cast(&self, x: &CpuTensor, _dtype: DType) -> Result<CpuTensor> {
+        // CPU backend stores everything as f32 internally, so cast is a no-op.
+        Ok(x.clone())
+    }
 }

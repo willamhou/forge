@@ -716,6 +716,7 @@ name = "forge-kvcache"
 version = "0.1.0"
 dependencies = [
  "forge-core",
+ "half",
  "tracing",
 ]
 

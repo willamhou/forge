@@ -134,6 +134,10 @@ impl<B: Backend> LlamaAttention<B> {
         // Compute attention with Q over full K,V (including cached)
         let attn_out = self.compute_attention(&q, &k_4d, &v_4d, seq_len, kv_len, backend)?;
 
+        // Cast attention output to match weight dtype (naive attention produces F32,
+        // but weights may be F16). FlashAttention will natively produce matching dtype.
+        let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
+
         // Output projection: [seq_len, num_heads * head_dim] @ wo
         backend.matmul(&attn_out, &self.wo)
     }
