@@ -1,3 +1,5 @@
+extern crate openblas_src;
+
 use forge_core::{Backend, DType, ForgeError, Result, Tensor};
 
 use crate::tensor::CpuTensor;
@@ -5,7 +7,7 @@ use crate::tensor::CpuTensor;
 /// CPU backend for Forge inference engine.
 ///
 /// All data lives in host memory as `Vec<f32>` wrapped in `Arc`.
-/// Allocation and transfer ops are implemented; compute ops are stubs.
+/// Uses OpenBLAS for matrix multiplication; all other ops are pure Rust.
 #[derive(Clone)]
 pub struct CpuBackend;
 
@@ -98,65 +100,277 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    // ── Compute ops (stubs) ─────────────────────────────────────
+    // ── Compute ops ────────────────────────────────────────────
 
-    fn matmul(&self, _a: &CpuTensor, _b: &CpuTensor) -> Result<CpuTensor> {
-        todo!("Task 3: matmul via CBLAS sgemm")
+    fn matmul(&self, a: &CpuTensor, b: &CpuTensor) -> Result<CpuTensor> {
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "matmul requires 2D tensors".into(),
+            ));
+        }
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = b_shape[1];
+        if b_shape[0] != k {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![k, n],
+                got: b_shape.to_vec(),
+            });
+        }
+        let mut c = vec![0.0f32; m * n];
+        unsafe {
+            cblas::sgemm(
+                cblas::Layout::RowMajor,
+                cblas::Transpose::None,
+                cblas::Transpose::None,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.data(),
+                k as i32,
+                b.data(),
+                n as i32,
+                0.0,
+                &mut c,
+                n as i32,
+            );
+        }
+        Ok(CpuTensor::new(c, vec![m, n]))
     }
 
     fn add(&self, a: &CpuTensor, b: &CpuTensor) -> Result<CpuTensor> {
         validate_same_len(a, b)?;
-        todo!("Task 3: elementwise add")
+        let data: Vec<f32> = a
+            .data()
+            .iter()
+            .zip(b.data().iter())
+            .map(|(x, y)| x + y)
+            .collect();
+        Ok(CpuTensor::new(data, a.shape().to_vec()))
     }
 
     fn mul(&self, a: &CpuTensor, b: &CpuTensor) -> Result<CpuTensor> {
         validate_same_len(a, b)?;
-        todo!("Task 3: elementwise mul")
+        let data: Vec<f32> = a
+            .data()
+            .iter()
+            .zip(b.data().iter())
+            .map(|(x, y)| x * y)
+            .collect();
+        Ok(CpuTensor::new(data, a.shape().to_vec()))
     }
 
-    fn mul_scalar(&self, _a: &CpuTensor, _scalar: f32) -> Result<CpuTensor> {
-        todo!("Task 3: scalar mul")
+    fn mul_scalar(&self, a: &CpuTensor, scalar: f32) -> Result<CpuTensor> {
+        let data: Vec<f32> = a.data().iter().map(|x| x * scalar).collect();
+        Ok(CpuTensor::new(data, a.shape().to_vec()))
     }
 
-    fn silu(&self, _a: &CpuTensor) -> Result<CpuTensor> {
-        todo!("Task 4: silu activation")
+    fn silu(&self, a: &CpuTensor) -> Result<CpuTensor> {
+        let data: Vec<f32> = a.data().iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        Ok(CpuTensor::new(data, a.shape().to_vec()))
     }
 
-    fn rms_norm(
-        &self,
-        _x: &CpuTensor,
-        _weight: &CpuTensor,
-        _eps: f32,
-    ) -> Result<CpuTensor> {
-        todo!("Task 4: rms_norm")
+    fn rms_norm(&self, x: &CpuTensor, weight: &CpuTensor, eps: f32) -> Result<CpuTensor> {
+        let shape = x.shape();
+        let cols = *shape.last().unwrap();
+        if weight.len() != cols {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: weight.shape().to_vec(),
+            });
+        }
+        let rows = x.len() / cols;
+        let src = x.data();
+        let w = weight.data();
+        let mut out = vec![0.0f32; rows * cols];
+        for row in 0..rows {
+            let row_data = &src[row * cols..(row + 1) * cols];
+            let ss: f32 = row_data.iter().map(|v| v * v).sum();
+            let rms = (ss / cols as f32 + eps).sqrt().recip();
+            for col in 0..cols {
+                out[row * cols + col] = row_data[col] * rms * w[col];
+            }
+        }
+        Ok(CpuTensor::new(out, shape.to_vec()))
     }
 
     fn rope(
         &self,
-        _x: &CpuTensor,
-        _freqs_cos: &CpuTensor,
-        _freqs_sin: &CpuTensor,
+        x: &CpuTensor,
+        freqs_cos: &CpuTensor,
+        freqs_sin: &CpuTensor,
     ) -> Result<CpuTensor> {
-        todo!("Task 4: rope")
+        let shape = x.shape();
+        if shape.len() != 4 {
+            return Err(ForgeError::InvalidArgument(
+                "rope expects 4D tensor [batch, seq_len, heads, head_dim]".into(),
+            ));
+        }
+        let batch = shape[0];
+        let seq_len = shape[1];
+        let num_heads = shape[2];
+        let head_dim = shape[3];
+        if head_dim % 2 != 0 {
+            return Err(ForgeError::InvalidArgument(
+                "rope requires even head_dim".into(),
+            ));
+        }
+        let half_dim = head_dim / 2;
+        let expected_freq_len = seq_len * half_dim;
+        if freqs_cos.len() < expected_freq_len || freqs_sin.len() < expected_freq_len {
+            return Err(ForgeError::InvalidArgument(format!(
+                "freq tensors need at least {} elements, got cos={} sin={}",
+                expected_freq_len,
+                freqs_cos.len(),
+                freqs_sin.len()
+            )));
+        }
+        let src = x.data();
+        let cos = freqs_cos.data();
+        let sin = freqs_sin.data();
+        let mut out = vec![0.0f32; src.len()];
+        for b in 0..batch {
+            for pos in 0..seq_len {
+                for head in 0..num_heads {
+                    let base = b * seq_len * num_heads * head_dim
+                        + pos * num_heads * head_dim
+                        + head * head_dim;
+                    for h in 0..half_dim {
+                        let x0 = src[base + h];
+                        let x1 = src[base + h + half_dim];
+                        let cos_val = cos[pos * half_dim + h];
+                        let sin_val = sin[pos * half_dim + h];
+                        out[base + h] = x0 * cos_val - x1 * sin_val;
+                        out[base + h + half_dim] = x0 * sin_val + x1 * cos_val;
+                    }
+                }
+            }
+        }
+        Ok(CpuTensor::new(out, shape.to_vec()))
     }
 
-    fn softmax(&self, _x: &CpuTensor, _dim: i32) -> Result<CpuTensor> {
-        todo!("Task 4: softmax")
+    fn softmax(&self, x: &CpuTensor, dim: i32) -> Result<CpuTensor> {
+        let shape = x.shape();
+        let ndim = shape.len() as i32;
+        let normalized_dim = if dim < 0 { ndim + dim } else { dim };
+        if normalized_dim != ndim - 1 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "softmax only supports last dimension (got dim={dim}, ndim={ndim})"
+            )));
+        }
+        let cols = *shape.last().unwrap();
+        let rows = x.len() / cols;
+        let src = x.data();
+        let mut out = vec![0.0f32; rows * cols];
+        for row in 0..rows {
+            let row_data = &src[row * cols..(row + 1) * cols];
+            let max_val = row_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for col in 0..cols {
+                let v = (row_data[col] - max_val).exp();
+                out[row * cols + col] = v;
+                sum += v;
+            }
+            for col in 0..cols {
+                out[row * cols + col] /= sum;
+            }
+        }
+        Ok(CpuTensor::new(out, shape.to_vec()))
     }
 
-    fn embedding(&self, _weight: &CpuTensor, _indices: &[u32]) -> Result<CpuTensor> {
-        todo!("Task 4: embedding lookup")
+    fn embedding(&self, weight: &CpuTensor, indices: &[u32]) -> Result<CpuTensor> {
+        let w_shape = weight.shape();
+        if w_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "embedding weight must be 2D [vocab_size, embedding_dim]".into(),
+            ));
+        }
+        let vocab_size = w_shape[0];
+        let dim = w_shape[1];
+        let mut out = Vec::with_capacity(indices.len() * dim);
+        for &idx in indices {
+            if idx as usize >= vocab_size {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "embedding index {idx} out of range (vocab_size={vocab_size})"
+                )));
+            }
+            let start = idx as usize * dim;
+            out.extend_from_slice(&weight.data()[start..start + dim]);
+        }
+        Ok(CpuTensor::new(out, vec![indices.len(), dim]))
     }
 
-    fn reshape(&self, _x: &CpuTensor, _shape: &[usize]) -> Result<CpuTensor> {
-        todo!("Task 5: reshape")
+    fn reshape(&self, x: &CpuTensor, shape: &[usize]) -> Result<CpuTensor> {
+        let numel: usize = shape.iter().product();
+        if numel != x.len() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: x.shape().to_vec(),
+            });
+        }
+        Ok(CpuTensor {
+            data: x.data.clone(),
+            shape: shape.to_vec(),
+            dtype: x.dtype,
+        })
     }
 
-    fn transpose(&self, _x: &CpuTensor, _dim0: usize, _dim1: usize) -> Result<CpuTensor> {
-        todo!("Task 5: transpose")
+    fn transpose(&self, x: &CpuTensor, dim0: usize, dim1: usize) -> Result<CpuTensor> {
+        let shape = x.shape();
+        if shape.len() != 2 || !((dim0 == 0 && dim1 == 1) || (dim0 == 1 && dim1 == 0)) {
+            return Err(ForgeError::InvalidArgument(
+                "transpose currently only supports 2D tensors with dims (0,1)".into(),
+            ));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        let src = x.data();
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = src[r * cols + c];
+            }
+        }
+        Ok(CpuTensor::new(out, vec![cols, rows]))
     }
 
-    fn cat(&self, _tensors: &[&CpuTensor], _dim: usize) -> Result<CpuTensor> {
-        todo!("Task 5: cat")
+    fn cat(&self, tensors: &[&CpuTensor], dim: usize) -> Result<CpuTensor> {
+        if tensors.is_empty() {
+            return Err(ForgeError::InvalidArgument("empty tensor list".into()));
+        }
+        if dim != 0 {
+            return Err(ForgeError::InvalidArgument(
+                "cat currently only supports dim=0".into(),
+            ));
+        }
+        let ndim = tensors[0].shape().len();
+        for t in tensors.iter().skip(1) {
+            if t.shape().len() != ndim {
+                return Err(ForgeError::ShapeMismatch {
+                    expected: tensors[0].shape().to_vec(),
+                    got: t.shape().to_vec(),
+                });
+            }
+            for d in 1..ndim {
+                if t.shape()[d] != tensors[0].shape()[d] {
+                    return Err(ForgeError::ShapeMismatch {
+                        expected: tensors[0].shape().to_vec(),
+                        got: t.shape().to_vec(),
+                    });
+                }
+            }
+        }
+        let mut total_first_dim = 0;
+        let mut all_data = Vec::new();
+        for t in tensors {
+            total_first_dim += t.shape()[0];
+            all_data.extend_from_slice(t.data());
+        }
+        let mut out_shape = tensors[0].shape().to_vec();
+        out_shape[0] = total_first_dim;
+        Ok(CpuTensor::new(all_data, out_shape))
     }
 }
