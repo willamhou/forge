@@ -3,7 +3,14 @@
 ## Starting the Server
 
 ```bash
-cargo run --release -- serve --model /path/to/model --port 8080
+# CUDA backend with paged KV cache (default)
+cargo run --release -p forge-server -- --model-path /path/to/model --port 8080
+
+# CPU backend with naive KV cache
+cargo run --release -p forge-server -- --model-path /path/to/model --backend cpu --kv-cache naive
+
+# Custom KV cache sizing
+cargo run --release -p forge-server -- --model-path /path/to/model --num-blocks 4096 --block-size 32
 ```
 
 The server exposes:
@@ -36,6 +43,50 @@ bash scripts/benchmark.sh /path/to/model 10 128 8080
 
 Reports TTFT (avg/p50/p99), ITL (avg), and throughput (tokens/s).
 
+## API Features
+
+### Structured Output (JSON Schema / Regex)
+
+Force the model to generate output matching a JSON schema or regex pattern:
+
+```bash
+# JSON Schema constraint
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "test",
+    "messages": [{"role": "user", "content": "Give me a person"}],
+    "json_schema": {"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name", "age"]},
+    "max_tokens": 50
+  }'
+
+# Regex constraint
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "test",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "regex": "[0-9]+",
+    "max_tokens": 10
+  }'
+```
+
+`json_schema` and `regex` are mutually exclusive.
+
+### Sampling Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `temperature` | `1.0` | 0 = greedy, >0 = multinomial |
+| `top_p` | `1.0` | Nucleus sampling threshold |
+| `top_k` | `null` | Top-k filtering |
+| `max_tokens` | `256` | Max generation length |
+| `seed` | `null` | Deterministic sampling seed |
+| `repetition_penalty` | `1.0` | Penalize repeated tokens |
+| `presence_penalty` | `0.0` | Penalize tokens that have appeared |
+| `frequency_penalty` | `0.0` | Penalize tokens by frequency |
+| `stop` | `[]` | Stop strings |
+
 ## Common Issues
 
 ### Server fails to start
@@ -61,9 +112,10 @@ Reports TTFT (avg/p50/p99), ITL (avg), and throughput (tokens/s).
 **Symptom:** `ForgeError::OutOfMemory(...)`.
 
 **Actions:**
-1. Reduce `max_tokens` in requests
-2. Use a smaller model
-3. Reduce KV cache block count (when configurable)
+1. Reduce `--num-blocks` (default 2048) to lower KV cache memory
+2. Reduce `max_tokens` in requests
+3. Use a smaller model
+4. Reduce `--max-batch-size` to limit concurrent sequences
 
 ### Build fails with cudarc errors
 
@@ -85,7 +137,7 @@ Reports TTFT (avg/p50/p99), ITL (avg), and throughput (tokens/s).
 Phase 1 uses `tracing` for structured logging. Set the log level via:
 
 ```bash
-RUST_LOG=info cargo run --release -- serve --model /path/to/model
+RUST_LOG=info cargo run --release -p forge-server -- --model-path /path/to/model
 ```
 
 Log levels: `error`, `warn`, `info`, `debug`, `trace`.

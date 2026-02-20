@@ -22,19 +22,20 @@ cargo test --workspace
 
 ## Project Structure
 
-Forge is a Rust workspace with 12 crates:
+Forge is a Rust workspace with 13 crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `forge-core` | Core traits, types, error definitions |
 | `forge-server` | HTTP API (axum), binary entry point |
 | `forge-backend` | Backend abstraction trait |
-| `forge-backend-cuda` | CUDA backend (cudarc 0.17) |
-| `forge-runtime` | Engine runtime loop, forward pass orchestration |
+| `forge-backend-cuda` | CUDA backend (cudarc 0.17, FP32 + FP16) |
+| `forge-backend-cpu` | CPU backend (OpenBLAS, for testing) |
+| `forge-runtime` | Engine runtime loop, sampling, FSM constraints |
 | `forge-scheduler` | Continuous batching scheduler |
-| `forge-kvcache` | PagedAttention block manager |
+| `forge-kvcache` | KV cache (naive + paged block manager) |
 | `forge-models/forge-model-llama` | Llama model implementation |
-| `forge-loader` | SafeTensors/GGUF weight loader |
+| `forge-loader` | SafeTensors weight loader (F32, F16, BF16→F16) |
 | `forge-kernels` | CUDA C++ kernels + FFI bindings |
 | `forge-transport` | Communication abstraction (in-process, future: gRPC) |
 | `forge-quantize` | Quantization support (Phase 2+) |
@@ -61,9 +62,26 @@ cargo build -p forge-backend-cuda --features flash-attn
 # Run tests
 cargo test --workspace
 
-# Run the server
-cargo run --release -- serve --model /path/to/model --port 8080
+# Run the server (CUDA backend, paged KV cache)
+cargo run --release -p forge-server -- --model-path /path/to/model --port 8080
+
+# Run with CPU backend
+cargo run --release -p forge-server -- --model-path /path/to/model --backend cpu --kv-cache naive
 ```
+
+## Server CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-path` | (required) | Path to model directory (SafeTensors + config.json + tokenizer.json) |
+| `--port` | `8080` | HTTP listen port |
+| `--backend` | `cuda` | Backend: `cuda` or `cpu` |
+| `--device` | `0` | CUDA device ordinal |
+| `--kv-cache` | `paged` | KV cache type: `paged` or `naive` |
+| `--block-size` | `16` | Tokens per KV cache block (paged only) |
+| `--num-blocks` | `2048` | Total KV cache blocks (paged only) |
+| `--max-batch-size` | `256` | Max sequences in a batch |
+| `--max-prefill-tokens` | `4096` | Max prefill tokens per scheduling step |
 
 ## Testing
 
