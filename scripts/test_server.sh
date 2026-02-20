@@ -29,6 +29,10 @@ for i in $(seq 1 30); do
         echo "Server ready after ${i}s"
         break
     fi
+    if [ "$i" -eq 30 ]; then
+        echo "ERROR: Server failed to start within 30s" >&2
+        exit 1
+    fi
     sleep 1
 done
 

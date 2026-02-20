@@ -1,7 +1,7 @@
 #!/bin/bash
 # Benchmark script for Forge LLM inference server.
 #
-# Measures TTFT, ITL, throughput, and peak memory.
+# Measures TTFT, ITL, and throughput.
 #
 # Usage: bash scripts/benchmark.sh /path/to/model [num_requests] [max_tokens]
 #
@@ -33,6 +33,10 @@ for i in $(seq 1 30); do
     if curl -sf "${HOST}/forge/v1/health" > /dev/null 2>&1; then
         echo "Server ready after ${i}s"
         break
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "ERROR: Server failed to start within 30s" >&2
+        exit 1
     fi
     sleep 1
 done
@@ -82,6 +86,7 @@ for i in range(num_requests):
 
     start = time.perf_counter()
     first_token_time = None
+    last_token_time = None
     token_times = []
     token_count = 0
 
@@ -99,9 +104,11 @@ for i in range(num_requests):
                     now = time.perf_counter()
                     if first_token_time is None:
                         first_token_time = now
+                        last_token_time = now
                         ttfts.append(now - start)
                     else:
-                        token_times.append(now - token_times[-1] if token_times else now - first_token_time)
+                        token_times.append(now - last_token_time)
+                        last_token_time = now
                     token_count += 1
     except Exception as e:
         print(f"  Request {i+1}: ERROR - {e}")

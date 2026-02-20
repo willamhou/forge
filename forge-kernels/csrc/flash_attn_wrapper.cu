@@ -16,7 +16,7 @@
 // #include "flash_attn/flash_api.h"
 
 extern "C" int forge_flash_attn_fwd(
-    void* q, void* k, void* v, void* out,
+    const void* q, const void* k, const void* v, void* out,
     int batch_size, int seqlen_q, int seqlen_k,
     int num_heads, int num_heads_k, int head_dim,
     float softmax_scale, int is_causal,

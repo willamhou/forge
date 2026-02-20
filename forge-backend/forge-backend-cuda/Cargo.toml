@@ -8,11 +8,11 @@ license.workspace = true
 # FlashAttention FFI integration. Requires FlashAttention library headers
 # and libflash_attn.so at link time. Falls back to naive attention when
 # disabled or when the FFI call fails at runtime.
-flash-attn = []
+flash-attn = ["dep:tracing"]
 
 [dependencies]
 forge-core.workspace = true
 forge-kernels.workspace = true
 cudarc = { version = "0.17", features = ["cublas", "nvrtc", "f16", "cuda-version-from-build-system"] }
 half.workspace = true
-tracing.workspace = true
+tracing = { workspace = true, optional = true }

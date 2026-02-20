@@ -20,9 +20,9 @@ use crate::tensor::CudaTensor;
 #[allow(dead_code)]
 unsafe extern "C" {
     fn forge_flash_attn_fwd(
-        q: *mut std::ffi::c_void,
-        k: *mut std::ffi::c_void,
-        v: *mut std::ffi::c_void,
+        q: *const std::ffi::c_void,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
         out: *mut std::ffi::c_void,
         batch_size: i32,
         seqlen_q: i32,
@@ -67,6 +67,7 @@ pub fn attention_fwd(
     }
 
     // Fallback: naive attention (always available)
+    // TODO: pass is_causal to naive_attention when causal masking is implemented
     naive_attention(backend, q, k, v, scale)
 }
 
