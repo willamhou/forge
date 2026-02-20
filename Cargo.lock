@@ -454,6 +454,7 @@ dependencies = [
  "forge-core",
  "forge-kernels",
  "half",
+ "tracing",
 ]
 
 [[package]]
