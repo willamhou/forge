@@ -66,8 +66,8 @@ pub fn attention_fwd(
         }
     }
 
-    // Fallback: naive attention (always available)
-    // TODO: pass is_causal to naive_attention when causal masking is implemented
+    // Fallback: naive attention (always available).
+    // Causal masking is applied automatically when seq_len > 1.
     naive_attention(backend, q, k, v, scale)
 }
 

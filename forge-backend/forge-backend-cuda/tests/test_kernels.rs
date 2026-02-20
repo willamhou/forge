@@ -225,13 +225,15 @@ fn test_naive_attention_multi_head_multi_token() {
     assert_eq!(out.shape(), &[1, 2, 2, 2]);
 
     let result = backend.copy_to_host_f32(&out).unwrap();
-    // Head 0 sees V tokens: t0h0=[1,2], t1h0=[5,6] → uniform attn → mean = [3,4]
-    // Head 1 sees V tokens: t0h1=[3,4], t1h1=[7,8] → uniform attn → mean = [5,6]
-    // Both query tokens get the same result (uniform Q and K).
+    // With causal masking (seq_len > 1, kv_len == seq_len):
+    //
+    // t0h0 (q_pos=0): attends only to KV pos 0 → V[t0h0] = [1,2]
+    // t0h1 (q_pos=0): attends only to KV pos 0 → V[t0h1] = [3,4]
+    // t1h0 (q_pos=1): attends to KV pos 0,1 uniformly → mean([1,2],[5,6]) = [3,4]
+    // t1h1 (q_pos=1): attends to KV pos 0,1 uniformly → mean([3,4],[7,8]) = [5,6]
     //
     // Output layout [t0h0, t0h1, t1h0, t1h1]:
-    // t0h0 = [3,4], t0h1 = [5,6], t1h0 = [3,4], t1h1 = [5,6]
-    let expected = [3.0, 4.0, 5.0, 6.0, 3.0, 4.0, 5.0, 6.0];
+    let expected = [1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0, 6.0];
     for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
         assert!(
             (got - exp).abs() < 1e-2,

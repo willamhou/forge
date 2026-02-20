@@ -21,6 +21,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 tokio-stream.workspace = true
 minijinja = { version = "2.12", features = ["loader"] }
 tokenizers = "0.21"

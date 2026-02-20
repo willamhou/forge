@@ -48,3 +48,4 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 tokio-stream = "0.1"
+clap = { version = "4", features = ["derive"] }

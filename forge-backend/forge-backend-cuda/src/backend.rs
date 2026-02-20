@@ -217,11 +217,12 @@ struct KernelFunctions {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct CudaBackend {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
-    pub(crate) blas: CudaBlas,
-    kernels: KernelFunctions,
+    pub(crate) blas: Arc<CudaBlas>,
+    kernels: Arc<KernelFunctions>,
     _module: Arc<CudaModule>,
 }
 
@@ -260,8 +261,8 @@ impl CudaBackend {
         Ok(Self {
             ctx,
             stream,
-            blas,
-            kernels,
+            blas: Arc::new(blas),
+            kernels: Arc::new(kernels),
             _module: module,
         })
     }

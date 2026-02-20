@@ -189,6 +189,20 @@ impl<B: Backend> LlamaAttention<B> {
                 // scores = Q @ K^T * scale: [1, head_dim] @ [head_dim, kv_len] -> [1, kv_len]
                 let scores = backend.matmul(&q_tensor, &k_t)?;
                 let scores = backend.mul_scalar(&scores, scale)?;
+
+                // Apply causal mask: query at offset t can attend to KV positions
+                // 0..=(kv_len - seq_len + t). Mask out future positions.
+                let scores = if seq_len > 1 {
+                    let abs_pos = kv_len - seq_len + t;
+                    let mut scores_data = backend.copy_to_host_f32(&scores)?;
+                    for k_pos in (abs_pos + 1)..kv_len {
+                        scores_data[k_pos] = f32::NEG_INFINITY;
+                    }
+                    backend.copy_from_host_f32(&scores_data, &[1, kv_len])?
+                } else {
+                    scores
+                };
+
                 let attn_weights = backend.softmax(&scores, -1)?;
 
                 // Extract V[:,kv_h]: [kv_len, head_dim]

@@ -108,6 +108,21 @@ pub fn naive_attention(
         let scores = backend.matmul(&q_head, &k_t_head)?;
         let scores = backend.mul_scalar(&scores, scale)?;
 
+        // Apply causal mask for prefill (seq_len > 1): each query position
+        // can only attend to positions at or before it.
+        let scores = if seq_len > 1 {
+            let mut scores_data = backend.copy_to_host_f32(&scores)?;
+            for q_pos in 0..seq_len {
+                let abs_pos = kv_len - seq_len + q_pos;
+                for k_pos in (abs_pos + 1)..kv_len {
+                    scores_data[q_pos * kv_len + k_pos] = f32::NEG_INFINITY;
+                }
+            }
+            backend.copy_from_host_f32(&scores_data, &[seq_len, kv_len])?
+        } else {
+            scores
+        };
+
         // attn_weights = softmax(scores, dim=-1)
         let attn_weights = backend.softmax(&scores, -1)?;
 
