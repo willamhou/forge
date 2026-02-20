@@ -26,6 +26,12 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
+    /// JSON Schema for structured output (guided generation).
+    #[serde(default)]
+    pub json_schema: Option<serde_json::Value>,
+    /// Regex pattern for structured output (guided generation).
+    #[serde(default)]
+    pub regex: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

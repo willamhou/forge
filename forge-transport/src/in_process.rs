@@ -28,6 +28,7 @@ impl InProcessTransport {
         let engine_req = EngineRequest {
             inference_req: req,
             event_tx,
+            constraint: None,
         };
         self.request_tx
             .send(engine_req)

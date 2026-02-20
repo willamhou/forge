@@ -9,3 +9,5 @@ forge-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 rand.workspace = true
+regex-automata = "0.4"
+serde_json.workspace = true

@@ -13,6 +13,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 
 use forge_core::{FinishReason, InferenceRequest, SamplingParams};
+use forge_runtime::constraints::fsm::{FsmConstraint, TokenVocab};
+use forge_runtime::constraints::json_schema::build_json_schema_fsm;
+use forge_runtime::constraints::regex::build_regex_fsm;
 use forge_runtime::engine::{EngineEvent, EngineRequest};
 
 use crate::chat_template::ChatTemplate;
@@ -27,6 +30,8 @@ pub struct AppState {
     pub chat_template: ChatTemplate,
     /// Channel to submit requests to the engine.
     pub request_tx: mpsc::Sender<EngineRequest>,
+    /// Token vocabulary for FSM constraint building (shared across requests).
+    pub token_vocab: Option<Arc<TokenVocab>>,
 }
 
 /// POST /v1/chat/completions
@@ -107,6 +112,80 @@ pub async fn chat_completions(
         .stop_token_ids
         .push(state.tokenizer.eos_token_id());
 
+    // Validate mutual exclusion of structured output fields
+    if req.json_schema.is_some() && req.regex.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "cannot specify both json_schema and regex",
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    // Build FSM constraint if json_schema or regex is provided.
+    // FSM index building is O(states * vocab_size) and runs on a blocking thread
+    // to avoid starving the async runtime.
+    let constraint: Option<Box<dyn FsmConstraint>> =
+        if req.json_schema.is_some() || req.regex.is_some() {
+            let vocab = match &state.token_vocab {
+                Some(v) => Arc::clone(v),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "structured output not available: token vocabulary not loaded",
+                                "type": "invalid_request_error"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+
+            let schema_str = req.json_schema.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default());
+            let regex_str = req.regex.clone();
+
+            let build_result = tokio::task::spawn_blocking(move || {
+                if let Some(schema) = schema_str {
+                    build_json_schema_fsm(&schema, &vocab)
+                } else if let Some(pattern) = regex_str {
+                    build_regex_fsm(&pattern, &vocab)
+                } else {
+                    unreachable!()
+                }
+            })
+            .await;
+
+            match build_result {
+                Ok(Ok(fsm)) => Some(Box::new(fsm) as Box<dyn FsmConstraint>),
+                Ok(Err(e)) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": { "message": format!("constraint error: {e}"), "type": "invalid_request_error" }
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": { "message": format!("constraint build failed: {e}"), "type": "server_error" }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            None
+        };
+
     let inference_req = InferenceRequest {
         request_id: request_id.clone(),
         prompt_tokens,
@@ -119,6 +198,7 @@ pub async fn chat_completions(
     let engine_req = EngineRequest {
         inference_req,
         event_tx,
+        constraint,
     };
 
     if state.request_tx.send(engine_req).await.is_err() {

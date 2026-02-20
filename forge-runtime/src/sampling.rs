@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use forge_core::{SampleResult, SamplingContext, SamplingParams};
 
+use crate::constraints::fsm::FsmConstraint;
+
 /// Logit processor pipeline: applies temperature and penalties in the logit domain.
 /// Top-k, top-p, and min-p are applied in the probability domain by `CpuSampler`.
 pub struct LogitProcessorPipeline {
@@ -83,6 +85,20 @@ impl CpuSampler {
         params: &SamplingParams,
         generated_tokens: &[u32],
     ) -> forge_core::Result<SampleResult> {
+        self.sample_with_constraint(logits, params, generated_tokens, None)
+    }
+
+    /// Sample a single token with an optional FSM constraint.
+    ///
+    /// The constraint mask is applied in the logit domain (before softmax),
+    /// after penalties and temperature scaling.
+    pub fn sample_with_constraint(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        generated_tokens: &[u32],
+        constraint: Option<(&dyn FsmConstraint, u32)>,
+    ) -> forge_core::Result<SampleResult> {
         let token_counts = count_tokens(generated_tokens);
         let ctx = SamplingContext {
             generated_tokens,
@@ -94,6 +110,11 @@ impl CpuSampler {
 
         let pipeline = LogitProcessorPipeline::from_params(params);
         pipeline.apply(&mut processed, &ctx);
+
+        // Apply FSM constraint mask (step 8 in the pipeline)
+        if let Some((fsm, state)) = constraint {
+            fsm.mask_logits(state, &mut processed);
+        }
 
         if params.temperature <= 0.0 {
             return self.greedy(&processed);

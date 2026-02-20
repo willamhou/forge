@@ -17,6 +17,7 @@ use forge_core::{Backend, ModelConfig};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
 use forge_model_llama::load_llama_model;
+use forge_runtime::constraints::fsm::TokenVocab;
 use forge_runtime::engine::Engine;
 use forge_scheduler::{ContinuousBatchingScheduler, SchedulerConfig};
 use forge_server::api::openai::{self, AppState};
@@ -149,12 +150,24 @@ async fn run_server<B: Backend + Clone>(
         .unwrap_or("unknown")
         .to_string();
 
+    // --- Build token vocabulary for structured output ---
+    let token_vocab = {
+        let vocab_size = model_config.vocab_size;
+        info!("Building token vocabulary for structured output ({vocab_size} tokens)...");
+        let vocab = TokenVocab::from_decode_fn(vocab_size, |id| {
+            tokenizer.decode(&[id]).ok()
+        });
+        info!("Token vocabulary built");
+        Some(Arc::new(vocab))
+    };
+
     // --- Start HTTP server ---
     let state = Arc::new(AppState {
         model_name: model_name.clone(),
         tokenizer,
         chat_template,
         request_tx,
+        token_vocab,
     });
 
     let app = Router::new()

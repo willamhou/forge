@@ -11,6 +11,7 @@ use forge_core::{
     Scheduler, SeqMetadata,
 };
 
+use crate::constraints::fsm::FsmConstraint;
 use crate::sampling::CpuSampler;
 
 /// Events emitted by the engine to consumers (HTTP layer, transport).
@@ -36,6 +37,14 @@ pub struct EngineRequest {
     pub inference_req: InferenceRequest,
     /// Per-request channel for sending events back to the caller.
     pub event_tx: mpsc::Sender<EngineEvent>,
+    /// Optional FSM constraint for structured output.
+    pub constraint: Option<Box<dyn FsmConstraint>>,
+}
+
+/// Per-sequence FSM constraint state.
+struct SeqConstraint {
+    fsm: Box<dyn FsmConstraint>,
+    state: u32,
 }
 
 /// The inference engine: ties together model, scheduler, KV cache, and sampler.
@@ -49,6 +58,8 @@ pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     request_rx: mpsc::Receiver<EngineRequest>,
     /// Per-sequence event senders (seq_id → event_tx).
     event_senders: HashMap<u64, mpsc::Sender<EngineEvent>>,
+    /// Per-sequence FSM constraints (seq_id → constraint + state).
+    constraints: HashMap<u64, SeqConstraint>,
 }
 
 impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
@@ -67,6 +78,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             sampler: CpuSampler,
             request_rx,
             event_senders: HashMap::new(),
+            constraints: HashMap::new(),
         }
     }
 
@@ -122,6 +134,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     let _ = self.scheduler.cancel(seq.seq_id);
                     let _ = self.kv_cache.free(seq.seq_id);
                     self.event_senders.remove(&seq.seq_id);
+                    self.constraints.remove(&seq.seq_id);
                 }
             }
         }
@@ -142,6 +155,16 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         match self.scheduler.enqueue(req.inference_req) {
             Ok(handle) => {
                 self.event_senders.insert(handle.seq_id, req.event_tx);
+                if let Some(fsm) = req.constraint {
+                    let initial = fsm.initial_state();
+                    self.constraints.insert(
+                        handle.seq_id,
+                        SeqConstraint {
+                            fsm,
+                            state: initial,
+                        },
+                    );
+                }
             }
             Err(e) => {
                 // Best-effort error notification
@@ -162,6 +185,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 let _ = self.scheduler.cancel(seq_id);
                 let _ = self.kv_cache.free(seq_id);
                 self.event_senders.remove(&seq_id);
+                self.constraints.remove(&seq_id);
             }
         }
     }
@@ -182,12 +206,38 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let last_logits = &logits_host[(num_tokens - 1) * vocab_size..];
 
         let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
-        let result =
-            self.sampler
-                .sample_single(last_logits, &seq.sampling_params, &generated)?;
+
+        // Build constraint reference for sampling
+        let constraint_ref = self
+            .constraints
+            .get(&seq.seq_id)
+            .map(|c| (&*c.fsm as &dyn FsmConstraint, c.state));
+
+        let result = self.sampler.sample_with_constraint(
+            last_logits,
+            &seq.sampling_params,
+            &generated,
+            constraint_ref,
+        )?;
 
         let token_id = result.token_id;
         self.scheduler.append_token(seq.seq_id, token_id)?;
+
+        // Advance FSM state if constraint is active
+        if let Some(seq_constraint) = self.constraints.get_mut(&seq.seq_id) {
+            match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
+                Some(next) => seq_constraint.state = next,
+                None => {
+                    warn!(
+                        seq_id = seq.seq_id,
+                        token_id,
+                        fsm_state = seq_constraint.state,
+                        "FSM transition invalid for sampled token; removing constraint"
+                    );
+                    self.constraints.remove(&seq.seq_id);
+                }
+            }
+        }
 
         // Check stop conditions
         let should_finish = seq.sampling_params.stop_token_ids.contains(&token_id)
@@ -210,6 +260,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             )
             .await;
             self.event_senders.remove(&seq.seq_id);
+            self.constraints.remove(&seq.seq_id);
         } else {
             self.send_event(
                 seq.seq_id,
