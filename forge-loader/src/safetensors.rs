@@ -88,9 +88,17 @@ fn view_to_tensor<B: Backend>(
             backend.copy_from_host_f16(f16_data, shape)
         }
         safetensors::Dtype::BF16 => {
+            // BF16 tensors are auto-converted to F16 at load time because our
+            // compute kernels only support F32 and F16. This is the standard
+            // approach used by inference servers (BF16 → F16 is lossless for
+            // the exponent range and only slightly reduces mantissa precision).
             let bf16_data: &[half::bf16] = bytemuck::try_cast_slice(data)
                 .map_err(|e| ForgeError::ModelLoad(format!("BF16 alignment error: {e}")))?;
-            backend.copy_from_host_bf16(bf16_data, shape)
+            let f16_data: Vec<half::f16> = bf16_data
+                .iter()
+                .map(|v| half::f16::from_f32(v.to_f32()))
+                .collect();
+            backend.copy_from_host_f16(&f16_data, shape)
         }
         safetensors::Dtype::F32 => {
             let f32_data: &[f32] = bytemuck::try_cast_slice(data)

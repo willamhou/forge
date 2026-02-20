@@ -26,7 +26,7 @@ use super::types::*;
 /// Shared application state passed to handlers.
 pub struct AppState {
     pub model_name: String,
-    pub tokenizer: ForgeTokenizer,
+    pub tokenizer: Arc<ForgeTokenizer>,
     pub chat_template: ChatTemplate,
     /// Channel to submit requests to the engine.
     pub request_tx: mpsc::Sender<EngineRequest>,

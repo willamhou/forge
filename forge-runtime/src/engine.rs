@@ -2,6 +2,7 @@
 //! model forward passes, and token sampling.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -47,6 +48,10 @@ struct SeqConstraint {
     state: u32,
 }
 
+/// Optional decode function for stop_strings checking.
+/// Takes a slice of token IDs and returns the decoded text.
+pub type DecodeFn = Arc<dyn Fn(&[u32]) -> Option<String> + Send + Sync>;
+
 /// The inference engine: ties together model, scheduler, KV cache, and sampler.
 pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     model: M,
@@ -60,6 +65,8 @@ pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     event_senders: HashMap<u64, mpsc::Sender<EngineEvent>>,
     /// Per-sequence FSM constraints (seq_id → constraint + state).
     constraints: HashMap<u64, SeqConstraint>,
+    /// Optional token decoder for stop_strings enforcement.
+    decode_fn: Option<DecodeFn>,
 }
 
 impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
@@ -79,7 +86,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             request_rx,
             event_senders: HashMap::new(),
             constraints: HashMap::new(),
+            decode_fn: None,
         }
+    }
+
+    /// Set a decode function for stop_strings enforcement.
+    pub fn with_decode_fn(mut self, f: DecodeFn) -> Self {
+        self.decode_fn = Some(f);
+        self
     }
 
     /// Main engine loop. Runs until the request channel is closed.
@@ -107,9 +121,26 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 continue;
             }
 
-            // Allocate KV cache for new prefill sequences
+            // Allocate KV cache for new prefill sequences.
+            // Allocation errors are handled per-sequence rather than killing the
+            // engine loop, so transient OOM only drops the affected request.
+            let mut failed_seq_ids = Vec::new();
             for seq in &batch.prefill_seqs {
-                self.kv_cache.allocate(seq.seq_id, seq.token_ids.len())?;
+                if let Err(e) = self.kv_cache.allocate(seq.seq_id, seq.token_ids.len()) {
+                    error!(seq_id = seq.seq_id, error = %e, "KV cache allocation failed");
+                    self.send_event(
+                        seq.seq_id,
+                        EngineEvent::Error {
+                            seq_id: seq.seq_id,
+                            error: format!("cache allocation failed: {e}"),
+                        },
+                    )
+                    .await;
+                    let _ = self.scheduler.cancel(seq.seq_id);
+                    self.event_senders.remove(&seq.seq_id);
+                    self.constraints.remove(&seq.seq_id);
+                    failed_seq_ids.push(seq.seq_id);
+                }
             }
 
             // Phase 1: process one sequence at a time
@@ -117,6 +148,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .prefill_seqs
                 .into_iter()
                 .chain(batch.decode_seqs)
+                .filter(|s| !failed_seq_ids.contains(&s.seq_id))
                 .collect();
 
             for seq in &all_seqs {
@@ -240,12 +272,33 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         }
 
         // Check stop conditions
-        let should_finish = seq.sampling_params.stop_token_ids.contains(&token_id)
-            || generated.len() + 1 >= seq.sampling_params.max_tokens;
+        let stop_token_hit = seq.sampling_params.stop_token_ids.contains(&token_id);
+        let max_tokens_hit = generated.len() + 1 >= seq.sampling_params.max_tokens;
+
+        // Check stop_strings against decoded text (if decoder available and strings configured)
+        let stop_string_hit = if !seq.sampling_params.stop_strings.is_empty() {
+            self.decode_fn.as_ref().and_then(|decode| {
+                // Include the just-sampled token in the decode
+                let mut all_tokens = generated.clone();
+                all_tokens.push(token_id);
+                let text = decode(&all_tokens)?;
+                seq.sampling_params
+                    .stop_strings
+                    .iter()
+                    .any(|s| text.ends_with(s))
+                    .then_some(true)
+            })
+        } else {
+            None
+        };
+
+        let should_finish = stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false);
 
         if should_finish {
-            let reason = if seq.sampling_params.stop_token_ids.contains(&token_id) {
+            let reason = if stop_token_hit {
                 FinishReason::EosToken
+            } else if stop_string_hit.unwrap_or(false) {
+                FinishReason::StopString
             } else {
                 FinishReason::MaxTokens
             };

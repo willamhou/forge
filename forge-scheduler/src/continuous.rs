@@ -108,6 +108,9 @@ impl Scheduler for ContinuousBatchingScheduler {
         // Step 2: Schedule prefill for waiting sequences (FCFS, within budget).
         let mut prefill_token_budget = self.config.max_prefill_tokens;
         let mut newly_running = Vec::new();
+        // Track blocks already promised to earlier prefills in this scheduling pass
+        // to avoid overcommitting cache capacity.
+        let mut blocks_committed: usize = 0;
 
         while let Some(&seq_id) = self.waiting.front() {
             if batch.total_seqs() >= self.config.max_batch_size {
@@ -129,15 +132,17 @@ impl Scheduler for ContinuousBatchingScheduler {
                 break;
             }
 
-            // Check if cache can accommodate
+            // Check if cache can accommodate (accounting for blocks already committed)
             let blocks_needed =
                 (prompt_len + cache_usage.block_size - 1) / cache_usage.block_size;
-            if blocks_needed > cache_usage.free_blocks() {
+            let available = cache_usage.free_blocks().saturating_sub(blocks_committed);
+            if blocks_needed > available {
                 break;
             }
 
             self.waiting.pop_front();
             prefill_token_budget -= prompt_len;
+            blocks_committed += blocks_needed;
 
             batch.prefill_seqs.push(ScheduledSeq {
                 seq_id,

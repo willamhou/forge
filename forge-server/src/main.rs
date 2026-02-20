@@ -166,13 +166,22 @@ async fn run_server<B: Backend + Clone>(
     let (request_tx, request_rx) = mpsc::channel(1024);
 
     // --- Spawn engine ---
+    // Wrap tokenizer in Arc so both the engine's decode callback and AppState can share it.
+    let tokenizer = Arc::new(tokenizer);
+
+    // Provide a decode function so the engine can check stop_strings.
+    let decode_tokenizer = Arc::clone(&tokenizer);
+    let decode_fn: std::sync::Arc<dyn Fn(&[u32]) -> Option<String> + Send + Sync> =
+        std::sync::Arc::new(move |ids: &[u32]| decode_tokenizer.decode(ids).ok());
+
     let mut engine = Engine::new(
         model,
         backend,
         Box::new(scheduler),
         kv_cache,
         request_rx,
-    );
+    )
+    .with_decode_fn(decode_fn);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {

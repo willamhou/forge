@@ -163,3 +163,30 @@ fn test_decode_before_new_prefill() {
     assert_eq!(batch.decode_seqs.len(), 1);
     assert_eq!(batch.prefill_seqs.len(), 1);
 }
+
+#[test]
+fn test_prefill_overcommit_protection() {
+    let config = SchedulerConfig {
+        max_batch_size: 10,
+        max_prefill_tokens: 4096,
+    };
+    let mut scheduler = ContinuousBatchingScheduler::new(config);
+
+    // Cache with 3 free blocks of size 16 = 48 tokens capacity
+    let cache = CacheUsage {
+        total_blocks: 5,
+        used_blocks: 2,
+        block_size: 16,
+    };
+
+    // Enqueue 3 requests, each needing 2 blocks (20 tokens each)
+    // Total need: 6 blocks, but only 3 are available
+    scheduler.enqueue(make_request("req-1", vec![0; 20])).unwrap();
+    scheduler.enqueue(make_request("req-2", vec![0; 20])).unwrap();
+    scheduler.enqueue(make_request("req-3", vec![0; 20])).unwrap();
+
+    let batch = scheduler.schedule(&cache).unwrap();
+    // Only the first request should be scheduled (2 blocks), leaving 1 free block
+    // which isn't enough for the second request (needs 2 blocks)
+    assert_eq!(batch.prefill_seqs.len(), 1);
+}
