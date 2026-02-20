@@ -216,6 +216,9 @@ struct KernelFunctions {
     transpose_f32: CudaFunction,
 }
 
+// CudaBackend is Clone for sharing with components like NaiveKvCache,
+// but cuBLAS/kernel calls are NOT thread-safe for concurrent use.
+// The engine must ensure single-threaded access to the backend.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct CudaBackend {

@@ -1,6 +1,6 @@
 //! Forge LLM Inference Server — OpenAI-compatible HTTP API.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::routing::{get, post};
@@ -91,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Chat template loaded");
 
     // --- Create engine components ---
-    let kv_cache = NaiveKvCache::new(backend.clone(), model_config.num_hidden_layers, 64);
+    let kv_cache =
+        NaiveKvCache::new(backend.clone(), model_config.num_hidden_layers, cli.max_batch_size);
     let scheduler_config = SchedulerConfig {
         max_batch_size: cli.max_batch_size,
         max_prefill_tokens: cli.max_prefill_tokens,
@@ -108,10 +109,13 @@ async fn main() -> anyhow::Result<()> {
         Box::new(kv_cache),
         request_rx,
     );
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             error!("Engine error: {e}");
         }
+        // Signal the HTTP server to shut down when the engine exits.
+        let _ = shutdown_tx.send(true);
     });
     info!("Engine spawned");
 
@@ -141,13 +145,25 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     info!("Forge serving '{model_name}' on {addr}");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // Shut down when engine exits or on Ctrl-C.
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    info!("Engine exited, shutting down HTTP server");
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl-C, shutting down");
+                }
+            }
+        })
+        .await?;
 
     Ok(())
 }
 
 /// Load chat template from tokenizer_config.json or fall back to ChatML.
-fn load_chat_template(model_path: &PathBuf) -> anyhow::Result<ChatTemplate> {
+fn load_chat_template(model_path: &Path) -> anyhow::Result<ChatTemplate> {
     let config_path = model_path.join("tokenizer_config.json");
     if config_path.exists() {
         let text = std::fs::read_to_string(&config_path)?;

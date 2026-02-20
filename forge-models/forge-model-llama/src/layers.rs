@@ -192,6 +192,8 @@ impl<B: Backend> LlamaAttention<B> {
 
                 // Apply causal mask: query at offset t can attend to KV positions
                 // 0..=(kv_len - seq_len + t). Mask out future positions.
+                // During decode (seq_len == 1), no mask needed — single query at
+                // latest position naturally attends to all cached entries.
                 let scores = if seq_len > 1 {
                     let abs_pos = kv_len - seq_len + t;
                     let mut scores_data = backend.copy_to_host_f32(&scores)?;

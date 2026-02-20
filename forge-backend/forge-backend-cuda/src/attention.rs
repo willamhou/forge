@@ -110,6 +110,9 @@ pub fn naive_attention(
 
         // Apply causal mask for prefill (seq_len > 1): each query position
         // can only attend to positions at or before it.
+        // During decode (seq_len == 1), the single query is at the latest
+        // position and naturally attends to all cached KV entries — no mask needed.
+        // NOTE: If multi-token decode (e.g. speculative) is added, revisit this guard.
         let scores = if seq_len > 1 {
             let mut scores_data = backend.copy_to_host_f32(&scores)?;
             for q_pos in 0..seq_len {
