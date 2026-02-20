@@ -57,14 +57,10 @@ impl Backend for CpuBackend {
 
     // ── Allocation ──────────────────────────────────────────────
 
-    fn allocate(&self, shape: &[usize], dtype: DType) -> Result<CpuTensor> {
-        match dtype {
-            DType::F32 => {
-                let numel: usize = shape.iter().product();
-                Ok(CpuTensor::new(vec![0.0; numel], shape.to_vec()))
-            }
-            _ => Err(ForgeError::UnsupportedDtype(dtype)),
-        }
+    fn allocate(&self, shape: &[usize], _dtype: DType) -> Result<CpuTensor> {
+        // CPU backend stores everything as f32 internally, regardless of requested dtype.
+        let numel: usize = shape.iter().product();
+        Ok(CpuTensor::new(vec![0.0; numel], shape.to_vec()))
     }
 
     fn allocate_zeros(&self, shape: &[usize], dtype: DType) -> Result<CpuTensor> {
@@ -118,6 +114,11 @@ impl Backend for CpuBackend {
                 expected: vec![k, n],
                 got: b_shape.to_vec(),
             });
+        }
+        if m > i32::MAX as usize || n > i32::MAX as usize || k > i32::MAX as usize {
+            return Err(ForgeError::InvalidArgument(
+                "matmul dimensions exceed i32::MAX (BLAS limitation)".into(),
+            ));
         }
         let mut c = vec![0.0f32; m * n];
         unsafe {
@@ -364,7 +365,8 @@ impl Backend for CpuBackend {
             }
         }
         let mut total_first_dim = 0;
-        let mut all_data = Vec::new();
+        let total_len: usize = tensors.iter().map(|t| t.len()).sum();
+        let mut all_data = Vec::with_capacity(total_len);
         for t in tensors {
             total_first_dim += t.shape()[0];
             all_data.extend_from_slice(t.data());

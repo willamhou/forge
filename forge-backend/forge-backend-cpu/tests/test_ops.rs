@@ -1,5 +1,5 @@
 use forge_backend_cpu::CpuBackend;
-use forge_core::{Backend, Tensor};
+use forge_core::{Backend, DType, Tensor};
 
 #[test]
 fn test_matmul_2x3_times_3x2() {
@@ -227,4 +227,38 @@ fn test_rope() {
             "index {i}: got {got}, expected {exp}"
         );
     }
+}
+
+#[test]
+fn test_copy_from_host_f16() {
+    let backend = CpuBackend::new();
+    let data: Vec<half::f16> = [1.0f32, 2.0, 3.0]
+        .iter()
+        .map(|&x| half::f16::from_f32(x))
+        .collect();
+    let t = backend.copy_from_host_f16(&data, &[3]).unwrap();
+    let result = backend.copy_to_host_f32(&t).unwrap();
+    assert_eq!(result, vec![1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn test_copy_from_host_bf16() {
+    let backend = CpuBackend::new();
+    let data: Vec<half::bf16> = [4.0f32, 5.0, 6.0]
+        .iter()
+        .map(|&x| half::bf16::from_f32(x))
+        .collect();
+    let t = backend.copy_from_host_bf16(&data, &[3]).unwrap();
+    let result = backend.copy_to_host_f32(&t).unwrap();
+    assert_eq!(result, vec![4.0, 5.0, 6.0]);
+}
+
+#[test]
+fn test_allocate_any_dtype() {
+    let backend = CpuBackend::new();
+    // CPU backend should accept all dtypes (stores as f32 internally)
+    let t = backend.allocate(&[2, 3], DType::BF16).unwrap();
+    assert_eq!(t.shape(), &[2, 3]);
+    let data = backend.copy_to_host_f32(&t).unwrap();
+    assert_eq!(data, vec![0.0; 6]);
 }
