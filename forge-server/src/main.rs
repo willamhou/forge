@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use forge_backend_cpu::CpuBackend;
 use forge_backend_cuda::CudaBackend;
+use forge_core::{Backend, ModelConfig};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
 use forge_model_llama::load_llama_model;
@@ -40,9 +42,13 @@ struct Cli {
     #[arg(long, default_value = "4096")]
     max_prefill_tokens: usize,
 
-    /// CUDA device ordinal
+    /// CUDA device ordinal (only used with --backend cuda)
     #[arg(long, default_value = "0")]
     device: usize,
+
+    /// Backend to use: "cuda" or "cpu"
+    #[arg(long, default_value = "cuda")]
+    backend: String,
 }
 
 #[tokio::main]
@@ -68,10 +74,26 @@ async fn main() -> anyhow::Result<()> {
         model_config.vocab_size,
     );
 
-    // --- Init CUDA backend ---
-    let backend = CudaBackend::new(cli.device)?;
-    info!("CUDA backend initialized (device {})", cli.device);
+    match cli.backend.as_str() {
+        "cpu" => {
+            let backend = CpuBackend::new();
+            info!("CPU backend initialized");
+            run_server(backend, &cli, model_config).await
+        }
+        "cuda" => {
+            let backend = CudaBackend::new(cli.device)?;
+            info!("CUDA backend initialized (device {})", cli.device);
+            run_server(backend, &cli, model_config).await
+        }
+        other => anyhow::bail!("Unknown backend: {other}. Use 'cpu' or 'cuda'."),
+    }
+}
 
+async fn run_server<B: Backend + Clone>(
+    backend: B,
+    cli: &Cli,
+    model_config: ModelConfig,
+) -> anyhow::Result<()> {
     // --- Load model weights ---
     info!("Loading model from {}...", cli.model_path.display());
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
