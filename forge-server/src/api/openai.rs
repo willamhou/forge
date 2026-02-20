@@ -137,8 +137,7 @@ pub async fn chat_completions(
         .as_secs();
 
     if is_stream {
-        handle_streaming(event_rx, state.clone(), request_id, state.model_name.clone(), now)
-            .into_response()
+        handle_streaming(event_rx, state.clone(), request_id, now).into_response()
     } else {
         handle_non_streaming(
             event_rx,
@@ -230,7 +229,6 @@ fn handle_streaming(
     mut event_rx: mpsc::Receiver<EngineEvent>,
     state: Arc<AppState>,
     request_id: String,
-    model: String,
     created: u64,
 ) -> Sse<ReceiverStream<std::result::Result<Event, std::convert::Infallible>>> {
     let (sse_tx, sse_rx) =
@@ -238,6 +236,7 @@ fn handle_streaming(
 
     tokio::spawn(async move {
         let mut decoder = IncrementalDecoder::new();
+        let model = state.model_name.clone();
 
         let initial_chunk = ChatCompletionChunk {
             id: request_id.clone(),
@@ -287,6 +286,27 @@ fn handle_streaming(
                     }
                 }
                 EngineEvent::Finish { reason, .. } => {
+                    // Flush any remaining decoded text from multi-byte sequences
+                    if let Some(remaining) = decoder.flush(&state.tokenizer) {
+                        let flush_chunk = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: Delta {
+                                    role: None,
+                                    content: Some(remaining),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        if let Ok(data) = serde_json::to_string(&flush_chunk) {
+                            let _ = sse_tx.send(Ok(Event::default().data(data))).await;
+                        }
+                    }
+
                     let reason_str = match reason {
                         FinishReason::EosToken | FinishReason::StopString => "stop",
                         FinishReason::MaxTokens => "length",

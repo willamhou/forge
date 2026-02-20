@@ -191,18 +191,26 @@ fn load_chat_template(model_path: &Path) -> anyhow::Result<ChatTemplate> {
         let text = std::fs::read_to_string(&config_path)?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if let Some(tmpl) = value.get("chat_template").and_then(|v| v.as_str()) {
-            let bos_token = value
-                .get("bos_token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let eos_token = value
-                .get("eos_token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            return Ok(ChatTemplate::with_tokens(tmpl, bos_token, eos_token)?);
+            let bos_token = extract_token_str(&value, "bos_token");
+            let eos_token = extract_token_str(&value, "eos_token");
+            return Ok(ChatTemplate::with_tokens(tmpl, &bos_token, &eos_token)?);
         }
     }
     // Fallback to ChatML
     info!("No chat_template in tokenizer_config.json, using ChatML default");
     Ok(ChatTemplate::chatml_default()?)
+}
+
+/// Extract a special token string from tokenizer_config.json.
+/// Handles both plain string `"bos_token": "<s>"` and object form
+/// `"bos_token": {"content": "<s>", ...}` used by some HuggingFace models.
+fn extract_token_str(config: &serde_json::Value, key: &str) -> String {
+    config
+        .get(key)
+        .and_then(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("content").and_then(|c| c.as_str()).map(String::from))
+        })
+        .unwrap_or_default()
 }

@@ -44,6 +44,7 @@ impl ForgeTokenizer {
 }
 
 /// Incremental decoder for streaming token-by-token output.
+#[derive(Default)]
 pub struct IncrementalDecoder {
     pending_ids: Vec<u32>,
     prev_text_len: usize,
@@ -51,10 +52,7 @@ pub struct IncrementalDecoder {
 
 impl IncrementalDecoder {
     pub fn new() -> Self {
-        Self {
-            pending_ids: Vec::new(),
-            prev_text_len: 0,
-        }
+        Self::default()
     }
 
     pub fn add_token(&mut self, token_id: u32, tokenizer: &ForgeTokenizer) -> Option<String> {
@@ -86,5 +84,21 @@ impl IncrementalDecoder {
         }
 
         Some(new_text)
+    }
+
+    /// Flush any remaining pending bytes (e.g. on stream finish).
+    pub fn flush(&mut self, tokenizer: &ForgeTokenizer) -> Option<String> {
+        if self.pending_ids.is_empty() {
+            return None;
+        }
+        let decoded = tokenizer.decode(&self.pending_ids).ok()?;
+        let new_text = decoded[self.prev_text_len..].to_string();
+        self.pending_ids.clear();
+        self.prev_text_len = 0;
+        if new_text.is_empty() {
+            None
+        } else {
+            Some(new_text)
+        }
     }
 }
