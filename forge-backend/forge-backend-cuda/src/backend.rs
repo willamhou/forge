@@ -687,6 +687,14 @@ impl Backend for CudaBackend {
                 .memcpy_dtov(tensor.f32_slice()?)
                 .map_err(|e| ForgeError::Cuda(e.to_string())),
             DType::F16 => self.cast_f16_to_f32_host(tensor),
+            DType::BF16 => {
+                // No GPU cast kernel yet — download bf16 to host and convert.
+                let bf16_host: Vec<half::bf16> = self
+                    .stream
+                    .memcpy_dtov(tensor.bf16_slice()?)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                Ok(bf16_host.iter().map(|v| v.to_f32()).collect())
+            }
             other => Err(ForgeError::InvalidArgument(format!(
                 "copy_to_host_f32 not supported for {:?}",
                 other

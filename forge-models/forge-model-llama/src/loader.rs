@@ -35,9 +35,7 @@ pub fn load_llama_model<B: Backend + Clone>(
     };
     let lm_head = backend.transpose(&lm_head_raw, 0, 1)?;
 
-    // Cap RoPE precomputation to avoid huge allocations
-    let rope_max_len = config.max_position_embeddings.min(8192);
-    let rope_freqs = RopeFreqs::precompute(&config, rope_max_len, backend)?;
+    let rope_freqs = RopeFreqs::precompute(&config, config.max_position_embeddings, backend)?;
 
     Ok(LlamaModel::new(
         config,

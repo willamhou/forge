@@ -34,7 +34,13 @@ impl LogitProcessorPipeline {
         if (self.repetition_penalty - 1.0).abs() < f32::EPSILON {
             return;
         }
+        // Deduplicate: penalize each unique token exactly once regardless
+        // of how many times it appears in generated_tokens.
+        let mut seen = std::collections::HashSet::new();
         for &token_id in ctx.generated_tokens {
+            if !seen.insert(token_id) {
+                continue;
+            }
             let idx = token_id as usize;
             if idx < logits.len() {
                 if logits[idx] > 0.0 {
