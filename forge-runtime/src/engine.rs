@@ -105,9 +105,25 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             let cache_usage = self.kv_cache.usage();
             let batch = self.scheduler.schedule(&cache_usage)?;
 
+            // Notify clients of rejected sequences before checking whether
+            // the batch is empty.  `is_empty()` ignores `rejected_seq_ids`, so
+            // a scheduling round that only rejects requests would otherwise skip
+            // error emission entirely, leaving request handlers hanging.
+            for seq_id in &batch.rejected_seq_ids {
+                self.send_event(
+                    *seq_id,
+                    EngineEvent::Error {
+                        seq_id: *seq_id,
+                        error: "prompt exceeds max_prefill_tokens".into(),
+                    },
+                );
+                self.event_senders.remove(seq_id);
+                self.constraints.remove(seq_id);
+            }
+
             if batch.is_empty() {
-                if drained == 0 {
-                    // No work and no new requests — wait for a request or short timeout
+                if drained == 0 && batch.rejected_seq_ids.is_empty() {
+                    // No work, no rejections, no new requests — wait for a request
                     tokio::select! {
                         req = self.request_rx.recv() => {
                             match req {
@@ -139,27 +155,12 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                             seq_id: seq.seq_id,
                             error: format!("cache allocation failed: {e}"),
                         },
-                    )
-                    .await;
+                    );
                     let _ = self.scheduler.cancel(seq.seq_id);
                     self.event_senders.remove(&seq.seq_id);
                     self.constraints.remove(&seq.seq_id);
                     failed_seq_ids.push(seq.seq_id);
                 }
-            }
-
-            // Notify clients of rejected sequences (prompt too large).
-            for seq_id in &batch.rejected_seq_ids {
-                self.send_event(
-                    *seq_id,
-                    EngineEvent::Error {
-                        seq_id: *seq_id,
-                        error: "prompt exceeds max_prefill_tokens".into(),
-                    },
-                )
-                .await;
-                self.event_senders.remove(seq_id);
-                self.constraints.remove(seq_id);
             }
 
             // Phase 1: process one sequence at a time
@@ -171,7 +172,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .collect();
 
             for seq in &all_seqs {
-                if let Err(e) = self.process_sequence(seq).await {
+                if let Err(e) = self.process_sequence(seq) {
                     error!(seq_id = seq.seq_id, error = %e, "sequence processing failed");
                     self.send_event(
                         seq.seq_id,
@@ -179,8 +180,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                             seq_id: seq.seq_id,
                             error: e.to_string(),
                         },
-                    )
-                    .await;
+                    );
                     // Clean up failed sequence
                     let _ = self.scheduler.cancel(seq.seq_id);
                     let _ = self.kv_cache.free(seq.seq_id);
@@ -227,23 +227,34 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         }
     }
 
-    /// Send an event to a specific sequence's consumer. If the consumer has
-    /// disconnected, cancel the sequence and clean up resources.
-    async fn send_event(&mut self, seq_id: u64, event: EngineEvent) {
+    /// Send an event to a specific sequence's consumer. Uses `try_send` to
+    /// avoid blocking the engine loop when a consumer is slow. If the channel
+    /// is full or disconnected, cancel the sequence and clean up resources.
+    fn send_event(&mut self, seq_id: u64, event: EngineEvent) {
         if let Some(tx) = self.event_senders.get(&seq_id) {
-            if tx.send(event).await.is_err() {
-                warn!(seq_id, "event receiver dropped, cancelling sequence");
-                let _ = self.scheduler.cancel(seq_id);
-                let _ = self.kv_cache.free(seq_id);
-                self.event_senders.remove(&seq_id);
-                self.constraints.remove(&seq_id);
+            match tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(seq_id, "event channel full, cancelling slow consumer");
+                    let _ = self.scheduler.cancel(seq_id);
+                    let _ = self.kv_cache.free(seq_id);
+                    self.event_senders.remove(&seq_id);
+                    self.constraints.remove(&seq_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(seq_id, "event receiver dropped, cancelling sequence");
+                    let _ = self.scheduler.cancel(seq_id);
+                    let _ = self.kv_cache.free(seq_id);
+                    self.event_senders.remove(&seq_id);
+                    self.constraints.remove(&seq_id);
+                }
             }
         }
     }
 
     /// Process a single sequence: forward pass + sample + emit event.
     /// For chunked prefill, non-final chunks only run the forward pass (no sampling).
-    async fn process_sequence(&mut self, seq: &ScheduledSeq) -> Result<()> {
+    fn process_sequence(&mut self, seq: &ScheduledSeq) -> Result<()> {
         let input = self.build_input(seq);
 
         let output = self.model.forward(&input, &mut *self.kv_cache)?;
@@ -283,8 +294,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     seq_id: seq.seq_id,
                     reason: FinishReason::MaxTokens,
                 },
-            )
-            .await;
+            );
             self.event_senders.remove(&seq.seq_id);
             self.constraints.remove(&seq.seq_id);
             return Ok(());
@@ -311,8 +321,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                         seq_id: seq.seq_id,
                         reason: FinishReason::StopString,
                     },
-                )
-                .await;
+                );
                 self.event_senders.remove(&seq.seq_id);
                 self.constraints.remove(&seq.seq_id);
                 return Ok(());
@@ -377,8 +386,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                          no valid FSM transition from state {fsm_state} for token {bad_token}"
                     ),
                 },
-            )
-            .await;
+            );
             self.event_senders.remove(&seq.seq_id);
             return Ok(());
         }
@@ -423,8 +431,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     token_id,
                     text: None, // decoded by the server layer
                 },
-            )
-            .await;
+            );
         }
 
         if should_finish {
@@ -445,8 +452,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     seq_id: seq.seq_id,
                     reason,
                 },
-            )
-            .await;
+            );
             self.event_senders.remove(&seq.seq_id);
             self.constraints.remove(&seq.seq_id);
         }

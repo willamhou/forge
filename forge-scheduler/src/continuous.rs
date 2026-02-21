@@ -124,10 +124,16 @@ impl Scheduler for ContinuousBatchingScheduler {
         }
 
         // Step 2: Continue chunked prefills that are already in progress.
+        // These are subject to max_prefill_tokens so they don't starve
+        // new requests or blow the per-step prefill budget.
+        let mut prefill_token_budget = self.config.max_prefill_tokens;
         let mut completed_prefills = Vec::new();
         let prefilling_snapshot: Vec<u64> = self.prefilling.clone();
         for &seq_id in &prefilling_snapshot {
             if batch.total_seqs() >= self.config.max_batch_size {
+                break;
+            }
+            if prefill_token_budget == 0 {
                 break;
             }
             if let Some(seq) = self.sequences.get(&seq_id) {
@@ -138,7 +144,12 @@ impl Scheduler for ContinuousBatchingScheduler {
                     .config
                     .prefill_chunk_size
                     .unwrap_or(remaining)
-                    .min(remaining);
+                    .min(remaining)
+                    .min(prefill_token_budget);
+
+                if chunk_size == 0 {
+                    break;
+                }
 
                 let chunk_tokens = seq.prompt_tokens[offset..offset + chunk_size].to_vec();
                 let is_last = offset + chunk_size >= prompt_len;
@@ -152,6 +163,8 @@ impl Scheduler for ContinuousBatchingScheduler {
                     is_last_prefill_chunk: is_last,
                     total_prompt_len: prompt_len,
                 });
+
+                prefill_token_budget -= chunk_size;
 
                 if is_last {
                     completed_prefills.push(seq_id);
@@ -176,12 +189,7 @@ impl Scheduler for ContinuousBatchingScheduler {
             self.running.push(seq_id);
         }
 
-        // Step 3: Schedule prefill for new waiting sequences (FCFS, within budget).
-        let mut prefill_token_budget = self.config.max_prefill_tokens;
-        // Subtract tokens already committed to continuing prefills above
-        for scheduled in &batch.prefill_seqs {
-            prefill_token_budget = prefill_token_budget.saturating_sub(scheduled.token_ids.len());
-        }
+        // Step 3: Schedule prefill for new waiting sequences (FCFS, within remaining budget).
 
         let mut newly_running = Vec::new();
         let mut newly_prefilling = Vec::new();
@@ -306,10 +314,16 @@ impl Scheduler for ContinuousBatchingScheduler {
         for &seq_id in &newly_prefilling {
             if let Some(seq) = self.sequences.get_mut(&seq_id) {
                 seq.state = SeqState::Running;
-                seq.prefill_offset = match self.config.prefill_chunk_size {
-                    Some(cs) => cs.min(seq.prompt_tokens.len()),
-                    None => seq.prompt_tokens.len(),
-                };
+                // Use the actual scheduled chunk length from the batch entry rather
+                // than the configured prefill_chunk_size, because the chunk may have
+                // been clamped to the remaining prefill budget.
+                let actual_chunk_len = batch
+                    .prefill_seqs
+                    .iter()
+                    .find(|s| s.seq_id == seq_id)
+                    .map(|s| s.token_ids.len())
+                    .unwrap_or(seq.prompt_tokens.len());
+                seq.prefill_offset = actual_chunk_len;
             }
         }
         self.prefilling.extend(newly_prefilling);
