@@ -372,19 +372,18 @@ fn object_schema_fixed_order(prop_patterns: &[String], is_required: &[bool]) -> 
 
     let inner = parts.join("");
     if !seen_required {
-        // All optional — allow any ordered subset of properties.
-        // For each possible starting property, build a right-to-left
-        // nested optional chain. Example with [A, B, C]:
-        //   A(,B(,C)?)?  |  B(,C)?  |  C
-        // Wrapping everything in `(...)?` also allows the empty object.
+        // All optional — allow any ordered subset (including non-contiguous).
+        // For each possible starting property, every subsequent property is
+        // independently optional. Example with [A, B, C]:
+        //   A(,B)?(,C)?  |  B(,C)?  |  C
+        // This allows {A}, {A,C}, {B}, {B,C}, {A,B,C}, etc.
         let mut alternatives: Vec<String> = Vec::new();
         for start in 0..prop_patterns.len() {
-            let last = prop_patterns.len() - 1;
-            let mut nested = prop_patterns[last].clone();
-            for j in (start..last).rev() {
-                nested = format!("{}({WS},{nested})?", prop_patterns[j]);
+            let mut chain = prop_patterns[start].clone();
+            for j in (start + 1)..prop_patterns.len() {
+                chain = format!("{chain}({WS},{prop})?", prop = prop_patterns[j]);
             }
-            alternatives.push(nested);
+            alternatives.push(chain);
         }
         let alts = alternatives.join("|");
         Ok(format!(r"\{{{WS}({alts})?{WS}\}}"))

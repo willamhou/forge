@@ -466,7 +466,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 Some(false)
             };
 
-            if !prefix_match.unwrap_or(true) || flush_all {
+            if !prefix_match.unwrap_or(false) || flush_all {
                 // Safe to flush all buffered tokens
                 if let Some(buf) = self.stop_buffers.remove(&seq.seq_id) {
                     for &tid in &buf {
