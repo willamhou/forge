@@ -56,7 +56,7 @@ cargo check --workspace
 # Build release
 cargo build --release --workspace
 
-# Build with FlashAttention FFI (requires libflash_attn)
+# Build with FlashAttention FFI (compiles wrapper .cu via build.rs, requires CUDA toolkit)
 cargo build -p forge-backend-cuda --features flash-attn
 
 # Run tests
@@ -113,7 +113,7 @@ bash scripts/benchmark.sh /path/to/model 10 128
 
 | Flag | Crate | Description |
 |------|-------|-------------|
-| `flash-attn` | `forge-backend-cuda` | Enable FlashAttention FFI (requires library headers + linked `.so`) |
+| `flash-attn` | `forge-backend-cuda` | Enable FlashAttention FFI (`build.rs` compiles wrapper `.cu`, requires CUDA toolkit; falls back to naive attention at runtime if library unavailable) |
 
 ## Architecture
 
