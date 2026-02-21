@@ -67,6 +67,10 @@ pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     constraints: HashMap<u64, SeqConstraint>,
     /// Optional token decoder for stop_strings enforcement.
     decode_fn: Option<DecodeFn>,
+    /// Per-sequence token buffer for stop_string look-ahead.
+    /// Tokens are held here until we confirm they don't form part of a
+    /// stop string, then flushed to the event channel.
+    stop_buffers: HashMap<u64, Vec<u32>>,
 }
 
 impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
@@ -87,6 +91,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             event_senders: HashMap::new(),
             constraints: HashMap::new(),
             decode_fn: None,
+            stop_buffers: HashMap::new(),
         }
     }
 
@@ -119,6 +124,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 );
                 self.event_senders.remove(seq_id);
                 self.constraints.remove(seq_id);
+                self.stop_buffers.remove(seq_id);
             }
 
             if batch.is_empty() {
@@ -159,6 +165,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     let _ = self.scheduler.cancel(seq.seq_id);
                     self.event_senders.remove(&seq.seq_id);
                     self.constraints.remove(&seq.seq_id);
+                    self.stop_buffers.remove(&seq.seq_id);
                     failed_seq_ids.push(seq.seq_id);
                 }
             }
@@ -186,6 +193,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     let _ = self.kv_cache.free(seq.seq_id);
                     self.event_senders.remove(&seq.seq_id);
                     self.constraints.remove(&seq.seq_id);
+                    self.stop_buffers.remove(&seq.seq_id);
                 }
             }
         }
@@ -240,6 +248,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     let _ = self.kv_cache.free(seq_id);
                     self.event_senders.remove(&seq_id);
                     self.constraints.remove(&seq_id);
+                    self.stop_buffers.remove(&seq_id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     warn!(seq_id, "event receiver dropped, cancelling sequence");
@@ -247,6 +256,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     let _ = self.kv_cache.free(seq_id);
                     self.event_senders.remove(&seq_id);
                     self.constraints.remove(&seq_id);
+                    self.stop_buffers.remove(&seq_id);
                 }
             }
         }
@@ -297,6 +307,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             );
             self.event_senders.remove(&seq.seq_id);
             self.constraints.remove(&seq.seq_id);
+            self.stop_buffers.remove(&seq.seq_id);
             return Ok(());
         }
 
@@ -324,6 +335,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 );
                 self.event_senders.remove(&seq.seq_id);
                 self.constraints.remove(&seq.seq_id);
+                self.stop_buffers.remove(&seq.seq_id);
                 return Ok(());
             }
         }
@@ -375,6 +387,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 "FSM transition invalid for sampled token; aborting sequence"
             );
             self.constraints.remove(&seq.seq_id);
+            self.stop_buffers.remove(&seq.seq_id);
             self.scheduler.finish(seq.seq_id, FinishReason::Cancelled)?;
             self.kv_cache.free(seq.seq_id)?;
             self.send_event(
@@ -395,12 +408,20 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let stop_token_hit = seq.sampling_params.stop_token_ids.contains(&token_id);
         let max_tokens_hit = generated.len() + 1 >= seq.sampling_params.max_tokens;
 
-        // Check stop_strings against decoded text (if decoder available and strings configured).
-        // Use `contains()` rather than `ends_with()` because a BPE token can decode
-        // to text that extends past the stop marker (e.g. "<stop>...").
-        let stop_string_hit = if !seq.sampling_params.stop_strings.is_empty() {
+        // Stop-string handling with look-ahead buffering.
+        //
+        // When stop_strings are configured, tokens are buffered until we can
+        // confirm they don't form part of a stop string. This prevents partial
+        // stop-string leakage in streaming mode.
+        let has_stop_strings = !seq.sampling_params.stop_strings.is_empty();
+        let stop_string_hit = if has_stop_strings {
+            // Buffer this token
+            self.stop_buffers
+                .entry(seq.seq_id)
+                .or_default()
+                .push(token_id);
+
             self.decode_fn.as_ref().and_then(|decode| {
-                // Include the just-sampled token in the decode
                 let mut all_tokens = generated.clone();
                 all_tokens.push(token_id);
                 let text = decode(&all_tokens)?;
@@ -417,19 +438,54 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let should_finish =
             stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false) || fsm_finished;
 
-        // Emit the token event unless a stop string was hit — OpenAI semantics
-        // exclude the stop sequence from output, so we suppress the triggering token.
-        // NOTE: If a stop string spans multiple tokens, earlier tokens may have
-        // already been emitted in streaming mode. A proper fix requires a look-ahead
-        // buffer that withholds tokens until they're confirmed safe. This is a known
-        // limitation tracked for a future streaming-buffer implementation.
-        if !stop_string_hit.unwrap_or(false) {
+        if stop_string_hit.unwrap_or(false) {
+            // Stop string hit — discard all buffered tokens (they contain
+            // the stop sequence and should not be emitted per OpenAI semantics).
+            self.stop_buffers.remove(&seq.seq_id);
+        } else if has_stop_strings {
+            // No stop string yet. Check if the current decoded text ends
+            // with a prefix of any stop string — if so, keep buffering.
+            // Otherwise flush safe tokens.
+            let flush_all = should_finish; // finishing for other reasons → flush everything
+            let prefix_match = if !flush_all {
+                self.decode_fn.as_ref().and_then(|decode| {
+                    let mut all_tokens = generated.clone();
+                    all_tokens.push(token_id);
+                    let text = decode(&all_tokens)?;
+                    let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
+                        // Check if the text ends with any non-empty prefix of s
+                        (1..=s.len()).any(|prefix_len| text.ends_with(&s[..prefix_len]))
+                    });
+                    Some(is_prefix)
+                })
+            } else {
+                Some(false)
+            };
+
+            if !prefix_match.unwrap_or(true) || flush_all {
+                // Safe to flush all buffered tokens
+                if let Some(buf) = self.stop_buffers.remove(&seq.seq_id) {
+                    for &tid in &buf {
+                        self.send_event(
+                            seq.seq_id,
+                            EngineEvent::Token {
+                                seq_id: seq.seq_id,
+                                token_id: tid,
+                                text: None,
+                            },
+                        );
+                    }
+                }
+            }
+            // else: keep buffering — text ends with stop-string prefix
+        } else {
+            // No stop_strings configured — emit immediately
             self.send_event(
                 seq.seq_id,
                 EngineEvent::Token {
                     seq_id: seq.seq_id,
                     token_id,
-                    text: None, // decoded by the server layer
+                    text: None,
                 },
             );
         }
@@ -446,6 +502,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             };
             self.scheduler.finish(seq.seq_id, reason)?;
             self.kv_cache.free(seq.seq_id)?;
+            // Clean up any remaining stop buffer
+            self.stop_buffers.remove(&seq.seq_id);
             self.send_event(
                 seq.seq_id,
                 EngineEvent::Finish {

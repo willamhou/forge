@@ -321,32 +321,70 @@ fn object_schema_to_regex(
 ///
 /// Produces a regex where properties appear in the iteration order provided
 /// by the schema, with optional properties wrapped in `(...)?`.
+///
+/// Strategy: each non-first property carries a leading comma inside its
+/// group. Optional properties at the start have no comma and are followed
+/// by a conditional comma on the next entry.
 fn object_schema_fixed_order(prop_patterns: &[String], is_required: &[bool]) -> Result<String> {
-    // Build a pattern like: \{ WS req1 WS , (WS opt1 WS ,)? WS req2 WS \}
-    // Each required property is always present; optional ones get `(...)?`.
-    // Commas between properties are handled by always emitting them and
-    // wrapping optional properties *with* their leading comma.
+    if prop_patterns.is_empty() {
+        return Ok(format!(r"\{{{WS}\}}"));
+    }
+
+    // Split into required and optional indices for cleaner generation.
+    // In fixed-order mode we output all required properties separated by
+    // commas, and each optional property is wrapped with its own leading
+    // comma in a `(...)?` group.  This avoids double/trailing/leading
+    // comma issues regardless of which optionals are present.
+    //
+    // Example with (opt, req1, opt2, req2):
+    //   ({opt}{WS},)? {req1} ({WS},{opt2})? {WS},{req2}
+    //
+    // The trick: the first required property never has a leading comma.
+    // Optional properties *before* the first required carry a trailing comma
+    // inside their group (consumed by the following required property).
+    // Optional properties *after* a required carry a leading comma inside
+    // their group.
+
     let mut parts: Vec<String> = Vec::new();
+    let mut seen_required = false;
+
     for (i, pattern) in prop_patterns.iter().enumerate() {
         if is_required[i] {
-            if parts.is_empty() {
+            if !seen_required {
+                // First required property: no leading comma, but preceding
+                // optional properties (if any) already end with a comma.
                 parts.push(pattern.clone());
+                seen_required = true;
             } else {
+                // Subsequent required: always preceded by comma
                 parts.push(format!("{WS},{pattern}"));
             }
-        } else if parts.is_empty() {
-            // Optional at start: no leading comma, wrap the property
+        } else if !seen_required {
+            // Optional before any required property: include trailing comma
+            // so the following required property doesn't get a spurious comma
+            // when this optional is absent.
             parts.push(format!("({pattern}{WS},)?"));
         } else {
-            // Optional after earlier properties: include leading comma in wrap
+            // Optional after a required property: leading comma inside group
             parts.push(format!("({WS},{pattern})?"));
         }
     }
 
     let inner = parts.join("");
-    if inner.is_empty() || is_required.iter().all(|&r| !r) {
+    if !seen_required {
         // All optional — the entire body is optional
-        Ok(format!(r"\{{{WS}({inner})?{WS}\}}"))
+        // Strip trailing commas from the optional groups since there's
+        // nothing following them. Rebuild without trailing commas.
+        let mut opt_parts: Vec<String> = Vec::new();
+        for pattern in prop_patterns {
+            if opt_parts.is_empty() {
+                opt_parts.push(pattern.clone());
+            } else {
+                opt_parts.push(format!("{WS},{pattern}"));
+            }
+        }
+        let opt_inner = opt_parts.join("");
+        Ok(format!(r"\{{{WS}({opt_inner})?{WS}\}}"))
     } else {
         Ok(format!(r"\{{{WS}{inner}{WS}\}}"))
     }
