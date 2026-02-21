@@ -228,14 +228,16 @@ impl Scheduler for ContinuousBatchingScheduler {
                 continue;
             }
 
-            // Determine how many tokens to prefill this round
+            // Determine how many tokens to prefill this round.
+            // Clamp to available budget so a large prefill_chunk_size doesn't
+            // permanently block the queue when budget < chunk_size.
             let chunk_size = match self.config.prefill_chunk_size {
-                Some(cs) => cs.min(prompt_len),
+                Some(cs) => cs.min(prompt_len).min(prefill_token_budget),
                 None => prompt_len,
             };
 
-            // Check budget
-            if chunk_size > prefill_token_budget {
+            // Check budget (only breaks for non-chunked mode where chunk_size == prompt_len)
+            if chunk_size == 0 || chunk_size > prefill_token_budget {
                 break;
             }
 

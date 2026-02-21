@@ -103,12 +103,15 @@ pub fn dequantize_q4_k(data: &[u8], n_elements: usize) -> Result<Vec<f16>> {
             let sc = scales[sub_block.min(N_SUB_BLOCKS - 1)] as f32;
             let m = mins[sub_block.min(N_SUB_BLOCKS - 1)] as f32;
 
-            // Extract 4-bit quantized value
-            let byte_idx = i / 2;
-            let nibble = if i % 2 == 0 {
-                qs[byte_idx] & 0x0F
+            // Extract 4-bit quantized value.
+            // GGML Q4_K stores 64 elements per 32 bytes: the first 32 values
+            // come from low nibbles, the next 32 from high nibbles.
+            let group = i / 64;
+            let pos_in_group = i % 64;
+            let nibble = if pos_in_group < 32 {
+                qs[group * 32 + pos_in_group] & 0x0F
             } else {
-                (qs[byte_idx] >> 4) & 0x0F
+                (qs[group * 32 + (pos_in_group - 32)] >> 4) & 0x0F
             };
 
             let val = d * sc * nibble as f32 - dmin * m;

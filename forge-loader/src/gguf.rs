@@ -372,7 +372,13 @@ fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool> {
 }
 
 fn read_gguf_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
+    const MAX_STRING_LEN: usize = 10_000_000;
     let len = read_u64(cursor)? as usize;
+    if len > MAX_STRING_LEN {
+        return Err(ForgeError::ModelLoad(format!(
+            "GGUF string length {len} exceeds maximum {MAX_STRING_LEN}"
+        )));
+    }
     let mut buf = vec![0u8; len];
     cursor.read_exact(&mut buf)?;
     String::from_utf8(buf)
