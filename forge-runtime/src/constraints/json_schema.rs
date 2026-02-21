@@ -372,19 +372,22 @@ fn object_schema_fixed_order(prop_patterns: &[String], is_required: &[bool]) -> 
 
     let inner = parts.join("");
     if !seen_required {
-        // All optional — the entire body is optional
-        // Strip trailing commas from the optional groups since there's
-        // nothing following them. Rebuild without trailing commas.
-        let mut opt_parts: Vec<String> = Vec::new();
-        for pattern in prop_patterns {
-            if opt_parts.is_empty() {
-                opt_parts.push(pattern.clone());
-            } else {
-                opt_parts.push(format!("{WS},{pattern}"));
+        // All optional — allow any ordered subset of properties.
+        // For each possible starting property, build a right-to-left
+        // nested optional chain. Example with [A, B, C]:
+        //   A(,B(,C)?)?  |  B(,C)?  |  C
+        // Wrapping everything in `(...)?` also allows the empty object.
+        let mut alternatives: Vec<String> = Vec::new();
+        for start in 0..prop_patterns.len() {
+            let last = prop_patterns.len() - 1;
+            let mut nested = prop_patterns[last].clone();
+            for j in (start..last).rev() {
+                nested = format!("{}({WS},{nested})?", prop_patterns[j]);
             }
+            alternatives.push(nested);
         }
-        let opt_inner = opt_parts.join("");
-        Ok(format!(r"\{{{WS}({opt_inner})?{WS}\}}"))
+        let alts = alternatives.join("|");
+        Ok(format!(r"\{{{WS}({alts})?{WS}\}}"))
     } else {
         Ok(format!(r"\{{{WS}{inner}{WS}\}}"))
     }

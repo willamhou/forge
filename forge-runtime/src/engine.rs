@@ -453,8 +453,12 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     all_tokens.push(token_id);
                     let text = decode(&all_tokens)?;
                     let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
-                        // Check if the text ends with any non-empty prefix of s
-                        (1..=s.len()).any(|prefix_len| text.ends_with(&s[..prefix_len]))
+                        // Check if the text ends with any non-empty prefix of s.
+                        // Use char_indices to iterate on character boundaries
+                        // (byte slicing on non-ASCII would panic).
+                        s.char_indices().skip(1).any(|(byte_pos, _)| {
+                            text.ends_with(&s[..byte_pos])
+                        }) || text.ends_with(s)
                     });
                     Some(is_prefix)
                 })
