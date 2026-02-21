@@ -1,0 +1,23 @@
+Codemap Diff Report
+===================
+Date: 2026-02-21
+Branch: feat/phase1-mvp
+
+Status: INITIAL GENERATION (no previous codemaps existed)
+Diff percentage: 100% (all new files)
+
+Files generated:
+  docs/codemaps/architecture.md  - Overall architecture, dependency graph, request flow
+  docs/codemaps/backend.md       - Backend traits, CUDA/CPU backends, kernels, KV cache
+  docs/codemaps/data.md          - Core types, API types, engine events, loader types
+  docs/codemaps/runtime.md       - Engine, sampling, FSM constraints, scheduler, server, model
+
+Coverage:
+  - 13/13 workspace crates documented
+  - All public traits and key structs captured
+  - Request flow documented end-to-end
+  - Feature flags documented
+  - External dependency versions listed
+
+Note: Since this is an initial generation (100% new content), no approval
+threshold applies. All files were created fresh.
