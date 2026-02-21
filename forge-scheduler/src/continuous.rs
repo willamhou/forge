@@ -185,8 +185,24 @@ impl Scheduler for ContinuousBatchingScheduler {
 
         let mut newly_running = Vec::new();
         let mut newly_prefilling = Vec::new();
-        let mut blocks_committed: usize = 0;
         let mut to_reject: Vec<u64> = Vec::new();
+
+        // Reserve blocks for running decode sequences that may cross a block
+        // boundary on this step (each decode emits 1 token).  Worst case:
+        // every running sequence needs one extra block.
+        let decode_block_reserve = if cache_usage.block_size == 0 {
+            0
+        } else {
+            self.running
+                .iter()
+                .filter(|&&sid| {
+                    self.sequences
+                        .get(&sid)
+                        .map_or(false, |s| s.total_len() % cache_usage.block_size == 0)
+                })
+                .count()
+        };
+        let mut blocks_committed: usize = decode_block_reserve;
 
         while let Some(&seq_id) = self.waiting.front() {
             if batch.total_seqs() >= self.config.max_batch_size {

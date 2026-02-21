@@ -139,13 +139,15 @@ fn unpack_q4_k_scales(packed: &[u8]) -> ([u8; 8], [u8; 8]) {
     for i in 0..4 {
         mins[i] = packed[4 + i] & 0x3F;
     }
-    // Last 4 scales: 2 bits from packed[0..4] >> 6 (low) + 4 bits from packed[8..12] (high)
+    // Last 4 scales: 4 bits from packed[8..12] (low) + 2 bits from packed[0..4] >> 6 (high)
+    // Matches GGML get_scale_min_k4: d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
     for i in 0..4 {
-        scales[4 + i] = (packed[i] >> 6) | ((packed[8 + i] & 0x0F) << 2);
+        scales[4 + i] = (packed[8 + i] & 0x0F) | ((packed[i] >> 6) << 4);
     }
-    // Last 4 mins: 2 bits from packed[4..8] >> 6 (low) + 4 bits from packed[8..12] >> 4 (high)
+    // Last 4 mins: 4 bits from packed[8..12] >> 4 (low) + 2 bits from packed[4..8] >> 6 (high)
+    // Matches GGML get_scale_min_k4: m = (q[j+4] >> 4) | ((q[j] >> 6) << 4)
     for i in 0..4 {
-        mins[4 + i] = (packed[4 + i] >> 6) | ((packed[8 + i] >> 4) << 2);
+        mins[4 + i] = (packed[8 + i] >> 4) | ((packed[4 + i] >> 6) << 4);
     }
 
     (scales, mins)
