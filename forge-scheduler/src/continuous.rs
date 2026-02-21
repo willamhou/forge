@@ -44,6 +44,16 @@ pub struct ContinuousBatchingScheduler {
 
 impl ContinuousBatchingScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
+        // Treat prefill_chunk_size == 0 as disabled (None) to prevent
+        // infinite-loop where zero-sized chunks never advance offset.
+        let config = if config.prefill_chunk_size == Some(0) {
+            SchedulerConfig {
+                prefill_chunk_size: None,
+                ..config
+            }
+        } else {
+            config
+        };
         Self {
             config,
             waiting: VecDeque::new(),

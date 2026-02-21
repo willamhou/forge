@@ -28,6 +28,29 @@ pub fn naive_attention(
     v: &CudaTensor,
     scale: f32,
 ) -> Result<CudaTensor> {
+    naive_attention_impl(backend, q, k, v, scale, true)
+}
+
+/// Compute naive scaled dot-product attention with explicit causal control.
+pub fn naive_attention_causal(
+    backend: &CudaBackend,
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
+    scale: f32,
+    is_causal: bool,
+) -> Result<CudaTensor> {
+    naive_attention_impl(backend, q, k, v, scale, is_causal)
+}
+
+fn naive_attention_impl(
+    backend: &CudaBackend,
+    q: &CudaTensor,
+    k: &CudaTensor,
+    v: &CudaTensor,
+    scale: f32,
+    is_causal: bool,
+) -> Result<CudaTensor> {
     let q_shape = q.shape();
     let k_shape = k.shape();
     let v_shape = v.shape();
@@ -110,7 +133,7 @@ pub fn naive_attention(
         // During decode (seq_len == 1), the single query is at the latest
         // position and naturally attends to all cached KV entries — no mask needed.
         // NOTE: If multi-token decode (e.g. speculative) is added, revisit this guard.
-        let scores = if seq_len > 1 {
+        let scores = if is_causal && seq_len > 1 {
             let mut scores_data = backend.copy_to_host_f32(&scores)?;
             for q_pos in 0..seq_len {
                 let abs_pos = kv_len - seq_len + q_pos;

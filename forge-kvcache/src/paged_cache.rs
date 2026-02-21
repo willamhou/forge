@@ -251,6 +251,13 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
     }
 
     fn get_kv(&self, seq_id: u64, layer: usize) -> Result<(B::Tensor, B::Tensor)> {
+        if layer >= self.num_layers {
+            return Err(ForgeError::InvalidArgument(format!(
+                "layer {layer} exceeds num_layers {}",
+                self.num_layers
+            )));
+        }
+
         let seq = self.sequences.get(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
 

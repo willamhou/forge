@@ -6,7 +6,7 @@
 
 use forge_core::Result;
 
-use crate::attention::naive_attention;
+use crate::attention::naive_attention_causal;
 use crate::backend::CudaBackend;
 use crate::tensor::CudaTensor;
 
@@ -44,7 +44,7 @@ pub fn attention_fwd(
     k: &CudaTensor,
     v: &CudaTensor,
     scale: f32,
-    #[allow(unused_variables)] is_causal: bool,
+    is_causal: bool,
 ) -> Result<CudaTensor> {
     #[cfg(feature = "flash-attn")]
     {
@@ -61,8 +61,7 @@ pub fn attention_fwd(
     }
 
     // Fallback: naive attention (always available).
-    // Causal masking is applied automatically when seq_len > 1.
-    naive_attention(backend, q, k, v, scale)
+    naive_attention_causal(backend, q, k, v, scale, is_causal)
 }
 
 /// Attempt to call FlashAttention via FFI.

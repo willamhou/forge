@@ -356,7 +356,13 @@ fn json_value_to_regex_literal(value: &serde_json::Value) -> String {
         }
         serde_json::Value::Number(n) => regex_escape(&n.to_string()),
         serde_json::Value::String(s) => {
-            format!(r#""{}""#, regex_escape(s))
+            // JSON-encode the string content first (handles quotes, backslashes,
+            // control characters), then regex-escape the encoded interior.
+            let json_encoded = serde_json::to_string(s).unwrap_or_default();
+            // json_encoded includes surrounding quotes, so strip them and
+            // regex-escape the interior to produce a literal regex match.
+            let inner = &json_encoded[1..json_encoded.len() - 1];
+            format!(r#""{}""#, regex_escape(inner))
         }
         serde_json::Value::Array(arr) => {
             let elements: Vec<String> = arr.iter().map(json_value_to_regex_literal).collect();
@@ -369,9 +375,11 @@ fn json_value_to_regex_literal(value: &serde_json::Value) -> String {
             let entries: Vec<String> = obj
                 .iter()
                 .map(|(k, v)| {
+                    let json_key = serde_json::to_string(k).unwrap_or_default();
+                    let key_inner = &json_key[1..json_key.len() - 1];
                     format!(
                         r#"{WS}"{}"{WS}:{WS}{}"#,
-                        regex_escape(k),
+                        regex_escape(key_inner),
                         json_value_to_regex_literal(v)
                     )
                 })
