@@ -109,9 +109,9 @@ fn string_schema_to_regex(
             ForgeError::InvalidArgument(format!("invalid string pattern: {e}"))
         })?;
         // Wrap in a non-capturing group to prevent breakout.
-        // Use `+` (one or more) rather than `*` so the pattern must match at least
-        // once, preserving the schema's constraint semantics.
-        return Ok(format!(r#""(?:{pattern})+""#));
+        // JSON Schema `pattern` means the string content must fully match the
+        // regex, so wrap without repetition quantifier.
+        return Ok(format!(r#""(?:{pattern})""#));
     }
 
     let min_len = obj
@@ -226,64 +226,84 @@ fn object_schema_to_regex(
 
             // Build the object regex with correct comma handling.
             //
-            // Key rule: a comma only appears between two properties that are both
-            // present. For optional properties that precede a required one, the
-            // comma is included as a trailing comma inside the optional group:
-            //   `(opt_prop ,)? req_prop`  — comma only if opt is present
+            // Strategy depends on whether required properties exist:
             //
-            // For optional properties after a required one, the comma is included
-            // as a leading comma inside the optional group:
-            //   `req_prop (, opt_prop)?`  — comma only if opt is present
+            // Mixed (has required): required properties are always present so
+            // commas between them are mandatory. Optional-before-required uses a
+            // trailing comma `(opt,)?`, optional-after-required uses a leading
+            // comma `(,opt)?`.
             //
-            // Check if any required property follows index i
-            let has_required_after = |i: usize| -> bool {
-                patterns[i + 1..].iter().any(|(_, req)| *req)
-            };
+            // All-optional (no required): use nested optional groups so commas
+            // only appear between two present properties:
+            //   `(prop1 (, prop2 (, prop3)? )? )?`
+            let has_any_required = patterns.iter().any(|(_, req)| *req);
 
-            let mut result = format!(r"\{{{WS}");
-            let mut any_required_before = false;
-            let mut any_emitted = false;
-
-            for (i, (prop_pattern, is_required)) in patterns.iter().enumerate() {
-                if !any_emitted {
-                    // First property — no comma needed
-                    if *is_required {
-                        result.push_str(prop_pattern);
-                        any_required_before = true;
-                    } else if i + 1 < patterns.len() && has_required_after(i) {
-                        // Optional before a required: trailing comma in the group
-                        result.push_str(&format!("({prop_pattern}{WS},)?"));
+            if !has_any_required {
+                // All-optional: nested optional groups with commas between them.
+                // Pattern: \{ WS (p1 (WS , p2 (WS , p3)?)?)? WS \}
+                let mut result = format!(r"\{{{WS}");
+                let n = patterns.len();
+                // Open nested groups: (p1 (, p2 (, p3 ...)?)?)?
+                for (i, (prop_pattern, _)) in patterns.iter().enumerate() {
+                    if i == 0 {
+                        result.push_str(&format!("({prop_pattern}"));
                     } else {
-                        result.push_str(&format!("({prop_pattern})?"));
-                    }
-                } else if *is_required {
-                    if any_required_before {
-                        // Required before us — comma is mandatory
-                        result.push_str(&format!("{WS},{prop_pattern}"));
-                    } else {
-                        // Only optionals before us — they carry trailing commas
-                        // in their groups, so no leading comma needed here
-                        result.push_str(prop_pattern);
-                    }
-                    any_required_before = true;
-                } else {
-                    // Optional property after something
-                    if any_required_before {
-                        // Required exists before — comma is mandatory if this appears
-                        result.push_str(&format!("({WS},{prop_pattern})?"));
-                    } else if i + 1 < patterns.len() && has_required_after(i) {
-                        // Only optionals before, required after: trailing comma
-                        result.push_str(&format!("({prop_pattern}{WS},)?"));
-                    } else {
-                        result.push_str(&format!("({prop_pattern})?"));
+                        result.push_str(&format!("({WS},{prop_pattern}"));
                     }
                 }
+                // Close all nested groups
+                for _ in 0..n {
+                    result.push_str(")?");
+                }
+                result.push_str(&format!("{WS}\\}}"));
+                Ok(result)
+            } else {
+                // Mixed: use trailing/leading comma approach.
+                let has_required_after = |i: usize| -> bool {
+                    patterns[i + 1..].iter().any(|(_, req)| *req)
+                };
 
-                any_emitted = true;
+                let mut result = format!(r"\{{{WS}");
+                let mut any_required_before = false;
+                let mut any_emitted = false;
+
+                for (i, (prop_pattern, is_required)) in patterns.iter().enumerate() {
+                    if !any_emitted {
+                        if *is_required {
+                            result.push_str(prop_pattern);
+                            any_required_before = true;
+                        } else {
+                            // First property is optional, required follows later
+                            result.push_str(&format!("({prop_pattern}{WS},)?"));
+                        }
+                    } else if *is_required {
+                        if any_required_before {
+                            result.push_str(&format!("{WS},{prop_pattern}"));
+                        } else {
+                            // Only optionals before — they carry trailing commas
+                            result.push_str(prop_pattern);
+                        }
+                        any_required_before = true;
+                    } else {
+                        // Optional after something
+                        if any_required_before {
+                            result.push_str(&format!("({WS},{prop_pattern})?"));
+                        } else if has_required_after(i) {
+                            // Optional between optionals and a later required
+                            result.push_str(&format!("({prop_pattern}{WS},)?"));
+                        } else {
+                            // Optional after required — leading comma
+                            // (any_required_before is true in this branch
+                            // so this case shouldn't be reached, but guard)
+                            result.push_str(&format!("({WS},{prop_pattern})?"));
+                        }
+                    }
+                    any_emitted = true;
+                }
+
+                result.push_str(&format!("{WS}\\}}"));
+                Ok(result)
             }
-
-            result.push_str(&format!("{WS}\\}}"));
-            Ok(result)
         }
         _ => {
             // Empty object or no properties specified
@@ -447,6 +467,43 @@ mod tests {
         assert_eq!(regex_escape("hello"), "hello");
         assert_eq!(regex_escape("a.b"), r"a\.b");
         assert_eq!(regex_escape("a+b"), r"a\+b");
+    }
+
+    #[test]
+    fn test_all_optional_properties_comma_handling() {
+        // Schema: two optional properties, no required
+        // Must match: {}, {"a":1}, {"a":1,"b":2}
+        // Must NOT match: {"a":1"b":2} (missing comma)
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            }
+        }"#;
+        let regex = schema_to_regex(schema).unwrap();
+        let dfa = regex_automata::dfa::dense::DFA::new(&regex).unwrap();
+        use regex_automata::dfa::Automaton;
+        use regex_automata::Anchored;
+        use regex_automata::util::start;
+
+        let matches = |input: &str| -> bool {
+            let start_config = start::Config::new().anchored(Anchored::Yes);
+            let Ok(start_state) = dfa.start_state(&start_config) else {
+                return false;
+            };
+            let mut state = start_state;
+            for &b in input.as_bytes() {
+                state = dfa.next_state(state, b);
+            }
+            state = dfa.next_eoi_state(state);
+            dfa.is_match_state(state)
+        };
+
+        assert!(matches(r#"{}"#), "should match empty object");
+        assert!(matches(r#"{"a":1}"#), "should match single optional");
+        assert!(matches(r#"{"a":1,"b":2}"#), "should match both optionals with comma");
+        assert!(!matches(r#"{"a":1"b":2}"#), "should reject missing comma between optionals");
     }
 
     #[test]

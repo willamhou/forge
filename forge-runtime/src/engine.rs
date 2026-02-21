@@ -280,8 +280,11 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let token_id = result.token_id;
         self.scheduler.append_token(seq.seq_id, token_id)?;
 
-        // Advance FSM state if constraint is active
+        // Advance FSM state if constraint is active.
+        // We use a two-phase approach: first compute the result inside the
+        // borrow, then handle abort outside to avoid double-borrow of `self`.
         let mut fsm_finished = false;
+        let mut fsm_abort: Option<(u32, u32)> = None; // (fsm_state, token_id)
         if let Some(seq_constraint) = self.constraints.get_mut(&seq.seq_id) {
             match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
                 Some(next) => {
@@ -299,15 +302,36 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     }
                 }
                 None => {
-                    warn!(
-                        seq_id = seq.seq_id,
-                        token_id,
-                        fsm_state = seq_constraint.state,
-                        "FSM transition invalid for sampled token; removing constraint"
-                    );
-                    self.constraints.remove(&seq.seq_id);
+                    // Record state for abort handling after the borrow ends.
+                    fsm_abort = Some((seq_constraint.state, token_id));
                 }
             }
+        }
+
+        // Handle FSM abort outside the borrow scope.
+        if let Some((fsm_state, bad_token)) = fsm_abort {
+            error!(
+                seq_id = seq.seq_id,
+                token_id = bad_token,
+                fsm_state,
+                "FSM transition invalid for sampled token; aborting sequence"
+            );
+            self.constraints.remove(&seq.seq_id);
+            self.scheduler.finish(seq.seq_id, FinishReason::Cancelled)?;
+            self.kv_cache.free(seq.seq_id)?;
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Error {
+                    seq_id: seq.seq_id,
+                    error: format!(
+                        "structured output constraint violated: \
+                         no valid FSM transition from state {fsm_state} for token {bad_token}"
+                    ),
+                },
+            )
+            .await;
+            self.event_senders.remove(&seq.seq_id);
+            return Ok(());
         }
 
         // Check stop conditions

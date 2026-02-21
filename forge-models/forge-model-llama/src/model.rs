@@ -57,10 +57,13 @@ impl<B: Backend + Clone> Model for LlamaModel<B> {
         let hidden = self.backend.embedding(&self.embed_tokens, token_ids)?;
         // hidden shape: [seq_len, hidden_size]
 
-        // Position offset: for prefill this is 0, for decode it's the
-        // number of previously cached tokens so RoPE uses correct positions.
+        // Position offset for RoPE: absolute position of the first token in
+        // this forward pass. For chunked prefill, prompt_len tracks the total
+        // tokens fed so far (offset + chunk_size), so subtracting token_ids.len()
+        // gives the chunk's starting position. For decode, prompt_len +
+        // generated_len - 1 is the position of the single decode token.
         let pos_offset = if seq_meta.is_prefill {
-            0
+            seq_meta.prompt_len.saturating_sub(token_ids.len())
         } else {
             seq_meta.prompt_len + seq_meta.generated_len - token_ids.len()
         };
