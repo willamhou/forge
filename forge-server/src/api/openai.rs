@@ -265,6 +265,8 @@ async fn handle_non_streaming(
     if let Some(err) = engine_error {
         // Distinguish client errors (bad request) from server errors.
         let is_client_error = err.contains("exceeds max_prefill_tokens")
+            || err.contains("empty prompt")
+            || err.contains("blocks but cache only has")
             || err.contains("failed to enqueue")
             || err.contains("constraint violated");
         let (status, error_type) = if is_client_error {

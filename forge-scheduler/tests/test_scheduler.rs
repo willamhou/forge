@@ -334,7 +334,7 @@ fn test_chunked_prefill_no_reject_long_prompts() {
         .unwrap();
 
     let batch = scheduler.schedule(&cache).unwrap();
-    assert!(batch.rejected_seq_ids.is_empty());
+    assert!(batch.rejected.is_empty());
     assert_eq!(batch.prefill_seqs.len(), 1);
     assert_eq!(batch.prefill_seqs[0].token_ids.len(), 4);
 }

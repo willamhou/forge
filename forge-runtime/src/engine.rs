@@ -111,15 +111,15 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             let batch = self.scheduler.schedule(&cache_usage)?;
 
             // Notify clients of rejected sequences before checking whether
-            // the batch is empty.  `is_empty()` ignores `rejected_seq_ids`, so
+            // the batch is empty.  `is_empty()` ignores `rejected`, so
             // a scheduling round that only rejects requests would otherwise skip
             // error emission entirely, leaving request handlers hanging.
-            for seq_id in &batch.rejected_seq_ids {
+            for (seq_id, reason) in &batch.rejected {
                 self.send_event(
                     *seq_id,
                     EngineEvent::Error {
                         seq_id: *seq_id,
-                        error: "prompt exceeds max_prefill_tokens".into(),
+                        error: reason.clone(),
                     },
                 );
                 self.event_senders.remove(seq_id);
@@ -128,7 +128,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             }
 
             if batch.is_empty() {
-                if drained == 0 && batch.rejected_seq_ids.is_empty() {
+                if drained == 0 && batch.rejected.is_empty() {
                     // No work, no rejections, no new requests — wait for a request
                     tokio::select! {
                         req = self.request_rx.recv() => {
@@ -265,6 +265,26 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     /// Process a single sequence: forward pass + sample + emit event.
     /// For chunked prefill, non-final chunks only run the forward pass (no sampling).
     fn process_sequence(&mut self, seq: &ScheduledSeq) -> Result<()> {
+        // Short-circuit: if max_tokens is already reached (e.g. max_tokens=0),
+        // finish immediately without running the forward pass.
+        let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
+        if generated.len() >= seq.sampling_params.max_tokens {
+            self.scheduler
+                .finish(seq.seq_id, FinishReason::MaxTokens)?;
+            self.kv_cache.free(seq.seq_id)?;
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Finish {
+                    seq_id: seq.seq_id,
+                    reason: FinishReason::MaxTokens,
+                },
+            );
+            self.event_senders.remove(&seq.seq_id);
+            self.constraints.remove(&seq.seq_id);
+            self.stop_buffers.remove(&seq.seq_id);
+            return Ok(());
+        }
+
         let input = self.build_input(seq);
 
         let output = self.model.forward(&input, &mut *self.kv_cache)?;
@@ -289,27 +309,6 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         }
         let num_tokens = logits_host.len() / vocab_size;
         let last_logits = &logits_host[(num_tokens - 1) * vocab_size..];
-
-        let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
-
-        // Short-circuit: if max_tokens is already reached (e.g. max_tokens=0),
-        // finish immediately without sampling.
-        if generated.len() >= seq.sampling_params.max_tokens {
-            self.scheduler
-                .finish(seq.seq_id, FinishReason::MaxTokens)?;
-            self.kv_cache.free(seq.seq_id)?;
-            self.send_event(
-                seq.seq_id,
-                EngineEvent::Finish {
-                    seq_id: seq.seq_id,
-                    reason: FinishReason::MaxTokens,
-                },
-            );
-            self.event_senders.remove(&seq.seq_id);
-            self.constraints.remove(&seq.seq_id);
-            self.stop_buffers.remove(&seq.seq_id);
-            return Ok(());
-        }
 
         // Build constraint reference for sampling
         let constraint_ref = self
@@ -340,12 +339,33 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             }
         }
 
-        let result = self.sampler.sample_with_constraint(
-            last_logits,
-            &seq.sampling_params,
-            &generated,
-            constraint_ref,
-        )?;
+        // When the FSM is in an accepting state, unmask EOS/stop tokens so the
+        // model can choose to stop at a valid completion boundary instead of being
+        // forced to continue until max_tokens.
+        let result = if let Some((fsm, state)) = constraint_ref {
+            if fsm.is_final_state(state) {
+                // Apply the FSM mask manually, then restore EOS tokens.
+                let mut masked_logits = last_logits.to_vec();
+                fsm.mask_logits(state, &mut masked_logits);
+                for &eos_id in &seq.sampling_params.stop_token_ids {
+                    if (eos_id as usize) < masked_logits.len() {
+                        masked_logits[eos_id as usize] = last_logits[eos_id as usize];
+                    }
+                }
+                self.sampler
+                    .sample_single(&masked_logits, &seq.sampling_params, &generated)?
+            } else {
+                self.sampler.sample_with_constraint(
+                    last_logits,
+                    &seq.sampling_params,
+                    &generated,
+                    constraint_ref,
+                )?
+            }
+        } else {
+            self.sampler
+                .sample_single(last_logits, &seq.sampling_params, &generated)?
+        };
 
         let token_id = result.token_id;
         self.scheduler.append_token(seq.seq_id, token_id)?;
@@ -372,8 +392,17 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     }
                 }
                 None => {
-                    // Record state for abort handling after the borrow ends.
-                    fsm_abort = Some((seq_constraint.state, token_id));
+                    // If the token is an EOS/stop token and the FSM is in an
+                    // accepting state, this is a valid completion — the model
+                    // chose to stop at a valid boundary (EOS was unmasked).
+                    if seq_constraint.fsm.is_final_state(seq_constraint.state)
+                        && seq.sampling_params.stop_token_ids.contains(&token_id)
+                    {
+                        fsm_finished = true;
+                    } else {
+                        // Record state for abort handling after the borrow ends.
+                        fsm_abort = Some((seq_constraint.state, token_id));
+                    }
                 }
             }
         }

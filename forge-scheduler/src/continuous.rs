@@ -193,7 +193,7 @@ impl Scheduler for ContinuousBatchingScheduler {
 
         let mut newly_running = Vec::new();
         let mut newly_prefilling = Vec::new();
-        let mut to_reject: Vec<u64> = Vec::new();
+        let mut to_reject: Vec<(u64, String)> = Vec::new();
 
         // Reserve blocks for decode sequences *actually scheduled this step*
         // that may cross a block boundary (each decode emits 1 token).
@@ -234,7 +234,7 @@ impl Scheduler for ContinuousBatchingScheduler {
             // Reject zero-token prompts so they don't stall the queue forever.
             if prompt_len == 0 {
                 self.waiting.pop_front();
-                to_reject.push(seq_id);
+                to_reject.push((seq_id, "empty prompt (zero tokens)".into()));
                 continue;
             }
 
@@ -243,7 +243,10 @@ impl Scheduler for ContinuousBatchingScheduler {
             if self.config.prefill_chunk_size.is_none() && prompt_len > self.config.max_prefill_tokens
             {
                 self.waiting.pop_front();
-                to_reject.push(seq_id);
+                to_reject.push((seq_id, format!(
+                    "prompt length ({prompt_len}) exceeds max_prefill_tokens ({})",
+                    self.config.max_prefill_tokens
+                )));
                 continue;
             }
 
@@ -273,7 +276,10 @@ impl Scheduler for ContinuousBatchingScheduler {
                 // so it doesn't block all subsequent requests (head-of-line).
                 if blocks_needed > cache_usage.total_blocks {
                     self.waiting.pop_front();
-                    to_reject.push(seq_id);
+                    to_reject.push((seq_id, format!(
+                        "prompt requires {blocks_needed} blocks but cache only has {} total",
+                        cache_usage.total_blocks
+                    )));
                     continue;
                 }
                 break;
@@ -331,10 +337,10 @@ impl Scheduler for ContinuousBatchingScheduler {
         self.prefilling.extend(newly_prefilling);
 
         // Remove rejected sequences
-        for &seq_id in &to_reject {
+        for &(seq_id, _) in &to_reject {
             self.sequences.remove(&seq_id);
         }
-        batch.rejected_seq_ids = to_reject;
+        batch.rejected = to_reject;
 
         Ok(batch)
     }

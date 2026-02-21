@@ -18,8 +18,8 @@ pub struct RequestHandle {
 pub struct ScheduleBatch {
     pub prefill_seqs: Vec<ScheduledSeq>,
     pub decode_seqs: Vec<ScheduledSeq>,
-    /// Sequence IDs rejected because their prompts exceed `max_prefill_tokens`.
-    pub rejected_seq_ids: Vec<u64>,
+    /// Rejected sequences with reasons (seq_id, human-readable reason).
+    pub rejected: Vec<(u64, String)>,
 }
 
 #[derive(Debug, Clone)]
