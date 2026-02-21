@@ -424,7 +424,15 @@ fn handle_streaming(
                     let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
                     break;
                 }
-                EngineEvent::Error { .. } => {
+                EngineEvent::Error { error, .. } => {
+                    // Send an SSE error event so streaming clients see the failure
+                    // instead of interpreting a bare [DONE] as successful completion.
+                    let err_payload = serde_json::json!({
+                        "error": { "message": error, "type": "server_error" }
+                    });
+                    if let Ok(data) = serde_json::to_string(&err_payload) {
+                        let _ = sse_tx.send(Ok(Event::default().event("error").data(data))).await;
+                    }
                     let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
                     break;
                 }

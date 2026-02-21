@@ -34,8 +34,8 @@ fn validate_shape(data_len: usize, shape: &[usize]) -> Result<()> {
     Ok(())
 }
 
-fn validate_same_len(a: &CpuTensor, b: &CpuTensor) -> Result<()> {
-    if a.len() != b.len() {
+fn validate_same_shape(a: &CpuTensor, b: &CpuTensor) -> Result<()> {
+    if a.shape() != b.shape() {
         return Err(ForgeError::ShapeMismatch {
             expected: a.shape().to_vec(),
             got: b.shape().to_vec(),
@@ -143,7 +143,7 @@ impl Backend for CpuBackend {
     }
 
     fn add(&self, a: &CpuTensor, b: &CpuTensor) -> Result<CpuTensor> {
-        validate_same_len(a, b)?;
+        validate_same_shape(a, b)?;
         let data: Vec<f32> = a
             .data()
             .iter()
@@ -154,7 +154,7 @@ impl Backend for CpuBackend {
     }
 
     fn mul(&self, a: &CpuTensor, b: &CpuTensor) -> Result<CpuTensor> {
-        validate_same_len(a, b)?;
+        validate_same_shape(a, b)?;
         let data: Vec<f32> = a
             .data()
             .iter()

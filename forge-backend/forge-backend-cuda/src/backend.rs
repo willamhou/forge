@@ -575,8 +575,8 @@ fn validate_shape(data_len: usize, shape: &[usize]) -> Result<()> {
     Ok(())
 }
 
-fn validate_same_len(a: &CudaTensor, b: &CudaTensor) -> Result<()> {
-    if a.len() != b.len() {
+fn validate_same_shape(a: &CudaTensor, b: &CudaTensor) -> Result<()> {
+    if a.shape() != b.shape() {
         return Err(ForgeError::ShapeMismatch {
             expected: a.shape().to_vec(),
             got: b.shape().to_vec(),
@@ -793,7 +793,7 @@ impl Backend for CudaBackend {
     }
 
     fn add(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
-        validate_same_len(a, b)?;
+        validate_same_shape(a, b)?;
         let n = a.len() as u32;
 
         match a.dtype() {
@@ -839,7 +839,7 @@ impl Backend for CudaBackend {
     }
 
     fn mul(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
-        validate_same_len(a, b)?;
+        validate_same_shape(a, b)?;
         let n = a.len() as u32;
 
         match a.dtype() {

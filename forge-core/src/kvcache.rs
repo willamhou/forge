@@ -9,7 +9,7 @@ pub struct CacheUsage {
 
 impl CacheUsage {
     pub fn free_blocks(&self) -> usize {
-        self.total_blocks - self.used_blocks
+        self.total_blocks.saturating_sub(self.used_blocks)
     }
 
     pub fn usage_ratio(&self) -> f32 {
