@@ -259,10 +259,36 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
 
         // Only look at the last token's logits (for both prefill and decode)
         let vocab_size = self.model.config().vocab_size;
+        if vocab_size == 0 || logits_host.len() < vocab_size {
+            return Err(forge_core::ForgeError::InvalidArgument(format!(
+                "empty or undersized logits: got {} elements, vocab_size={}",
+                logits_host.len(),
+                vocab_size
+            )));
+        }
         let num_tokens = logits_host.len() / vocab_size;
         let last_logits = &logits_host[(num_tokens - 1) * vocab_size..];
 
         let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
+
+        // Short-circuit: if max_tokens is already reached (e.g. max_tokens=0),
+        // finish immediately without sampling.
+        if generated.len() >= seq.sampling_params.max_tokens {
+            self.scheduler
+                .finish(seq.seq_id, FinishReason::MaxTokens)?;
+            self.kv_cache.free(seq.seq_id)?;
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Finish {
+                    seq_id: seq.seq_id,
+                    reason: FinishReason::MaxTokens,
+                },
+            )
+            .await;
+            self.event_senders.remove(&seq.seq_id);
+            self.constraints.remove(&seq.seq_id);
+            return Ok(());
+        }
 
         // Build constraint reference for sampling
         let constraint_ref = self

@@ -272,6 +272,18 @@ async fn handle_non_streaming(
             .into_response();
     }
 
+    // If the engine channel closed without sending Finish or Error, the engine
+    // crashed or was shut down unexpectedly. Return 500 instead of a partial 200.
+    if finish_reason.is_none() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": { "message": "engine terminated unexpectedly", "type": "server_error" }
+            })),
+        )
+            .into_response();
+    }
+
     let text = tokenizer.decode(&token_ids).unwrap_or_default();
     let completion_tokens = token_ids.len();
 
