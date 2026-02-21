@@ -76,6 +76,28 @@ impl CudaTensor {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn f16_slice_mut(&mut self) -> Result<&mut CudaSlice<half::f16>> {
+        match &mut self.data {
+            TensorData::F16(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected f16 tensor, got {:?}",
+                self.dtype
+            ))),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn bf16_slice_mut(&mut self) -> Result<&mut CudaSlice<half::bf16>> {
+        match &mut self.data {
+            TensorData::BF16(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected bf16 tensor, got {:?}",
+                self.dtype
+            ))),
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         match &self.data {
             TensorData::F32(s) => s.len(),

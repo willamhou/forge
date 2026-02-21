@@ -686,6 +686,7 @@ dependencies = [
 name = "forge-backend-cuda"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "cudarc",
  "forge-core",
  "forge-kernels",

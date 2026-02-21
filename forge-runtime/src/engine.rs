@@ -143,6 +143,20 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 }
             }
 
+            // Notify clients of rejected sequences (prompt too large).
+            for seq_id in &batch.rejected_seq_ids {
+                self.send_event(
+                    *seq_id,
+                    EngineEvent::Error {
+                        seq_id: *seq_id,
+                        error: "prompt exceeds max_prefill_tokens".into(),
+                    },
+                )
+                .await;
+                self.event_senders.remove(seq_id);
+                self.constraints.remove(seq_id);
+            }
+
             // Phase 1: process one sequence at a time
             let all_seqs: Vec<ScheduledSeq> = batch
                 .prefill_seqs
@@ -289,7 +303,9 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let stop_token_hit = seq.sampling_params.stop_token_ids.contains(&token_id);
         let max_tokens_hit = generated.len() + 1 >= seq.sampling_params.max_tokens;
 
-        // Check stop_strings against decoded text (if decoder available and strings configured)
+        // Check stop_strings against decoded text (if decoder available and strings configured).
+        // Use `contains()` rather than `ends_with()` because a BPE token can decode
+        // to text that extends past the stop marker (e.g. "<stop>...").
         let stop_string_hit = if !seq.sampling_params.stop_strings.is_empty() {
             self.decode_fn.as_ref().and_then(|decode| {
                 // Include the just-sampled token in the decode
@@ -299,7 +315,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 seq.sampling_params
                     .stop_strings
                     .iter()
-                    .any(|s| text.ends_with(s))
+                    .any(|s| text.contains(s))
                     .then_some(true)
             })
         } else {
@@ -308,6 +324,20 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
 
         let should_finish =
             stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false) || fsm_finished;
+
+        // Emit the token event unless a stop string was hit — OpenAI semantics
+        // exclude the stop sequence from output, so we suppress the triggering token.
+        if !stop_string_hit.unwrap_or(false) {
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Token {
+                    seq_id: seq.seq_id,
+                    token_id,
+                    text: None, // decoded by the server layer
+                },
+            )
+            .await;
+        }
 
         if should_finish {
             let reason = if stop_token_hit {
@@ -331,16 +361,6 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             .await;
             self.event_senders.remove(&seq.seq_id);
             self.constraints.remove(&seq.seq_id);
-        } else {
-            self.send_event(
-                seq.seq_id,
-                EngineEvent::Token {
-                    seq_id: seq.seq_id,
-                    token_id,
-                    text: None, // decoded by the server layer
-                },
-            )
-            .await;
         }
 
         Ok(())

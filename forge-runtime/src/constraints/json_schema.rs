@@ -108,8 +108,10 @@ fn string_schema_to_regex(
         regex_automata::dfa::dense::DFA::new(pattern).map_err(|e| {
             ForgeError::InvalidArgument(format!("invalid string pattern: {e}"))
         })?;
-        // Wrap in a non-capturing group to prevent breakout
-        return Ok(format!(r#""(?:{pattern})*""#));
+        // Wrap in a non-capturing group to prevent breakout.
+        // Use `+` (one or more) rather than `*` so the pattern must match at least
+        // once, preserving the schema's constraint semantics.
+        return Ok(format!(r#""(?:{pattern})+""#));
     }
 
     let min_len = obj
@@ -209,47 +211,52 @@ fn object_schema_to_regex(
 
     match properties {
         Some(props) if !props.is_empty() => {
-            let mut parts = Vec::new();
             let prop_entries: Vec<(&String, &serde_json::Value)> = props.iter().collect();
 
-            for (i, (key, value_schema)) in prop_entries.iter().enumerate() {
+            // Build the object pattern.
+            // Each property after the first needs a comma separator, but when
+            // an optional property precedes a required one the comma must be
+            // conditional on the optional property actually appearing.
+            let mut result = format!(r"\{{{WS}");
+            let mut prev_was_required = false;
+            let mut any_emitted = false;
+
+            for (key, value_schema) in &prop_entries {
                 let value_regex = schema_node_to_regex(value_schema)?;
                 let escaped_key = regex_escape(key);
                 let prop_pattern = format!(
                     r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#
                 );
 
-                if required.contains(key.as_str()) {
-                    parts.push(prop_pattern);
-                } else {
-                    // Optional property: may or may not appear
-                    // For simplicity, optional properties appear in order if present
-                    if i > 0 {
-                        parts.push(format!("({WS},{prop_pattern})?"));
+                let is_required = required.contains(key.as_str());
+
+                if !any_emitted {
+                    // First property — no comma needed
+                    if is_required {
+                        result.push_str(&prop_pattern);
+                        prev_was_required = true;
                     } else {
-                        parts.push(format!("({prop_pattern})?"));
+                        result.push_str(&format!("({prop_pattern})?"));
+                        prev_was_required = false;
                     }
+                } else if is_required {
+                    if prev_was_required {
+                        // Both this and previous are required: mandatory comma
+                        result.push_str(&format!("{WS},{prop_pattern}"));
+                    } else {
+                        // Previous was optional: comma is conditional on it
+                        result.push_str(&format!("({WS},)?{prop_pattern}"));
+                    }
+                    prev_was_required = true;
+                } else {
+                    // Optional property after something — include comma in the group
+                    result.push_str(&format!("({WS},{prop_pattern})?"));
+                    prev_was_required = false;
                 }
+
+                any_emitted = true;
             }
 
-            // Build the object pattern
-            // Required properties are separated by commas
-            // We generate a pattern that requires all required props in order
-            let mut result = format!(r"\{{{WS}");
-            let mut first = true;
-            for (i, (key, _)) in prop_entries.iter().enumerate() {
-                let part = &parts[i];
-                if required.contains(key.as_str()) {
-                    if !first {
-                        result.push_str(&format!("{WS},{part}"));
-                    } else {
-                        result.push_str(part);
-                        first = false;
-                    }
-                } else {
-                    result.push_str(part);
-                }
-            }
             result.push_str(&format!("{WS}\\}}"));
             Ok(result)
         }

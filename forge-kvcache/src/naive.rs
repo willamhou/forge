@@ -28,15 +28,28 @@ pub struct NaiveKvCache<B: Backend> {
     sequences: HashMap<u64, SeqCache>,
     num_layers: usize,
     max_sequences: usize,
+    /// Maximum total tokens across all sequences (for usage reporting).
+    max_total_tokens: usize,
 }
 
 impl<B: Backend> NaiveKvCache<B> {
     pub fn new(backend: B, num_layers: usize, max_sequences: usize) -> Self {
+        // Default to 128K tokens total capacity (reasonable for naive CPU-side cache).
+        Self::with_max_tokens(backend, num_layers, max_sequences, 128 * 1024)
+    }
+
+    pub fn with_max_tokens(
+        backend: B,
+        num_layers: usize,
+        max_sequences: usize,
+        max_total_tokens: usize,
+    ) -> Self {
         Self {
             backend,
             sequences: HashMap::new(),
             num_layers,
             max_sequences,
+            max_total_tokens,
         }
     }
 }
@@ -141,14 +154,31 @@ impl<B: Backend + Clone> KvCache for NaiveKvCache<B> {
     }
 
     fn usage(&self) -> CacheUsage {
+        // Sum the token count per sequence (use max across layers per seq).
+        let used_tokens: usize = self
+            .sequences
+            .values()
+            .map(|seq| {
+                seq.layers
+                    .values()
+                    .map(|lc| lc.num_tokens)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+
         CacheUsage {
-            total_blocks: self.max_sequences,
-            used_blocks: self.sequences.len(),
+            total_blocks: self.max_total_tokens,
+            used_blocks: used_tokens,
             block_size: 1,
         }
     }
 
-    fn can_allocate(&self, _num_tokens: usize) -> bool {
-        self.sequences.len() < self.max_sequences
+    fn can_allocate(&self, num_tokens: usize) -> bool {
+        if self.sequences.len() >= self.max_sequences {
+            return false;
+        }
+        let usage = self.usage();
+        usage.free_blocks() >= num_tokens
     }
 }

@@ -1,4 +1,5 @@
 use forge_backend_cuda::attention::naive_attention;
+use forge_backend_cuda::flash_attention::attention_fwd;
 use forge_backend_cuda::CudaBackend;
 use forge_core::{Backend, Tensor};
 
@@ -260,4 +261,81 @@ fn test_naive_attention_invalid_head_ratio() {
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
     assert!(err_msg.contains("multiple"), "got: {err_msg}");
+}
+
+/// Test that `attention_fwd` dispatches correctly:
+/// - For F32 tensors, it should use naive attention (FlashAttention requires fp16/bf16).
+/// - For F16 tensors without the flash-attn feature, it should also use naive attention.
+/// - For F16 tensors with the flash-attn feature (stub returns -1), it should fall
+///   back to naive attention.
+///
+/// In all cases, the result should match naive_attention directly.
+#[test]
+fn test_attention_fwd_f32_uses_naive() {
+    let backend = CudaBackend::new(0).unwrap();
+    // F32 tensors — always takes naive path regardless of flash-attn feature
+    let q = backend
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
+        .unwrap();
+    let k = backend
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
+        .unwrap();
+    let v = backend
+        .copy_from_host_f32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 2, 2])
+        .unwrap();
+
+    let scale = 1.0 / (2.0f32).sqrt();
+    let fwd_out = attention_fwd(&backend, &q, &k, &v, scale, false).unwrap();
+    let naive_out = naive_attention(&backend, &q, &k, &v, scale).unwrap();
+
+    let fwd_data = backend.copy_to_host_f32(&fwd_out).unwrap();
+    let naive_data = backend.copy_to_host_f32(&naive_out).unwrap();
+
+    assert_eq!(fwd_out.shape(), naive_out.shape());
+    for (i, (&a, &b)) in fwd_data.iter().zip(naive_data.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-5,
+            "attention_fwd vs naive mismatch at {i}: {a} vs {b}"
+        );
+    }
+}
+
+/// Test attention_fwd with F16 tensors. Without the flash-attn feature linked to
+/// a real library, this should fall back to naive attention (which handles F16).
+#[test]
+fn test_attention_fwd_f16_fallback() {
+    let backend = CudaBackend::new(0).unwrap();
+    // Create F16 tensors
+    let q_f32 = backend
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
+        .unwrap();
+    let k_f32 = backend
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
+        .unwrap();
+    let v_f32 = backend
+        .copy_from_host_f32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 2, 2])
+        .unwrap();
+
+    use forge_core::DType;
+    let q = backend.cast(&q_f32, DType::F16).unwrap();
+    let k = backend.cast(&k_f32, DType::F16).unwrap();
+    let v = backend.cast(&v_f32, DType::F16).unwrap();
+
+    let scale = 1.0 / (2.0f32).sqrt();
+    let fwd_out = attention_fwd(&backend, &q, &k, &v, scale, false).unwrap();
+
+    // Verify shape is correct
+    assert_eq!(fwd_out.shape(), &[1, 1, 2, 2]);
+
+    // Compare with naive attention on the same F16 inputs
+    let naive_out = naive_attention(&backend, &q, &k, &v, scale).unwrap();
+    let fwd_data = backend.copy_to_host_f32(&fwd_out).unwrap();
+    let naive_data = backend.copy_to_host_f32(&naive_out).unwrap();
+
+    for (i, (&a, &b)) in fwd_data.iter().zip(naive_data.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 0.1,
+            "F16 attention_fwd vs naive mismatch at {i}: {a} vs {b}"
+        );
+    }
 }

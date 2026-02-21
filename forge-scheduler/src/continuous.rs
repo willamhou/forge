@@ -112,6 +112,8 @@ impl Scheduler for ContinuousBatchingScheduler {
         // to avoid overcommitting cache capacity.
         let mut blocks_committed: usize = 0;
 
+        let mut to_reject: Vec<u64> = Vec::new();
+
         while let Some(&seq_id) = self.waiting.front() {
             if batch.total_seqs() >= self.config.max_batch_size {
                 break;
@@ -127,7 +129,14 @@ impl Scheduler for ContinuousBatchingScheduler {
 
             let prompt_len = seq.prompt_tokens.len();
 
-            // Check token budget
+            // Reject prompts that can never fit in the prefill budget.
+            if prompt_len > self.config.max_prefill_tokens {
+                self.waiting.pop_front();
+                to_reject.push(seq_id);
+                continue;
+            }
+
+            // Skip if remaining budget is insufficient (try next request).
             if prompt_len > prefill_token_budget {
                 break;
             }
@@ -163,6 +172,12 @@ impl Scheduler for ContinuousBatchingScheduler {
             }
         }
         self.running.extend(newly_running);
+
+        // Remove rejected sequences so they don't block future scheduling.
+        for &seq_id in &to_reject {
+            self.sequences.remove(&seq_id);
+        }
+        batch.rejected_seq_ids = to_reject;
 
         Ok(batch)
     }
