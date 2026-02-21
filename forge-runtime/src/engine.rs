@@ -296,6 +296,29 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             .get(&seq.seq_id)
             .map(|c| (&*c.fsm as &dyn FsmConstraint, c.state));
 
+        // If FSM is in a terminal state with no allowed tokens, finish cleanly
+        // instead of sampling (which would pick an arbitrary token and fail).
+        if let Some((fsm, state)) = constraint_ref {
+            let no_tokens = fsm
+                .allowed_tokens(state)
+                .is_none_or(|t| t.is_empty());
+            if no_tokens && fsm.is_final_state(state) {
+                self.scheduler.finish(seq.seq_id, FinishReason::StopString)?;
+                self.kv_cache.free(seq.seq_id)?;
+                self.send_event(
+                    seq.seq_id,
+                    EngineEvent::Finish {
+                        seq_id: seq.seq_id,
+                        reason: FinishReason::StopString,
+                    },
+                )
+                .await;
+                self.event_senders.remove(&seq.seq_id);
+                self.constraints.remove(&seq.seq_id);
+                return Ok(());
+            }
+        }
+
         let result = self.sampler.sample_with_constraint(
             last_logits,
             &seq.sampling_params,

@@ -242,23 +242,26 @@ fn object_schema_to_regex(
             let has_any_required = patterns.iter().any(|(_, req)| *req);
 
             if !has_any_required {
-                // All-optional: nested optional groups with commas between them.
-                // Pattern: \{ WS (p1 (WS , p2 (WS , p3)?)?)? WS \}
-                let mut result = format!(r"\{{{WS}");
-                let n = patterns.len();
-                // Open nested groups: (p1 (, p2 (, p3 ...)?)?)?
-                for (i, (prop_pattern, _)) in patterns.iter().enumerate() {
-                    if i == 0 {
-                        result.push_str(&format!("({prop_pattern}"));
-                    } else {
-                        result.push_str(&format!("({WS},{prop_pattern}"));
+                // All-optional: allow any subset of properties in schema order.
+                //
+                // Recursive formulation for props [p0..pN-1]:
+                //   subset(i) = pi ( WS , subset(i+1) )? | subset(i+1)   (i < N-1)
+                //   subset(N-1) = pN-1
+                //
+                // Top-level: \{ WS ( subset(0) )? WS \}
+                fn any_subset(props: &[String], ws: &str) -> String {
+                    if props.len() == 1 {
+                        return props[0].clone();
                     }
+                    let head = &props[0];
+                    let tail = any_subset(&props[1..], ws);
+                    format!("({head}({ws},{tail})?|{tail})")
                 }
-                // Close all nested groups
-                for _ in 0..n {
-                    result.push_str(")?");
-                }
-                result.push_str(&format!("{WS}\\}}"));
+
+                let prop_patterns: Vec<String> =
+                    patterns.iter().map(|(p, _)| p.clone()).collect();
+                let inner = any_subset(&prop_patterns, WS);
+                let result = format!(r"\{{{WS}({inner})?{WS}\}}");
                 Ok(result)
             } else {
                 // Mixed: use trailing/leading comma approach.
