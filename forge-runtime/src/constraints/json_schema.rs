@@ -79,11 +79,11 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         ));
     }
 
-    // Determine type
-    let type_str = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("object");
+    // Determine type — missing `type` means any JSON value is valid
+    let type_str = match obj.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return Ok(any_json_value()),
+    };
 
     match type_str {
         "string" => string_schema_to_regex(obj),
@@ -159,7 +159,10 @@ fn array_schema_to_regex(
         ))
     } else if let Some(max) = max_items {
         let max = max as usize;
-        if min_items == 0 {
+        if max == 0 {
+            // Empty array only
+            Ok(format!(r"\[{WS}\]"))
+        } else if min_items == 0 {
             // Up to max items
             let additional = if max > 1 {
                 format!("({WS},{WS}{item_regex}){{0,{}}}", max - 1)

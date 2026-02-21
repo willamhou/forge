@@ -1,6 +1,6 @@
 //! OpenAI-compatible API types for chat completions.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -16,7 +16,7 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub stream: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
     #[serde(default)]
     pub seed: Option<u64>,
@@ -88,4 +88,24 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+/// Deserialize `stop` as either a single string or an array of strings.
+/// OpenAI allows both `"stop": "\n"` and `"stop": ["\n", "END"]`.
+fn deserialize_stop<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StopField {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+
+    let opt: Option<StopField> = Option::deserialize(deserializer)?;
+    Ok(opt.map(|sf| match sf {
+        StopField::Single(s) => vec![s],
+        StopField::Multiple(v) => v,
+    }))
 }

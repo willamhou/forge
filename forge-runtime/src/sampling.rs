@@ -239,8 +239,9 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 /// Zero out all but the top-k highest probabilities.
+/// `k == 0` means "disable top-k" (keep all tokens), matching common API conventions.
 fn apply_top_k(probs: &mut [f32], k: usize) {
-    if k >= probs.len() {
+    if k == 0 || k >= probs.len() {
         return;
     }
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
