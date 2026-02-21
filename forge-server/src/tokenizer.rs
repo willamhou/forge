@@ -84,6 +84,12 @@ impl IncrementalDecoder {
             return None; // incomplete UTF-8, keep accumulating
         }
 
+        // Guard against tokenizers that rewrite earlier text on new tokens
+        // (e.g. whitespace normalization). If decoded is shorter than expected,
+        // reset prev_text_len to avoid panic or dropped characters.
+        if decoded.len() < self.prev_text_len {
+            self.prev_text_len = 0;
+        }
         let new_text = decoded[self.prev_text_len..].to_string();
 
         if new_text.is_empty() {
@@ -113,6 +119,9 @@ impl IncrementalDecoder {
             return None;
         }
         let decoded = tokenizer.decode(&self.pending_ids).ok()?;
+        if decoded.len() < self.prev_text_len {
+            self.prev_text_len = 0;
+        }
         let new_text = decoded[self.prev_text_len..].to_string();
         self.pending_ids.clear();
         self.prev_text_len = 0;

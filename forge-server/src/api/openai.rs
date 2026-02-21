@@ -263,10 +263,19 @@ async fn handle_non_streaming(
     }
 
     if let Some(err) = engine_error {
+        // Distinguish client errors (bad request) from server errors.
+        let is_client_error = err.contains("exceeds max_prefill_tokens")
+            || err.contains("failed to enqueue")
+            || err.contains("constraint violated");
+        let (status, error_type) = if is_client_error {
+            (StatusCode::BAD_REQUEST, "invalid_request_error")
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        };
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             Json(serde_json::json!({
-                "error": { "message": err, "type": "server_error" }
+                "error": { "message": err, "type": error_type }
             })),
         )
             .into_response();
@@ -349,6 +358,7 @@ fn handle_streaming(
             let _ = sse_tx.send(Ok(Event::default().data(data))).await;
         }
 
+        let mut terminated = false;
         while let Some(event) = event_rx.recv().await {
             match event {
                 EngineEvent::Token { token_id, text, .. } => {
@@ -422,6 +432,7 @@ fn handle_streaming(
                         let _ = sse_tx.send(Ok(Event::default().data(data))).await;
                     }
                     let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    terminated = true;
                     break;
                 }
                 EngineEvent::Error { error, .. } => {
@@ -434,9 +445,22 @@ fn handle_streaming(
                         let _ = sse_tx.send(Ok(Event::default().event("error").data(data))).await;
                     }
                     let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    terminated = true;
                     break;
                 }
             }
+        }
+
+        // If the loop exited because the channel closed (no Finish/Error),
+        // emit a terminal error event so clients see a clean end-of-stream.
+        if !terminated {
+            let err_payload = serde_json::json!({
+                "error": { "message": "stream interrupted", "type": "server_error" }
+            });
+            if let Ok(data) = serde_json::to_string(&err_payload) {
+                let _ = sse_tx.send(Ok(Event::default().event("error").data(data))).await;
+            }
+            let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
         }
     });
 
