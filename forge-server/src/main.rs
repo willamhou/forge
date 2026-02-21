@@ -160,6 +160,7 @@ async fn run_server<B: Backend + Clone>(
     let scheduler_config = SchedulerConfig {
         max_batch_size: cli.max_batch_size,
         max_prefill_tokens: cli.max_prefill_tokens,
+        ..Default::default()
     };
     let scheduler = ContinuousBatchingScheduler::new(scheduler_config);
 

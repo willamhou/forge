@@ -121,11 +121,16 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 continue;
             }
 
-            // Allocate KV cache for new prefill sequences.
+            // Allocate KV cache for new prefill sequences (first chunk only).
             // Allocation errors are handled per-sequence rather than killing the
             // engine loop, so transient OOM only drops the affected request.
             let mut failed_seq_ids = Vec::new();
             for seq in &batch.prefill_seqs {
+                // Only allocate on the first prefill chunk (offset == 0).
+                // Subsequent chunks append to an already-allocated cache entry.
+                if seq.position_offset != 0 {
+                    continue;
+                }
                 if let Err(e) = self.kv_cache.allocate(seq.seq_id, seq.token_ids.len()) {
                     error!(seq_id = seq.seq_id, error = %e, "KV cache allocation failed");
                     self.send_event(
@@ -237,11 +242,17 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     }
 
     /// Process a single sequence: forward pass + sample + emit event.
+    /// For chunked prefill, non-final chunks only run the forward pass (no sampling).
     async fn process_sequence(&mut self, seq: &ScheduledSeq) -> Result<()> {
         let input = self.build_input(seq);
 
         let output = self.model.forward(&input, &mut *self.kv_cache)?;
         self.backend.synchronize()?;
+
+        // For non-final prefill chunks, skip sampling — just populate KV cache.
+        if seq.is_prefill && !seq.is_last_prefill_chunk {
+            return Ok(());
+        }
 
         // Copy logits to host for CPU sampling
         let logits_host = self.backend.copy_to_host_f32(&output.logits)?;
@@ -371,16 +382,22 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let gen_count = self.get_generated_count(seq.seq_id);
 
         let (prompt_len, generated_len) = if seq.is_prefill {
-            (seq.token_ids.len(), 0)
+            // For chunked prefill, position_offset is the starting position of this chunk.
+            // prompt_len reflects the total tokens fed so far (offset + chunk size).
+            (seq.position_offset + seq.token_ids.len(), 0)
         } else {
             // Invariant: position_offset = prompt_len + generated_len - 1
-            let prompt_len = seq.position_offset + 1 - gen_count;
+            let prompt_len = (seq.position_offset + 1).saturating_sub(gen_count).max(1);
             (prompt_len, gen_count)
         };
 
+        // Positions are absolute: [offset, offset+1, ..., offset+len-1]
+        let offset = seq.position_offset as u32;
+        let positions: Vec<u32> = (offset..offset + seq.token_ids.len() as u32).collect();
+
         ModelInput {
             token_ids: vec![seq.token_ids.clone()],
-            positions: vec![(0..seq.token_ids.len() as u32).collect()],
+            positions: vec![positions],
             seq_metadata: vec![SeqMetadata {
                 seq_id: seq.seq_id,
                 prompt_len,

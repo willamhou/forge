@@ -21,6 +21,8 @@ pub struct SequenceState {
     pub sampling_params: SamplingParams,
     pub state: SeqState,
     pub is_prefilled: bool,
+    /// How many prompt tokens have already been prefilled (for chunked prefill).
+    pub prefill_offset: usize,
 }
 
 impl SequenceState {
@@ -38,6 +40,7 @@ impl SequenceState {
             sampling_params,
             state: SeqState::Waiting,
             is_prefilled: false,
+            prefill_offset: 0,
         }
     }
 

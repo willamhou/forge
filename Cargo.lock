@@ -732,6 +732,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 

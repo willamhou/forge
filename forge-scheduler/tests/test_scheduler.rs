@@ -169,6 +169,7 @@ fn test_prefill_overcommit_protection() {
     let config = SchedulerConfig {
         max_batch_size: 10,
         max_prefill_tokens: 4096,
+        ..Default::default()
     };
     let mut scheduler = ContinuousBatchingScheduler::new(config);
 
@@ -189,4 +190,151 @@ fn test_prefill_overcommit_protection() {
     // Only the first request should be scheduled (2 blocks), leaving 1 free block
     // which isn't enough for the second request (needs 2 blocks)
     assert_eq!(batch.prefill_seqs.len(), 1);
+}
+
+// --- Chunked Prefill Tests ---
+
+#[test]
+fn test_chunked_prefill_splits_long_prompt() {
+    let config = SchedulerConfig {
+        max_batch_size: 10,
+        max_prefill_tokens: 4096,
+        prefill_chunk_size: Some(4),
+    };
+    let mut scheduler = ContinuousBatchingScheduler::new(config);
+    let cache = default_cache();
+
+    // Prompt of 10 tokens, chunk size 4 → chunks: [0..4], [4..8], [8..10]
+    scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
+        .unwrap();
+
+    // Round 1: first chunk [1,2,3,4]
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs.len(), 1);
+    assert_eq!(batch.prefill_seqs[0].token_ids, vec![1, 2, 3, 4]);
+    assert_eq!(batch.prefill_seqs[0].position_offset, 0);
+    assert!(!batch.prefill_seqs[0].is_last_prefill_chunk);
+    assert_eq!(batch.decode_seqs.len(), 0);
+
+    // Round 2: second chunk [5,6,7,8]
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs.len(), 1);
+    assert_eq!(batch.prefill_seqs[0].token_ids, vec![5, 6, 7, 8]);
+    assert_eq!(batch.prefill_seqs[0].position_offset, 4);
+    assert!(!batch.prefill_seqs[0].is_last_prefill_chunk);
+
+    // Round 3: final chunk [9,10]
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs.len(), 1);
+    assert_eq!(batch.prefill_seqs[0].token_ids, vec![9, 10]);
+    assert_eq!(batch.prefill_seqs[0].position_offset, 8);
+    assert!(batch.prefill_seqs[0].is_last_prefill_chunk);
+
+    // Round 4: should now be in decode mode (no prefill, no decode until token appended)
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs.len(), 0);
+    assert_eq!(batch.decode_seqs.len(), 0); // no generated token yet
+}
+
+#[test]
+fn test_chunked_prefill_exact_chunk_boundary() {
+    let config = SchedulerConfig {
+        max_batch_size: 10,
+        max_prefill_tokens: 4096,
+        prefill_chunk_size: Some(5),
+    };
+    let mut scheduler = ContinuousBatchingScheduler::new(config);
+    let cache = default_cache();
+
+    // Prompt of exactly 10 tokens, chunk size 5 → [0..5], [5..10]
+    scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
+        .unwrap();
+
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs[0].token_ids.len(), 5);
+    assert!(!batch.prefill_seqs[0].is_last_prefill_chunk);
+
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs[0].token_ids.len(), 5);
+    assert!(batch.prefill_seqs[0].is_last_prefill_chunk);
+}
+
+#[test]
+fn test_chunked_prefill_short_prompt_no_chunking() {
+    let config = SchedulerConfig {
+        max_batch_size: 10,
+        max_prefill_tokens: 4096,
+        prefill_chunk_size: Some(512),
+    };
+    let mut scheduler = ContinuousBatchingScheduler::new(config);
+    let cache = default_cache();
+
+    // Prompt shorter than chunk size → single prefill, is_last = true
+    scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3]))
+        .unwrap();
+
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs.len(), 1);
+    assert_eq!(batch.prefill_seqs[0].token_ids, vec![1, 2, 3]);
+    assert!(batch.prefill_seqs[0].is_last_prefill_chunk);
+}
+
+#[test]
+fn test_chunked_prefill_decode_interleaved() {
+    let config = SchedulerConfig {
+        max_batch_size: 10,
+        max_prefill_tokens: 4096,
+        prefill_chunk_size: Some(3),
+    };
+    let mut scheduler = ContinuousBatchingScheduler::new(config);
+    let cache = default_cache();
+
+    // Enqueue a short request first, then a long one
+    let h1 = scheduler
+        .enqueue(make_request("req-1", vec![1, 2]))
+        .unwrap();
+    scheduler
+        .enqueue(make_request("req-2", vec![10, 20, 30, 40, 50, 60]))
+        .unwrap();
+
+    // Round 1: prefill req-1 (complete) + first chunk of req-2
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.prefill_seqs.len(), 2);
+    assert!(batch.prefill_seqs[0].is_last_prefill_chunk); // req-1 done
+    assert!(!batch.prefill_seqs[1].is_last_prefill_chunk); // req-2 chunk 1
+
+    // Append a token to req-1 so it enters decode
+    scheduler.append_token(h1.seq_id, 99).unwrap();
+
+    // Round 2: decode for req-1 + second chunk of req-2
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert_eq!(batch.decode_seqs.len(), 1); // req-1 decode
+    assert_eq!(batch.prefill_seqs.len(), 1); // req-2 chunk 2
+    assert!(batch.prefill_seqs[0].is_last_prefill_chunk); // req-2 done
+}
+
+#[test]
+fn test_chunked_prefill_no_reject_long_prompts() {
+    // With chunking enabled, prompts exceeding max_prefill_tokens should NOT be rejected
+    // because they can be split across multiple rounds.
+    let config = SchedulerConfig {
+        max_batch_size: 10,
+        max_prefill_tokens: 8,
+        prefill_chunk_size: Some(4),
+    };
+    let mut scheduler = ContinuousBatchingScheduler::new(config);
+    let cache = default_cache();
+
+    // Prompt of 12 tokens > max_prefill_tokens=8, but chunk_size=4 allows it
+    scheduler
+        .enqueue(make_request("req-1", (1..=12).collect()))
+        .unwrap();
+
+    let batch = scheduler.schedule(&cache).unwrap();
+    assert!(batch.rejected_seq_ids.is_empty());
+    assert_eq!(batch.prefill_seqs.len(), 1);
+    assert_eq!(batch.prefill_seqs[0].token_ids.len(), 4);
 }

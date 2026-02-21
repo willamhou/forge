@@ -29,6 +29,9 @@ pub struct ScheduledSeq {
     pub position_offset: usize,
     pub sampling_params: SamplingParams,
     pub is_prefill: bool,
+    /// When chunked prefill is active, `true` means this is the final chunk
+    /// and sampling should proceed. `false` means more chunks remain.
+    pub is_last_prefill_chunk: bool,
 }
 
 impl ScheduleBatch {
