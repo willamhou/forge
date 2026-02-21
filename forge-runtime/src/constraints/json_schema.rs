@@ -202,6 +202,13 @@ fn array_schema_to_regex(
 }
 
 /// Convert an object schema to regex.
+///
+/// Properties can appear in any order (JSON semantics). Required properties
+/// must always be present; optional properties may be omitted.
+///
+/// We use an alternation over all permutations of properties.  For small
+/// property counts (up to ~6) this is practical; for larger schemas the
+/// DFA compiler minimises the exponential blowup.
 fn object_schema_to_regex(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
@@ -217,103 +224,100 @@ fn object_schema_to_regex(
             let prop_entries: Vec<(&String, &serde_json::Value)> = props.iter().collect();
 
             // Build per-property regex patterns and required flags.
-            let mut patterns: Vec<(String, bool)> = Vec::new();
+            let mut prop_patterns: Vec<String> = Vec::new();
+            let mut is_required: Vec<bool> = Vec::new();
             for (key, value_schema) in &prop_entries {
                 let value_regex = schema_node_to_regex(value_schema)?;
                 let escaped_key = regex_escape(key);
                 let prop_pattern = format!(
                     r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#
                 );
-                patterns.push((prop_pattern, required.contains(key.as_str())));
+                prop_patterns.push(prop_pattern);
+                is_required.push(required.contains(key.as_str()));
             }
 
-            // Build the object regex with correct comma handling.
-            //
-            // Strategy depends on whether required properties exist:
-            //
-            // Mixed (has required): required properties are always present so
-            // commas between them are mandatory. Optional-before-required uses a
-            // trailing comma `(opt,)?`, optional-after-required uses a leading
-            // comma `(,opt)?`.
-            //
-            // All-optional (no required): use nested optional groups so commas
-            // only appear between two present properties:
-            //   `(prop1 (, prop2 (, prop3)? )? )?`
-            let has_any_required = patterns.iter().any(|(_, req)| *req);
-
-            if !has_any_required {
-                // All-optional: allow any subset of properties in schema order.
-                //
-                // Recursive formulation for props [p0..pN-1]:
-                //   subset(i) = pi ( WS , subset(i+1) )? | subset(i+1)   (i < N-1)
-                //   subset(N-1) = pN-1
-                //
-                // Top-level: \{ WS ( subset(0) )? WS \}
-                fn any_subset(props: &[String], ws: &str) -> String {
-                    if props.len() == 1 {
-                        return props[0].clone();
-                    }
-                    let head = &props[0];
-                    let tail = any_subset(&props[1..], ws);
-                    format!("({head}({ws},{tail})?|{tail})")
+            // Generate all valid orderings. Each ordering is a permutation of
+            // the property indices where required properties are always present
+            // and optional properties may be included or omitted.
+            let n = prop_patterns.len();
+            // Collect all subsets that include all required properties.
+            let mut valid_combos: Vec<Vec<usize>> = Vec::new();
+            for mask in 0..(1u64 << n) {
+                let subset: Vec<usize> = (0..n).filter(|&i| mask & (1 << i) != 0).collect();
+                // Must include all required properties.
+                let has_all_required = (0..n)
+                    .filter(|&i| is_required[i])
+                    .all(|i| subset.contains(&i));
+                if has_all_required {
+                    valid_combos.push(subset);
                 }
+            }
 
-                let prop_patterns: Vec<String> =
-                    patterns.iter().map(|(p, _)| p.clone()).collect();
-                let inner = any_subset(&prop_patterns, WS);
-                let result = format!(r"\{{{WS}({inner})?{WS}\}}");
-                Ok(result)
+            // For each valid subset, generate all permutations.
+            let mut alternatives: Vec<String> = Vec::new();
+
+            // Empty object (only if no required properties)
+            if !is_required.iter().any(|&r| r) {
+                alternatives.push(String::new()); // matches \{ WS \}
+            }
+
+            for combo in &valid_combos {
+                if combo.is_empty() {
+                    continue; // handled by empty-object case above
+                }
+                let mut perms = Vec::new();
+                permutations(combo, &mut perms);
+                for perm in perms {
+                    let joined = perm
+                        .iter()
+                        .map(|&i| prop_patterns[i].as_str())
+                        .collect::<Vec<_>>()
+                        .join(&format!("{WS},"));
+                    alternatives.push(joined);
+                }
+            }
+
+            if alternatives.is_empty() {
+                // Should not happen, but fall back to empty object
+                Ok(format!(r"\{{{WS}\}}"))
+            } else if alternatives.len() == 1 && alternatives[0].is_empty() {
+                Ok(format!(r"\{{{WS}\}}"))
             } else {
-                // Mixed: use trailing/leading comma approach.
-                let has_required_after = |i: usize| -> bool {
-                    patterns[i + 1..].iter().any(|(_, req)| *req)
-                };
-
-                let mut result = format!(r"\{{{WS}");
-                let mut any_required_before = false;
-                let mut any_emitted = false;
-
-                for (i, (prop_pattern, is_required)) in patterns.iter().enumerate() {
-                    if !any_emitted {
-                        if *is_required {
-                            result.push_str(prop_pattern);
-                            any_required_before = true;
-                        } else {
-                            // First property is optional, required follows later
-                            result.push_str(&format!("({prop_pattern}{WS},)?"));
-                        }
-                    } else if *is_required {
-                        if any_required_before {
-                            result.push_str(&format!("{WS},{prop_pattern}"));
-                        } else {
-                            // Only optionals before — they carry trailing commas
-                            result.push_str(prop_pattern);
-                        }
-                        any_required_before = true;
-                    } else {
-                        // Optional after something
-                        if any_required_before {
-                            result.push_str(&format!("({WS},{prop_pattern})?"));
-                        } else if has_required_after(i) {
-                            // Optional between optionals and a later required
-                            result.push_str(&format!("({prop_pattern}{WS},)?"));
-                        } else {
-                            // Optional after required — leading comma
-                            // (any_required_before is true in this branch
-                            // so this case shouldn't be reached, but guard)
-                            result.push_str(&format!("({WS},{prop_pattern})?"));
-                        }
-                    }
-                    any_emitted = true;
+                let non_empty: Vec<&str> = alternatives
+                    .iter()
+                    .filter(|a| !a.is_empty())
+                    .map(|a| a.as_str())
+                    .collect();
+                let has_empty = alternatives.iter().any(|a| a.is_empty());
+                let inner = non_empty.join("|");
+                if has_empty {
+                    Ok(format!(r"\{{{WS}({inner})?{WS}\}}"))
+                } else {
+                    Ok(format!(r"\{{{WS}({inner}){WS}\}}"))
                 }
-
-                result.push_str(&format!("{WS}\\}}"));
-                Ok(result)
             }
         }
         _ => {
             // Empty object or no properties specified
             Ok(format!(r"\{{{WS}\}}"))
+        }
+    }
+}
+
+/// Generate all permutations of a slice.
+fn permutations(items: &[usize], result: &mut Vec<Vec<usize>>) {
+    if items.len() <= 1 {
+        result.push(items.to_vec());
+        return;
+    }
+    for (i, &item) in items.iter().enumerate() {
+        let mut rest: Vec<usize> = items.to_vec();
+        rest.remove(i);
+        let mut sub_perms = Vec::new();
+        permutations(&rest, &mut sub_perms);
+        for mut perm in sub_perms {
+            perm.insert(0, item);
+            result.push(perm);
         }
     }
 }

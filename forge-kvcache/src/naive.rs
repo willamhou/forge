@@ -58,6 +58,12 @@ impl<B: Backend + Clone> KvCache for NaiveKvCache<B> {
     type T = B::Tensor;
 
     fn allocate(&mut self, seq_id: u64, _initial_len: usize) -> Result<()> {
+        if self.sequences.len() >= self.max_sequences && !self.sequences.contains_key(&seq_id) {
+            return Err(ForgeError::OutOfMemory(format!(
+                "max_sequences ({}) reached",
+                self.max_sequences
+            )));
+        }
         self.sequences.insert(
             seq_id,
             SeqCache {

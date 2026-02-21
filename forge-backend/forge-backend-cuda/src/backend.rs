@@ -824,7 +824,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, a.shape.clone()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(n as usize)
@@ -843,6 +843,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, a.shape.clone()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -870,7 +871,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, a.shape.clone()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(n as usize)
@@ -889,6 +890,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, a.shape.clone()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -915,7 +917,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, a.shape.clone()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(n as usize)
@@ -934,6 +936,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, a.shape.clone()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -959,7 +962,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, a.shape.clone()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(n as usize)
@@ -977,6 +980,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, a.shape.clone()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -1023,7 +1027,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, shape.to_vec()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(rows * cols)
@@ -1048,6 +1052,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, shape.to_vec()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -1109,7 +1114,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, shape.to_vec()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(x.len())
@@ -1132,6 +1137,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, shape.to_vec()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -1177,7 +1183,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, shape.to_vec()))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(rows * cols)
@@ -1200,6 +1206,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, shape.to_vec()))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -1257,7 +1264,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, vec![num_indices, embedding_dim]))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(num_indices * embedding_dim)
@@ -1282,6 +1289,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, vec![num_indices, embedding_dim]))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -1333,7 +1341,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, vec![cols, rows]))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(rows * cols)
@@ -1352,6 +1360,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, vec![cols, rows]))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
@@ -1417,7 +1426,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f16_data(out, out_shape))
             }
-            _ => {
+            DType::F32 => {
                 let mut out = self
                     .stream
                     .alloc_zeros::<f32>(total_elems)
@@ -1435,6 +1444,7 @@ impl Backend for CudaBackend {
 
                 Ok(CudaTensor::f32_data(out, out_shape))
             }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
