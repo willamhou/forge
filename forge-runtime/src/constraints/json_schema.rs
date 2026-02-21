@@ -201,14 +201,19 @@ fn array_schema_to_regex(
     }
 }
 
+/// Maximum number of object properties that can use the full permutation
+/// strategy. Beyond this limit we fall back to fixed-order to prevent
+/// combinatorial explosion (n! permutations).
+const MAX_PERMUTATION_PROPERTIES: usize = 6;
+
 /// Convert an object schema to regex.
 ///
 /// Properties can appear in any order (JSON semantics). Required properties
 /// must always be present; optional properties may be omitted.
 ///
-/// We use an alternation over all permutations of properties.  For small
-/// property counts (up to ~6) this is practical; for larger schemas the
-/// DFA compiler minimises the exponential blowup.
+/// For small property counts (<= 6) we enumerate all valid permutations.
+/// For larger schemas we fall back to fixed property order to avoid
+/// factorial blowup in regex size.
 fn object_schema_to_regex(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
@@ -236,11 +241,19 @@ fn object_schema_to_regex(
                 is_required.push(required.contains(key.as_str()));
             }
 
+            let n = prop_patterns.len();
+
+            // For large schemas, fall back to fixed-order output with
+            // optional wrapping. This avoids n! regex blowup.
+            if n > MAX_PERMUTATION_PROPERTIES {
+                return object_schema_fixed_order(&prop_patterns, &is_required);
+            }
+
             // Generate all valid orderings. Each ordering is a permutation of
             // the property indices where required properties are always present
             // and optional properties may be included or omitted.
-            let n = prop_patterns.len();
-            // Collect all subsets that include all required properties.
+            // n is guaranteed <= MAX_PERMUTATION_PROPERTIES (6) here,
+            // so 1u64 << n and n! are both safe.
             let mut valid_combos: Vec<Vec<usize>> = Vec::new();
             for mask in 0..(1u64 << n) {
                 let subset: Vec<usize> = (0..n).filter(|&i| mask & (1 << i) != 0).collect();
@@ -301,6 +314,41 @@ fn object_schema_to_regex(
             // Empty object or no properties specified
             Ok(format!(r"\{{{WS}\}}"))
         }
+    }
+}
+
+/// Fixed-order fallback for schemas with more than MAX_PERMUTATION_PROPERTIES.
+///
+/// Produces a regex where properties appear in the iteration order provided
+/// by the schema, with optional properties wrapped in `(...)?`.
+fn object_schema_fixed_order(prop_patterns: &[String], is_required: &[bool]) -> Result<String> {
+    // Build a pattern like: \{ WS req1 WS , (WS opt1 WS ,)? WS req2 WS \}
+    // Each required property is always present; optional ones get `(...)?`.
+    // Commas between properties are handled by always emitting them and
+    // wrapping optional properties *with* their leading comma.
+    let mut parts: Vec<String> = Vec::new();
+    for (i, pattern) in prop_patterns.iter().enumerate() {
+        if is_required[i] {
+            if parts.is_empty() {
+                parts.push(pattern.clone());
+            } else {
+                parts.push(format!("{WS},{pattern}"));
+            }
+        } else if parts.is_empty() {
+            // Optional at start: no leading comma, wrap the property
+            parts.push(format!("({pattern}{WS},)?"));
+        } else {
+            // Optional after earlier properties: include leading comma in wrap
+            parts.push(format!("({WS},{pattern})?"));
+        }
+    }
+
+    let inner = parts.join("");
+    if inner.is_empty() || is_required.iter().all(|&r| !r) {
+        // All optional — the entire body is optional
+        Ok(format!(r"\{{{WS}({inner})?{WS}\}}"))
+    } else {
+        Ok(format!(r"\{{{WS}{inner}{WS}\}}"))
     }
 }
 
@@ -400,12 +448,25 @@ fn json_value_to_regex_literal(value: &serde_json::Value) -> String {
 }
 
 /// Regex pattern matching any JSON value.
+///
+/// Uses self-referencing patterns for arrays and objects to ensure only
+/// syntactically valid JSON is accepted.  The recursion is bounded to
+/// two levels of nesting since deeper recursion would produce an overly
+/// large DFA; for unconstrained schemas this is a reasonable trade-off.
 fn any_json_value() -> String {
-    // Simplified: matches strings, numbers, booleans, null, arrays, objects
-    format!(
-        r#"("{}"|{}|{}|{}|\[.*\]|\{{.*\}})"#,
+    // Leaf values: strings, numbers, booleans, null
+    let leaf = format!(
+        r#""{}"|{}|{}|{}"#,
         STRING_INNER, NUMBER, BOOLEAN, NULL
-    )
+    );
+    // Level-0: leaf only (used as elements inside level-1 containers)
+    let atom = format!("({leaf})");
+    // Level-1: leaf or one-level array/object
+    let array_1 = format!(r"\[{WS}({atom}({WS},{WS}{atom})*)?{WS}\]");
+    let obj_val = &atom;
+    let obj_entry = format!(r#"{WS}"{}"{WS}:{WS}{obj_val}"#, STRING_INNER);
+    let object_1 = format!(r"\{{{WS}({obj_entry}({WS},{WS}{obj_entry})*)?{WS}\}}");
+    format!("({leaf}|{array_1}|{object_1})")
 }
 
 /// Escape special regex characters in a string.

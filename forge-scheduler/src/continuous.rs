@@ -195,17 +195,19 @@ impl Scheduler for ContinuousBatchingScheduler {
         let mut newly_prefilling = Vec::new();
         let mut to_reject: Vec<u64> = Vec::new();
 
-        // Reserve blocks for running decode sequences that may cross a block
-        // boundary on this step (each decode emits 1 token).  The KV cache
-        // length is total_len() - 1 because the most recent generated token
-        // is the decode *input* and hasn't been written to cache yet.
+        // Reserve blocks for decode sequences *actually scheduled this step*
+        // that may cross a block boundary (each decode emits 1 token).
+        // Only count sequences admitted to batch.decode_seqs, not all running
+        // sequences — otherwise we over-reserve when max_batch_size caps the
+        // decode set and artificially starve waiting prefills.
         let decode_block_reserve = if cache_usage.block_size == 0 {
             0
         } else {
-            self.running
+            batch
+                .decode_seqs
                 .iter()
-                .filter(|&&sid| {
-                    self.sequences.get(&sid).map_or(false, |s| {
+                .filter(|ds| {
+                    self.sequences.get(&ds.seq_id).map_or(false, |s| {
                         let cache_len = s.total_len().saturating_sub(1);
                         cache_len % cache_usage.block_size == 0
                     })
