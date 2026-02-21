@@ -131,7 +131,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 if seq.position_offset != 0 {
                     continue;
                 }
-                if let Err(e) = self.kv_cache.allocate(seq.seq_id, seq.token_ids.len()) {
+                if let Err(e) = self.kv_cache.allocate(seq.seq_id, seq.total_prompt_len) {
                     error!(seq_id = seq.seq_id, error = %e, "KV cache allocation failed");
                     self.send_event(
                         seq.seq_id,
@@ -338,6 +338,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
 
         // Emit the token event unless a stop string was hit — OpenAI semantics
         // exclude the stop sequence from output, so we suppress the triggering token.
+        // NOTE: If a stop string spans multiple tokens, earlier tokens may have
+        // already been emitted in streaming mode. A proper fix requires a look-ahead
+        // buffer that withholds tokens until they're confirmed safe. This is a known
+        // limitation tracked for a future streaming-buffer implementation.
         if !stop_string_hit.unwrap_or(false) {
             self.send_event(
                 seq.seq_id,

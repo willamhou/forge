@@ -157,7 +157,7 @@ impl CpuSampler {
     }
 
     fn greedy(&self, logits: &[f32]) -> forge_core::Result<SampleResult> {
-        let (token_id, &max_logit) = logits
+        let (token_id, _) = logits
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -165,9 +165,15 @@ impl CpuSampler {
                 forge_core::ForgeError::InvalidArgument("empty logits".into())
             })?;
 
+        // Compute logprob from normalized probability (softmax), not raw logit.
+        // This is consistent with multinomial sampling which returns ln(p).
+        let probs = softmax(logits);
+        let p = probs[token_id];
+        let logprob = if p > 0.0 { p.ln() } else { f32::NEG_INFINITY };
+
         Ok(SampleResult {
             token_id: token_id as u32,
-            logprob: max_logit.ln(),
+            logprob,
         })
     }
 

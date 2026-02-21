@@ -32,6 +32,10 @@ pub struct ScheduledSeq {
     /// When chunked prefill is active, `true` means this is the final chunk
     /// and sampling should proceed. `false` means more chunks remain.
     pub is_last_prefill_chunk: bool,
+    /// Total prompt length for this sequence. Used by the engine to allocate
+    /// the correct KV cache size on the first prefill chunk (which may be
+    /// smaller than the full prompt when chunked prefill is active).
+    pub total_prompt_len: usize,
 }
 
 impl ScheduleBatch {

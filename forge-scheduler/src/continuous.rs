@@ -108,6 +108,7 @@ impl Scheduler for ContinuousBatchingScheduler {
                     sampling_params: seq.sampling_params.clone(),
                     is_prefill: false,
                     is_last_prefill_chunk: false,
+                    total_prompt_len: seq.prompt_tokens.len(),
                 });
             }
         }
@@ -139,6 +140,7 @@ impl Scheduler for ContinuousBatchingScheduler {
                     sampling_params: seq.sampling_params.clone(),
                     is_prefill: true,
                     is_last_prefill_chunk: is_last,
+                    total_prompt_len: prompt_len,
                 });
 
                 if is_last {
@@ -234,6 +236,7 @@ impl Scheduler for ContinuousBatchingScheduler {
                 sampling_params: seq.sampling_params.clone(),
                 is_prefill: true,
                 is_last_prefill_chunk: is_last,
+                total_prompt_len: prompt_len,
             });
 
             if is_last {
