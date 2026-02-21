@@ -200,9 +200,14 @@ impl GgufLoader {
         // Data section starts at an aligned position after the header.
         // GGUF aligns tensor data to 32 bytes (or to the alignment specified in metadata).
         let alignment = match metadata.get("general.alignment") {
-            Some(GgufValue::U32(a)) => *a as u64,
-            Some(GgufValue::U64(a)) => *a,
-            _ => 32,
+            Some(GgufValue::U32(a)) if *a > 0 => *a as u64,
+            Some(GgufValue::U64(a)) if *a > 0 => *a,
+            Some(_) => {
+                return Err(ForgeError::ModelLoad(
+                    "GGUF general.alignment must be > 0".into(),
+                ));
+            }
+            None => 32,
         };
         let header_end = cursor.position();
         let data_offset = (header_end + alignment - 1) / alignment * alignment;

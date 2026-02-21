@@ -225,10 +225,20 @@ impl Scheduler for ContinuousBatchingScheduler {
 
             // Check cache: we need to allocate blocks for the full prompt, not just the chunk,
             // because KV cache is allocated on first prefill chunk.
-            let blocks_needed =
-                (prompt_len + cache_usage.block_size - 1) / cache_usage.block_size;
+            let blocks_needed = if cache_usage.block_size == 0 {
+                usize::MAX
+            } else {
+                (prompt_len + cache_usage.block_size - 1) / cache_usage.block_size
+            };
             let available = cache_usage.free_blocks().saturating_sub(blocks_committed);
             if blocks_needed > available {
+                // If the prompt can never fit in the total cache, reject it
+                // so it doesn't block all subsequent requests (head-of-line).
+                if blocks_needed > cache_usage.total_blocks {
+                    self.waiting.pop_front();
+                    to_reject.push(seq_id);
+                    continue;
+                }
                 break;
             }
 

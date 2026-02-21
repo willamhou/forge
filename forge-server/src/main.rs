@@ -73,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.block_size == 0 {
+        anyhow::bail!("--block-size must be >= 1");
+    }
+
     // --- Load config ---
     let config_path = cli.model_path.join("config.json");
     let config_text = std::fs::read_to_string(&config_path)
