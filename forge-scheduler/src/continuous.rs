@@ -188,17 +188,19 @@ impl Scheduler for ContinuousBatchingScheduler {
         let mut to_reject: Vec<u64> = Vec::new();
 
         // Reserve blocks for running decode sequences that may cross a block
-        // boundary on this step (each decode emits 1 token).  Worst case:
-        // every running sequence needs one extra block.
+        // boundary on this step (each decode emits 1 token).  The KV cache
+        // length is total_len() - 1 because the most recent generated token
+        // is the decode *input* and hasn't been written to cache yet.
         let decode_block_reserve = if cache_usage.block_size == 0 {
             0
         } else {
             self.running
                 .iter()
                 .filter(|&&sid| {
-                    self.sequences
-                        .get(&sid)
-                        .map_or(false, |s| s.total_len() % cache_usage.block_size == 0)
+                    self.sequences.get(&sid).map_or(false, |s| {
+                        let cache_len = s.total_len().saturating_sub(1);
+                        cache_len % cache_usage.block_size == 0
+                    })
                 })
                 .count()
         };
@@ -218,6 +220,13 @@ impl Scheduler for ContinuousBatchingScheduler {
             };
 
             let prompt_len = seq.prompt_tokens.len();
+
+            // Reject zero-token prompts so they don't stall the queue forever.
+            if prompt_len == 0 {
+                self.waiting.pop_front();
+                to_reject.push(seq_id);
+                continue;
+            }
 
             // Reject prompts that can never fit in the max prefill budget
             // (only when chunking is disabled — with chunking any prompt can be split).
