@@ -313,12 +313,10 @@ fn object_schema_to_regex(
 
     match properties {
         Some(props) if !props.is_empty() => {
-            let prop_entries: Vec<(&String, &serde_json::Value)> = props.iter().collect();
-
             // Build per-property regex patterns and required flags.
             let mut prop_patterns: Vec<String> = Vec::new();
             let mut is_required: Vec<bool> = Vec::new();
-            for (key, value_schema) in &prop_entries {
+            for (key, value_schema) in props.iter() {
                 let value_regex = schema_node_to_regex(value_schema)?;
                 let escaped_key = regex_escape(key);
                 let prop_pattern = format!(
@@ -326,6 +324,20 @@ fn object_schema_to_regex(
                 );
                 prop_patterns.push(prop_pattern);
                 is_required.push(required.contains(key.as_str()));
+            }
+
+            // Include required keys that are not declared in `properties`.
+            // JSON Schema allows this — such keys accept any JSON value.
+            for key in &required {
+                if !props.contains_key(*key) {
+                    let escaped_key = regex_escape(key);
+                    let value_regex = any_json_value();
+                    let prop_pattern = format!(
+                        r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#
+                    );
+                    prop_patterns.push(prop_pattern);
+                    is_required.push(true);
+                }
             }
 
             let n = prop_patterns.len();
@@ -568,7 +580,10 @@ fn validate_const_against_schema(
 
 /// Check if a JSON value satisfies the active constraints in a schema object.
 ///
-/// Checks: `type`, `minLength`, `maxLength` (for strings).
+/// Checks: `type`, string constraints (`minLength`, `maxLength`, `pattern`),
+/// numeric constraints (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`),
+/// array constraints (`minItems`, `maxItems`), and object constraints (`required`,
+/// `minProperties`, `maxProperties`).
 fn value_satisfies_schema(
     value: &serde_json::Value,
     schema: &serde_json::Map<String, serde_json::Value>,
@@ -622,6 +637,43 @@ fn value_satisfies_schema(
         }
         if let Some(ex_max) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
             if n >= ex_max {
+                return false;
+            }
+        }
+    }
+    // Array constraints
+    if let Some(arr) = value.as_array() {
+        let len = arr.len() as u64;
+        if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
+            if len < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+            if len > max {
+                return false;
+            }
+        }
+    }
+    // Object constraints
+    if let Some(obj) = value.as_object() {
+        if let Some(req_arr) = schema.get("required").and_then(|v| v.as_array()) {
+            for req_key in req_arr {
+                if let Some(key) = req_key.as_str() {
+                    if !obj.contains_key(key) {
+                        return false;
+                    }
+                }
+            }
+        }
+        let prop_count = obj.len() as u64;
+        if let Some(min) = schema.get("minProperties").and_then(|v| v.as_u64()) {
+            if prop_count < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maxProperties").and_then(|v| v.as_u64()) {
+            if prop_count > max {
                 return false;
             }
         }
