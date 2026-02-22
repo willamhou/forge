@@ -97,6 +97,15 @@ fn naive_attention_impl(
     }
     let heads_per_group = num_heads / num_kv_heads;
 
+    // Naive attention only supports batch=1. Multi-batch requires iterating
+    // over the batch dimension (or using FlashAttention). Reject early to
+    // avoid silently processing only the first batch element.
+    if batch != 1 {
+        return Err(ForgeError::InvalidArgument(format!(
+            "naive attention only supports batch=1, got batch={batch}; use FlashAttention for batched inputs"
+        )));
+    }
+
     // Q/K/V are [batch, seq_len, num_heads, head_dim] — token-major order in memory.
     // After reshape to 2D, layout is [t0h0, t0h1, ..., t1h0, t1h1, ...].
     // We read all data to CPU and extract per-head slices with stride.

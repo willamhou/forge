@@ -48,13 +48,24 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         ForgeError::InvalidArgument("schema must be an object or boolean".into())
     })?;
 
-    // Handle enum
+    // Handle enum — filter by type constraint if both are present.
     if let Some(enum_values) = obj.get("enum") {
+        if let Some(type_val) = obj.get("type") {
+            return typed_enum_to_regex(enum_values, type_val);
+        }
         return enum_to_regex(enum_values);
     }
 
-    // Handle const
+    // Handle const — validate against type constraint if present.
     if let Some(const_val) = obj.get("const") {
+        if let Some(type_val) = obj.get("type") {
+            if !json_value_matches_type(const_val, type_val) {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "const value {} does not match type constraint {}",
+                    const_val, type_val
+                )));
+            }
+        }
         return Ok(json_value_to_regex_literal(const_val));
     }
 
@@ -139,22 +150,31 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
 fn string_schema_to_regex(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
-    if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
-        // Validate the inner pattern compiles independently to prevent injection
-        regex_automata::dfa::dense::DFA::new(pattern).map_err(|e| {
-            ForgeError::InvalidArgument(format!("invalid string pattern: {e}"))
-        })?;
-        // Wrap in a non-capturing group to prevent breakout.
-        // JSON Schema `pattern` means the string content must fully match the
-        // regex, so wrap without repetition quantifier.
-        return Ok(format!(r#""(?:{pattern})""#));
-    }
-
     let min_len = obj
         .get("minLength")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let max_len = obj.get("maxLength").and_then(|v| v.as_u64());
+
+    if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
+        // Validate the inner pattern compiles independently to prevent injection
+        regex_automata::dfa::dense::DFA::new(pattern).map_err(|e| {
+            ForgeError::InvalidArgument(format!("invalid string pattern: {e}"))
+        })?;
+        // JSON Schema `pattern` must fully match the string content.
+        // When minLength/maxLength are also present, DFA-based regex engines
+        // cannot intersect pattern matching with length counting (no
+        // lookaheads). Reject unsupported combinations rather than silently
+        // ignoring the length constraint.
+        if min_len > 0 || max_len.is_some() {
+            return Err(ForgeError::InvalidArgument(
+                "combining pattern with minLength/maxLength is not supported; \
+                 encode the length constraint within the pattern itself"
+                    .into(),
+            ));
+        }
+        return Ok(format!(r#""(?:{pattern})""#));
+    }
 
     let char_pattern = if let Some(enumeration) = obj.get("enum") {
         return enum_to_regex(enumeration);
@@ -460,6 +480,55 @@ fn enum_to_regex(values: &serde_json::Value) -> Result<String> {
     Ok(format!("({})", alternatives.join("|")))
 }
 
+/// Convert an enum to regex, filtering values by a type constraint.
+///
+/// `{"type":"integer","enum":[1,"x",null]}` → only keeps `1`.
+fn typed_enum_to_regex(
+    values: &serde_json::Value,
+    type_constraint: &serde_json::Value,
+) -> Result<String> {
+    let arr = values.as_array().ok_or_else(|| {
+        ForgeError::InvalidArgument("enum must be an array".into())
+    })?;
+
+    let filtered: Vec<String> = arr
+        .iter()
+        .filter(|v| json_value_matches_type(v, type_constraint))
+        .map(|v| json_value_to_regex_literal(v))
+        .collect();
+
+    if filtered.is_empty() {
+        return Err(ForgeError::InvalidArgument(
+            "no enum values match the type constraint".into(),
+        ));
+    }
+
+    Ok(format!("({})", filtered.join("|")))
+}
+
+/// Check if a JSON value matches a `"type"` constraint.
+///
+/// Handles both `"type": "string"` and `"type": ["string", "null"]`.
+fn json_value_matches_type(value: &serde_json::Value, type_constraint: &serde_json::Value) -> bool {
+    let types = type_value_to_set(type_constraint);
+    let actual_type = match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) => {
+            if n.is_f64() && n.as_f64().map(|f| f.fract() != 0.0).unwrap_or(false) {
+                "number"
+            } else {
+                // Integers match both "integer" and "number" in JSON Schema.
+                return types.contains(&"integer") || types.contains(&"number");
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+    types.contains(&actual_type)
+}
+
 /// Convert anyOf/oneOf to regex (alternation).
 fn any_of_to_regex(schemas: &serde_json::Value) -> Result<String> {
     let arr = schemas.as_array().ok_or_else(|| {
@@ -551,9 +620,10 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
                             .collect();
                         let result = match intersected.len() {
                             0 => {
-                                // Empty intersection — contradiction; will
-                                // produce an error downstream via type dispatch.
-                                serde_json::Value::Array(Vec::new())
+                                return Err(ForgeError::InvalidArgument(format!(
+                                    "allOf type contradiction: {:?} ∩ {:?} = ∅",
+                                    existing_set, new_set
+                                )));
                             }
                             1 => serde_json::Value::String(intersected[0].to_string()),
                             _ => serde_json::Value::Array(
