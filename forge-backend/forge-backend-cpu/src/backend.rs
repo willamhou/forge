@@ -376,6 +376,26 @@ impl Backend for CpuBackend {
         Ok(CpuTensor::new(all_data, out_shape))
     }
 
+    fn slice_rows(
+        &self,
+        tensor: &CpuTensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<CpuTensor> {
+        let shape = tensor.shape();
+        let cols: usize = if shape.len() > 1 {
+            shape[1..].iter().product()
+        } else {
+            1
+        };
+        let offset = start_row * cols;
+        let len = num_rows * cols;
+        let data = tensor.data()[offset..offset + len].to_vec();
+        let mut out_shape = shape.to_vec();
+        out_shape[0] = num_rows;
+        Ok(CpuTensor::new(data, out_shape))
+    }
+
     fn cast(&self, x: &CpuTensor, _dtype: DType) -> Result<CpuTensor> {
         // CPU backend stores everything as f32 internally, so cast is a no-op.
         Ok(x.clone())

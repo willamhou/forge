@@ -170,17 +170,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 }
             }
 
-            // Phase 1: process one sequence at a time
-            let all_seqs: Vec<ScheduledSeq> = batch
+            // Prefill: sequential (variable-length, can't concatenate)
+            for seq in batch
                 .prefill_seqs
-                .into_iter()
-                .chain(batch.decode_seqs)
+                .iter()
                 .filter(|s| !failed_seq_ids.contains(&s.seq_id))
-                .collect();
-
-            for seq in &all_seqs {
+            {
                 if let Err(e) = self.process_sequence(seq) {
-                    error!(seq_id = seq.seq_id, error = %e, "sequence processing failed");
+                    error!(seq_id = seq.seq_id, error = %e, "prefill failed");
                     self.send_event(
                         seq.seq_id,
                         EngineEvent::Error {
@@ -188,12 +185,57 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                             error: e.to_string(),
                         },
                     );
-                    // Clean up failed sequence
                     let _ = self.scheduler.cancel(seq.seq_id);
                     let _ = self.kv_cache.free(seq.seq_id);
                     self.event_senders.remove(&seq.seq_id);
                     self.constraints.remove(&seq.seq_id);
                     self.stop_buffers.remove(&seq.seq_id);
+                }
+            }
+
+            // Decode: batched when > 1 sequence, single otherwise
+            let decode_seqs: Vec<ScheduledSeq> = batch
+                .decode_seqs
+                .into_iter()
+                .filter(|s| !failed_seq_ids.contains(&s.seq_id))
+                .collect();
+
+            if decode_seqs.len() > 1 {
+                if let Err(e) = self.process_decode_batch(&decode_seqs) {
+                    // Forward pass failed — clean up all sequences in the batch
+                    error!(error = %e, "batch decode forward failed");
+                    for seq in &decode_seqs {
+                        self.send_event(
+                            seq.seq_id,
+                            EngineEvent::Error {
+                                seq_id: seq.seq_id,
+                                error: e.to_string(),
+                            },
+                        );
+                        let _ = self.scheduler.cancel(seq.seq_id);
+                        let _ = self.kv_cache.free(seq.seq_id);
+                        self.event_senders.remove(&seq.seq_id);
+                        self.constraints.remove(&seq.seq_id);
+                        self.stop_buffers.remove(&seq.seq_id);
+                    }
+                }
+            } else {
+                for seq in &decode_seqs {
+                    if let Err(e) = self.process_sequence(seq) {
+                        error!(seq_id = seq.seq_id, error = %e, "decode failed");
+                        self.send_event(
+                            seq.seq_id,
+                            EngineEvent::Error {
+                                seq_id: seq.seq_id,
+                                error: e.to_string(),
+                            },
+                        );
+                        let _ = self.scheduler.cancel(seq.seq_id);
+                        let _ = self.kv_cache.free(seq.seq_id);
+                        self.event_senders.remove(&seq.seq_id);
+                        self.constraints.remove(&seq.seq_id);
+                        self.stop_buffers.remove(&seq.seq_id);
+                    }
                 }
             }
         }
@@ -310,6 +352,82 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let num_tokens = logits_host.len() / vocab_size;
         let last_logits = &logits_host[(num_tokens - 1) * vocab_size..];
 
+        self.sample_and_emit(seq, last_logits)
+    }
+
+    /// Process multiple decode sequences in a single batched forward pass.
+    ///
+    /// Each sequence contributes exactly 1 token. Tokens are concatenated into
+    /// `[N, hidden_size]` for the forward pass, then logits are split per-sequence
+    /// for independent sampling.
+    fn process_decode_batch(&mut self, seqs: &[ScheduledSeq]) -> Result<()> {
+        // Filter out sequences that have already hit max_tokens
+        let mut active_seqs = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
+            if generated.len() >= seq.sampling_params.max_tokens {
+                self.scheduler
+                    .finish(seq.seq_id, FinishReason::MaxTokens)?;
+                self.kv_cache.free(seq.seq_id)?;
+                self.send_event(
+                    seq.seq_id,
+                    EngineEvent::Finish {
+                        seq_id: seq.seq_id,
+                        reason: FinishReason::MaxTokens,
+                    },
+                );
+                self.event_senders.remove(&seq.seq_id);
+                self.constraints.remove(&seq.seq_id);
+                self.stop_buffers.remove(&seq.seq_id);
+                continue;
+            }
+            active_seqs.push(seq);
+        }
+
+        if active_seqs.is_empty() {
+            return Ok(());
+        }
+
+        // Build batched ModelInput (N sequences, 1 token each)
+        let input = self.build_batch_input(&active_seqs);
+
+        // Single forward pass for all decode sequences
+        let output = self.model.forward(&input, &mut *self.kv_cache)?;
+        self.backend.synchronize()?;
+
+        // Copy logits to host: [N, vocab_size]
+        let logits_host = self.backend.copy_to_host_f32(&output.logits)?;
+        let vocab_size = self.model.config().vocab_size;
+
+        // Per-sequence sampling
+        for (i, seq) in active_seqs.iter().enumerate() {
+            let seq_logits = &logits_host[i * vocab_size..(i + 1) * vocab_size];
+            if let Err(e) = self.sample_and_emit(seq, seq_logits) {
+                error!(seq_id = seq.seq_id, error = %e, "sampling failed in batch");
+                self.send_event(
+                    seq.seq_id,
+                    EngineEvent::Error {
+                        seq_id: seq.seq_id,
+                        error: e.to_string(),
+                    },
+                );
+                let _ = self.scheduler.cancel(seq.seq_id);
+                let _ = self.kv_cache.free(seq.seq_id);
+                self.event_senders.remove(&seq.seq_id);
+                self.constraints.remove(&seq.seq_id);
+                self.stop_buffers.remove(&seq.seq_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sample a token from logits, advance FSM, handle stop conditions, emit events.
+    ///
+    /// Shared by `process_sequence` (single) and `process_decode_batch` (batched).
+    fn sample_and_emit(&mut self, seq: &ScheduledSeq, last_logits: &[f32]) -> Result<()> {
+        let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
+
         // Build constraint reference for sampling
         let constraint_ref = self
             .constraints
@@ -379,8 +497,6 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
                 Some(next) => {
                     seq_constraint.state = next;
-                    // If the FSM reached a final state and has no further transitions,
-                    // the structured output is complete.
                     if seq_constraint.fsm.is_final_state(next) {
                         let has_transitions = seq_constraint
                             .fsm
@@ -392,15 +508,11 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     }
                 }
                 None => {
-                    // If the token is an EOS/stop token and the FSM is in an
-                    // accepting state, this is a valid completion — the model
-                    // chose to stop at a valid boundary (EOS was unmasked).
                     if seq_constraint.fsm.is_final_state(seq_constraint.state)
                         && seq.sampling_params.stop_token_ids.contains(&token_id)
                     {
                         fsm_finished = true;
                     } else {
-                        // Record state for abort handling after the borrow ends.
                         fsm_abort = Some((seq_constraint.state, token_id));
                     }
                 }
@@ -437,14 +549,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let stop_token_hit = seq.sampling_params.stop_token_ids.contains(&token_id);
         let max_tokens_hit = generated.len() + 1 >= seq.sampling_params.max_tokens;
 
-        // Stop-string handling with look-ahead buffering.
-        //
-        // When stop_strings are configured, tokens are buffered until we can
-        // confirm they don't form part of a stop string. This prevents partial
-        // stop-string leakage in streaming mode.
         let has_stop_strings = !seq.sampling_params.stop_strings.is_empty();
         let stop_string_hit = if has_stop_strings {
-            // Buffer this token
             self.stop_buffers
                 .entry(seq.seq_id)
                 .or_default()
@@ -468,23 +574,15 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false) || fsm_finished;
 
         if stop_string_hit.unwrap_or(false) {
-            // Stop string hit — discard all buffered tokens (they contain
-            // the stop sequence and should not be emitted per OpenAI semantics).
             self.stop_buffers.remove(&seq.seq_id);
         } else if has_stop_strings {
-            // No stop string yet. Check if the current decoded text ends
-            // with a prefix of any stop string — if so, keep buffering.
-            // Otherwise flush safe tokens.
-            let flush_all = should_finish; // finishing for other reasons → flush everything
+            let flush_all = should_finish;
             let prefix_match = if !flush_all {
                 self.decode_fn.as_ref().and_then(|decode| {
                     let mut all_tokens = generated.clone();
                     all_tokens.push(token_id);
                     let text = decode(&all_tokens)?;
                     let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
-                        // Check if the text ends with any non-empty prefix of s.
-                        // Use char_indices to iterate on character boundaries
-                        // (byte slicing on non-ASCII would panic).
                         s.char_indices().skip(1).any(|(byte_pos, _)| {
                             text.ends_with(&s[..byte_pos])
                         }) || text.ends_with(s)
@@ -496,7 +594,6 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             };
 
             if !prefix_match.unwrap_or(false) || flush_all {
-                // Safe to flush all buffered tokens
                 if let Some(buf) = self.stop_buffers.remove(&seq.seq_id) {
                     for &tid in &buf {
                         self.send_event(
@@ -510,9 +607,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     }
                 }
             }
-            // else: keep buffering — text ends with stop-string prefix
         } else {
-            // No stop_strings configured — emit immediately
             self.send_event(
                 seq.seq_id,
                 EngineEvent::Token {
@@ -535,7 +630,6 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             };
             self.scheduler.finish(seq.seq_id, reason)?;
             self.kv_cache.free(seq.seq_id)?;
-            // Clean up any remaining stop buffer
             self.stop_buffers.remove(&seq.seq_id);
             self.send_event(
                 seq.seq_id,
@@ -549,6 +643,35 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         }
 
         Ok(())
+    }
+
+    /// Build a batched ModelInput from multiple decode sequences (1 token each).
+    fn build_batch_input(&self, seqs: &[&ScheduledSeq]) -> ModelInput {
+        let mut token_ids = Vec::with_capacity(seqs.len());
+        let mut positions = Vec::with_capacity(seqs.len());
+        let mut seq_metadata = Vec::with_capacity(seqs.len());
+
+        for seq in seqs {
+            let gen_count = self.get_generated_count(seq.seq_id);
+            let prompt_len = (seq.position_offset + 1).saturating_sub(gen_count).max(1);
+            let offset = seq.position_offset as u32;
+            let pos: Vec<u32> = (offset..offset + seq.token_ids.len() as u32).collect();
+
+            token_ids.push(seq.token_ids.clone());
+            positions.push(pos);
+            seq_metadata.push(SeqMetadata {
+                seq_id: seq.seq_id,
+                prompt_len,
+                generated_len: gen_count,
+                is_prefill: false,
+            });
+        }
+
+        ModelInput {
+            token_ids,
+            positions,
+            seq_metadata,
+        }
     }
 
     /// Build a single-sequence ModelInput from a ScheduledSeq.

@@ -254,6 +254,42 @@ fn test_copy_from_host_bf16() {
 }
 
 #[test]
+fn test_slice_rows_basic() {
+    let backend = CpuBackend::new();
+    let data: Vec<f32> = (1..=12).map(|i| i as f32).collect();
+    let t = backend.copy_from_host_f32(&data, &[3, 4]).unwrap();
+    let sliced = backend.slice_rows(&t, 1, 2).unwrap();
+    assert_eq!(sliced.shape(), &[2, 4]);
+    assert_eq!(
+        backend.copy_to_host_f32(&sliced).unwrap(),
+        vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    );
+}
+
+#[test]
+fn test_slice_rows_single_row() {
+    let backend = CpuBackend::new();
+    let data: Vec<f32> = (1..=6).map(|i| i as f32).collect();
+    let t = backend.copy_from_host_f32(&data, &[3, 2]).unwrap();
+    let sliced = backend.slice_rows(&t, 2, 1).unwrap();
+    assert_eq!(sliced.shape(), &[1, 2]);
+    assert_eq!(backend.copy_to_host_f32(&sliced).unwrap(), vec![5.0, 6.0]);
+}
+
+#[test]
+fn test_slice_rows_first_row() {
+    let backend = CpuBackend::new();
+    let data: Vec<f32> = (1..=6).map(|i| i as f32).collect();
+    let t = backend.copy_from_host_f32(&data, &[2, 3]).unwrap();
+    let sliced = backend.slice_rows(&t, 0, 1).unwrap();
+    assert_eq!(sliced.shape(), &[1, 3]);
+    assert_eq!(
+        backend.copy_to_host_f32(&sliced).unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
 fn test_allocate_any_dtype() {
     let backend = CpuBackend::new();
     // CPU backend should accept all dtypes (stores as f32 internally)

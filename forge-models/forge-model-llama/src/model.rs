@@ -35,40 +35,25 @@ impl<B: Backend> LlamaModel<B> {
     }
 }
 
-impl<B: Backend + Clone> Model for LlamaModel<B> {
-    type T = B::Tensor;
-
-    fn forward(
+impl<B: Backend + Clone> LlamaModel<B> {
+    /// Single-sequence forward pass (prefill or decode).
+    fn forward_single(
         &self,
         input: &ModelInput,
         kv_cache: &mut dyn KvCache<T = B::Tensor>,
     ) -> Result<ModelOutput<B::Tensor>> {
-        // Phase 1: single-sequence only. The engine loops over sequences externally.
-        if input.seq_metadata.len() != 1 {
-            return Err(ForgeError::InvalidArgument(format!(
-                "Phase 1 model supports exactly 1 sequence per forward call, got {}",
-                input.seq_metadata.len()
-            )));
-        }
         let seq_meta = &input.seq_metadata[0];
         let token_ids = &input.token_ids[0];
 
-        // 1. Token embedding lookup
         let hidden = self.backend.embedding(&self.embed_tokens, token_ids)?;
-        // hidden shape: [seq_len, hidden_size]
 
-        // Position offset for RoPE: absolute position of the first token in
-        // this forward pass. For chunked prefill, prompt_len tracks the total
-        // tokens fed so far (offset + chunk_size), so subtracting token_ids.len()
-        // gives the chunk's starting position. For decode, prompt_len +
-        // generated_len - 1 is the position of the single decode token.
+        // Position offset for RoPE: absolute position of the first token.
         let pos_offset = if seq_meta.is_prefill {
             seq_meta.prompt_len.saturating_sub(token_ids.len())
         } else {
             seq_meta.prompt_len + seq_meta.generated_len - token_ids.len()
         };
 
-        // 2. Run through each decoder layer
         let mut hidden = hidden;
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(
@@ -82,13 +67,75 @@ impl<B: Backend + Clone> Model for LlamaModel<B> {
             )?;
         }
 
-        // 3. Final RMS norm
         hidden = self.norm.forward(&hidden, &self.backend)?;
-
-        // 4. LM head projection → logits [seq_len, vocab_size]
         let logits = self.backend.matmul(&hidden, &self.lm_head)?;
 
         Ok(ModelOutput { logits })
+    }
+
+    /// Batched decode forward: N sequences, 1 token each.
+    ///
+    /// Concatenates tokens into `[N, hidden_size]`. Linear ops (QKV, MLP, norms,
+    /// LM head) batch naturally. Attention loops per-sequence for KV cache.
+    fn forward_batch_decode(
+        &self,
+        input: &ModelInput,
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+    ) -> Result<ModelOutput<B::Tensor>> {
+        let all_tokens: Vec<u32> = input.token_ids.iter().flatten().copied().collect();
+        let all_positions: Vec<u32> = input.positions.iter().flatten().copied().collect();
+        let seq_ids: Vec<u64> = input.seq_metadata.iter().map(|m| m.seq_id).collect();
+
+        let mut hidden = self.backend.embedding(&self.embed_tokens, &all_tokens)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_batch(
+                &hidden,
+                &self.rope_freqs,
+                &all_positions,
+                &seq_ids,
+                kv_cache,
+                i,
+                &self.backend,
+            )?;
+        }
+
+        hidden = self.norm.forward(&hidden, &self.backend)?;
+        let logits = self.backend.matmul(&hidden, &self.lm_head)?;
+
+        Ok(ModelOutput { logits })
+    }
+}
+
+impl<B: Backend + Clone> Model for LlamaModel<B> {
+    type T = B::Tensor;
+
+    fn forward(
+        &self,
+        input: &ModelInput,
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+    ) -> Result<ModelOutput<B::Tensor>> {
+        if input.seq_metadata.len() == 1 {
+            return self.forward_single(input, kv_cache);
+        }
+
+        // Multi-sequence: all must be decode with exactly 1 token each
+        for (i, meta) in input.seq_metadata.iter().enumerate() {
+            if meta.is_prefill {
+                return Err(ForgeError::InvalidArgument(
+                    "batch forward does not support prefill sequences".into(),
+                ));
+            }
+            if input.token_ids[i].len() != 1 {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "batch decode expects 1 token per sequence, seq {} has {}",
+                    meta.seq_id,
+                    input.token_ids[i].len()
+                )));
+            }
+        }
+
+        self.forward_batch_decode(input, kv_cache)
     }
 
     fn config(&self) -> &ModelConfig {

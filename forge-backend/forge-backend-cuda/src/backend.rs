@@ -1124,6 +1124,50 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn slice_rows(
+        &self,
+        tensor: &CudaTensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<CudaTensor> {
+        let shape = tensor.shape();
+        let cols: usize = if shape.len() > 1 {
+            shape[1..].iter().product()
+        } else {
+            1
+        };
+        let offset = start_row * cols;
+        let len = num_rows * cols;
+        let mut out_shape = shape.to_vec();
+        out_shape[0] = num_rows;
+
+        match tensor.dtype() {
+            DType::F32 => {
+                let src = tensor.f32_slice()?;
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(len)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                self.stream
+                    .memcpy_dtod(&src.slice(offset..offset + len), &mut out)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                Ok(CudaTensor::f32_data(out, out_shape))
+            }
+            DType::F16 => {
+                let src = tensor.f16_slice()?;
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(len)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                self.stream
+                    .memcpy_dtod(&src.slice(offset..offset + len), &mut out)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                Ok(CudaTensor::f16_data(out, out_shape))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
     fn extract_head(
         &self,
         tensor: &CudaTensor,

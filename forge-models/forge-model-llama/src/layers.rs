@@ -142,6 +142,72 @@ impl<B: Backend> LlamaAttention<B> {
         backend.matmul(&attn_out, &self.wo)
     }
 
+    /// Batched attention for decode: each sequence contributes exactly 1 token.
+    ///
+    /// `x`: `[N, hidden_size]` (N concatenated decode tokens)
+    /// `positions`: per-token absolute positions, length N
+    /// `seq_ids`: per-sequence IDs for KV cache, length N
+    ///
+    /// Returns: `[N, hidden_size]`
+    pub fn forward_batch(
+        &self,
+        x: &B::Tensor,
+        rope_freqs: &RopeFreqs<B>,
+        positions: &[u32],
+        seq_ids: &[u64],
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        layer_idx: usize,
+        backend: &B,
+    ) -> Result<B::Tensor> {
+        let n = x.shape()[0];
+
+        // Batch QKV projections: [N, hidden_size] @ weights → [N, proj_size]
+        let q = backend.matmul(x, &self.wq)?;
+        let k = backend.matmul(x, &self.wk)?;
+        let v = backend.matmul(x, &self.wv)?;
+
+        // Reshape for RoPE: [1, N, num_heads/kv_heads, head_dim]
+        let q = backend.reshape(&q, &[1, n, self.num_heads, self.head_dim])?;
+        let k = backend.reshape(&k, &[1, n, self.num_kv_heads, self.head_dim])?;
+
+        // Apply RoPE with per-token positions
+        let q = rope_freqs.apply_with_positions(&q, positions, backend)?;
+        let k = rope_freqs.apply_with_positions(&k, positions, backend)?;
+
+        // Flatten back to 2D
+        let q = backend.reshape(&q, &[n, self.num_heads * self.head_dim])?;
+        let k = backend.reshape(&k, &[n, self.num_kv_heads * self.head_dim])?;
+
+        // Per-sequence attention loop (KV cache is per-sequence)
+        let mut attn_outputs = Vec::with_capacity(n);
+        for i in 0..n {
+            let q_row = backend.slice_rows(&q, i, 1)?;
+            let k_row = backend.slice_rows(&k, i, 1)?;
+            let v_row = backend.slice_rows(&v, i, 1)?;
+
+            kv_cache.append(seq_ids[i], layer_idx, &k_row, &v_row)?;
+            let (k_full, v_full) = kv_cache.get_kv(seq_ids[i], layer_idx)?;
+            let kv_len = k_full.shape()[0];
+
+            let q_4d =
+                backend.reshape(&q_row, &[1, 1, self.num_heads, self.head_dim])?;
+            let k_4d =
+                backend.reshape(&k_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
+            let v_4d =
+                backend.reshape(&v_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
+
+            let attn_out =
+                self.compute_attention(&q_4d, &k_4d, &v_4d, 1, kv_len, backend)?;
+            attn_outputs.push(attn_out);
+        }
+
+        // Cat → [N, num_heads * head_dim], cast, batch output projection
+        let refs: Vec<&B::Tensor> = attn_outputs.iter().collect();
+        let concat = backend.cat(&refs, 0)?;
+        let concat = backend.cast(&concat, self.wo.dtype())?;
+        backend.matmul(&concat, &self.wo)
+    }
+
     /// Compute scaled dot-product attention per head (GPU-native, no CPU copies).
     ///
     /// Q: [1, seq_len, num_heads, head_dim]
@@ -241,6 +307,39 @@ impl<B: Backend> LlamaDecoderLayer<B> {
             pos_offset,
             kv_cache,
             seq_id,
+            layer_idx,
+            backend,
+        )?;
+        let x = backend.add(x, &attn_out)?;
+
+        // Post-attention norm + MLP + residual
+        let normed = self.post_attention_layernorm.forward(&x, backend)?;
+        let mlp_out = self.mlp.forward(&normed, backend)?;
+        backend.add(&x, &mlp_out)
+    }
+
+    /// Batched forward for decode: N sequences, 1 token each.
+    ///
+    /// Norms and MLP operate row-wise and batch naturally on `[N, hidden_size]`.
+    /// Attention loops per-sequence for KV cache.
+    pub fn forward_batch(
+        &self,
+        x: &B::Tensor,
+        rope_freqs: &RopeFreqs<B>,
+        positions: &[u32],
+        seq_ids: &[u64],
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        layer_idx: usize,
+        backend: &B,
+    ) -> Result<B::Tensor> {
+        // Pre-attention norm + batched attention + residual
+        let normed = self.input_layernorm.forward(x, backend)?;
+        let attn_out = self.self_attn.forward_batch(
+            &normed,
+            rope_freqs,
+            positions,
+            seq_ids,
+            kv_cache,
             layer_idx,
             backend,
         )?;

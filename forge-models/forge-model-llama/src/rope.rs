@@ -89,4 +89,54 @@ impl<B: Backend> RopeFreqs<B> {
 
         backend.rope(x, &cos_slice, &sin_slice)
     }
+
+    /// Apply RoPE with explicit per-token positions.
+    ///
+    /// Unlike `apply_with_offset` which assumes consecutive positions
+    /// `[offset..offset+seq_len]`, this method allows arbitrary positions
+    /// per token — required for batched decode where each token comes from
+    /// a different sequence at a different absolute position.
+    ///
+    /// `x` shape: `[1, seq_len, num_heads, head_dim]`
+    /// `positions`: `&[u32]` of length `seq_len`, each entry is the absolute position.
+    pub fn apply_with_positions(
+        &self,
+        x: &B::Tensor,
+        positions: &[u32],
+        backend: &B,
+    ) -> Result<B::Tensor> {
+        let seq_len = x.shape()[1];
+        if positions.len() != seq_len {
+            return Err(ForgeError::InvalidArgument(format!(
+                "positions length {} != seq_len {}",
+                positions.len(),
+                seq_len,
+            )));
+        }
+
+        // Gather cos/sin rows by position index
+        let mut cos_data = Vec::with_capacity(seq_len * self.half_dim);
+        let mut sin_data = Vec::with_capacity(seq_len * self.half_dim);
+
+        for &pos in positions {
+            let pos = pos as usize;
+            if pos >= self.max_seq_len {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "RoPE position {} exceeds precomputed table length {}",
+                    pos, self.max_seq_len,
+                )));
+            }
+            let start = pos * self.half_dim;
+            let end = start + self.half_dim;
+            cos_data.extend_from_slice(&self.cos_host[start..end]);
+            sin_data.extend_from_slice(&self.sin_host[start..end]);
+        }
+
+        let cos_tensor =
+            backend.copy_from_host_f32(&cos_data, &[seq_len, self.half_dim])?;
+        let sin_tensor =
+            backend.copy_from_host_f32(&sin_data, &[seq_len, self.half_dim])?;
+
+        backend.rope(x, &cos_tensor, &sin_tensor)
+    }
 }

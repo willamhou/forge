@@ -88,6 +88,28 @@ pub trait Backend: Send + Sync + 'static {
         self.copy_from_host_f32(&data, scores.shape())
     }
 
+    /// Extract rows `[start_row..start_row+num_rows]` from a tensor.
+    /// Input: `[total_rows, cols...]`, Output: `[num_rows, cols...]`.
+    fn slice_rows(
+        &self,
+        tensor: &Self::Tensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<Self::Tensor> {
+        let shape = tensor.shape();
+        let cols: usize = if shape.len() > 1 {
+            shape[1..].iter().product()
+        } else {
+            1
+        };
+        let data = self.copy_to_host_f32(tensor)?;
+        let offset = start_row * cols;
+        let len = num_rows * cols;
+        let mut out_shape = shape.to_vec();
+        out_shape[0] = num_rows;
+        self.copy_from_host_f32(&data[offset..offset + len], &out_shape)
+    }
+
     /// Interleave per-head `[seq_len, head_dim]` outputs → `[seq_len, num_heads * head_dim]`.
     fn interleave_heads(
         &self,

@@ -735,7 +735,9 @@ dependencies = [
 name = "forge-model-llama"
 version = "0.1.0"
 dependencies = [
+ "forge-backend-cpu",
  "forge-core",
+ "forge-kvcache",
  "forge-loader",
  "tracing",
 ]
