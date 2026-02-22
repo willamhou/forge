@@ -44,7 +44,6 @@ forge-model-llama ──→ forge-core, forge-kernels
 forge-kvcache ──→ forge-core
 
 forge-backend-cuda ──→ forge-core, forge-kernels, cudarc, half
-                       (optional: cc, tracing via flash-attn feature)
 
 forge-backend-cpu ──→ forge-core, half
 
@@ -54,12 +53,6 @@ forge-kernels ──→ forge-core, cudarc, half
 
 forge-core ──→ thiserror, half, serde
 ```
-
-## Feature Flags
-
-| Flag | Crate | Effect |
-|------|-------|--------|
-| `flash-attn` | `forge-backend-cuda` | Compiles `flash_attn_wrapper.cu` via `build.rs`, enables FlashAttention FFI with runtime fallback |
 
 ## Request Flow
 

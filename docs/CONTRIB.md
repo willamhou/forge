@@ -56,9 +56,6 @@ cargo check --workspace
 # Build release
 cargo build --release --workspace
 
-# Build with FlashAttention FFI (compiles wrapper .cu via build.rs, requires CUDA toolkit)
-cargo build -p forge-backend-cuda --features flash-attn
-
 # Run tests
 cargo test --workspace
 
@@ -108,12 +105,6 @@ bash scripts/benchmark.sh /path/to/model 10 128
 - Edition 2024, stable toolchain
 - `cargo fmt` and `cargo clippy` before committing
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `perf:`, `docs:`, `chore:`
-
-## Feature Flags
-
-| Flag | Crate | Description |
-|------|-------|-------------|
-| `flash-attn` | `forge-backend-cuda` | Enable FlashAttention FFI (`build.rs` compiles wrapper `.cu`, requires CUDA toolkit; falls back to naive attention at runtime if library unavailable) |
 
 ## Architecture
 

@@ -263,17 +263,11 @@ fn test_naive_attention_invalid_head_ratio() {
     assert!(err_msg.contains("multiple"), "got: {err_msg}");
 }
 
-/// Test that `attention_fwd` dispatches correctly:
-/// - For F32 tensors, it should use naive attention (FlashAttention requires fp16/bf16).
-/// - For F16 tensors without the flash-attn feature, it should also use naive attention.
-/// - For F16 tensors with the flash-attn feature (stub returns -1), it should fall
-///   back to naive attention.
-///
-/// In all cases, the result should match naive_attention directly.
+/// Test that `attention_fwd` delegates to naive attention for F32 tensors.
+/// Phase 2 will replace with PagedAttention kernel.
 #[test]
 fn test_attention_fwd_f32_uses_naive() {
     let backend = CudaBackend::new(0).unwrap();
-    // F32 tensors — always takes naive path regardless of flash-attn feature
     let q = backend
         .copy_from_host_f32(&[1.0, 0.0, 0.0, 1.0], &[1, 1, 2, 2])
         .unwrap();
@@ -300,8 +294,8 @@ fn test_attention_fwd_f32_uses_naive() {
     }
 }
 
-/// Test attention_fwd with F16 tensors. Without the flash-attn feature linked to
-/// a real library, this should fall back to naive attention (which handles F16).
+/// Test that `attention_fwd` delegates to naive attention for F16 tensors.
+/// Phase 2 will replace with PagedAttention kernel.
 #[test]
 fn test_attention_fwd_f16_fallback() {
     let backend = CudaBackend::new(0).unwrap();

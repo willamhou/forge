@@ -48,8 +48,8 @@ pub enum DType { F32, F16, BF16, I32, U32 }
 | `src/lib.rs` | `CudaBackend` struct, `Backend` impl |
 | `src/tensor.rs` | `CudaTensor` struct, `Tensor` impl, device memory management |
 | `src/attention.rs` | Naive attention with causal masking |
-| `src/flash_attention.rs` | FlashAttention v2 FFI (feature-gated `flash-attn`) |
-| `build.rs` | Compiles `flash_attn_wrapper.cu` when `flash-attn` enabled |
+| `src/flash_attention.rs` | Attention dispatch (delegates to naive; Phase 2: PagedAttention) |
+| `build.rs` | No-op (reserved for future build steps) |
 | `tests/test_kernels.rs` | Integration tests for CUDA ops |
 
 ### `CudaBackend`
@@ -57,7 +57,7 @@ pub enum DType { F32, F16, BF16, I32, U32 }
 - Constructor: `CudaBackend::new(device_ordinal) -> Result<Self>`
 - All ops dispatch to cuBLAS (matmul) or custom CUDA kernels (element-wise)
 - FP16 path: `matmul_f16` uses `cublasGemmEx` with `CUDA_R_16F`
-- FlashAttention: runtime fallback to naive if FFI unavailable
+- Attention: delegates to naive attention (Phase 2 will add PagedAttention)
 
 ### `CudaTensor`
 - `data: CudaSlice<u8>` (type-erased GPU buffer)
@@ -84,19 +84,15 @@ pub enum DType { F32, F16, BF16, I32, U32 }
 ### Files
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | FFI bindings (`extern "C"` wrappers) |
-| `csrc/kernels.cu` | RMSNorm, RoPE, SiLU, embedding, cast kernels |
-| `csrc/flash_attn_wrapper.cu` | FlashAttention v2 wrapper (compiled by build.rs) |
-| `build.rs` | Compiles `kernels.cu` via `nvcc` |
+| `src/lib.rs` | Module declarations |
+| `src/elementwise.rs` | Add, mul, mul_scalar, silu kernel sources (F32 + F16) |
+| `src/norm.rs` | RMS norm, softmax kernel sources (F32 + F16) |
+| `src/positional.rs` | RoPE, embedding kernel sources (F32 + F16) |
+| `src/memory.rs` | Transpose, cast kernel sources (F32 + F16) |
+| `src/attention.rs` | Extract head, causal mask, interleave heads kernel sources (F32 + F16) |
 
-### Exposed FFI Functions
-```
-forge_rms_norm, forge_rms_norm_f16
-forge_rope, forge_rope_f16
-forge_silu_mul, forge_silu_mul_f16
-forge_embedding_lookup
-forge_cast_f32_to_f16, forge_cast_f16_to_f32
-```
+### Usage
+Kernel source strings are concatenated at runtime in `CudaBackend::new()` and compiled to PTX via NVRTC.
 
 ## forge-kvcache — KV Cache
 

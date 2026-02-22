@@ -137,17 +137,6 @@ curl -s http://localhost:8080/v1/chat/completions \
 2. `nvcc` is on PATH
 3. `CUDA_PATH` environment variable is set correctly
 
-### FlashAttention feature fails to compile or link
-
-**Symptom:** Build error when using `--features flash-attn`.
-
-**Check:**
-1. CUDA toolkit is installed and `nvcc` is on PATH (needed by `build.rs` to compile the wrapper `.cu` file)
-2. The `cc` crate can find a working C++ compiler
-3. If linking the FlashAttention library: verify headers and `.so` are available
-
-**Note:** When the `flash-attn` feature is enabled, `build.rs` compiles `forge-kernels/csrc/flash_attn_wrapper.cu`. At runtime, if the FFI call fails the backend falls back to naive attention automatically.
-
 ## Monitoring
 
 Phase 1 uses `tracing` for structured logging. Set the log level via:

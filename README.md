@@ -9,6 +9,7 @@ A from-scratch LLM inference server written in Rust with CUDA acceleration.
 - **Structured output** — JSON Schema → regex → DFA → token-level FSM constrained generation
 - **N-gram speculative decoding** with adaptive draft length
 - **Paged KV cache** with block-level memory management
+- **GPU-native attention** — extract/mask/interleave ops run as CUDA kernels with no CPU roundtrip
 - **GGUF model loading** with Q4_K_M and Q8_0 dequantization
 - **CUDA + CPU backends** — feature-gated CUDA for CPU-only builds
 - **Llama model family** support (Llama 2/3, TinyLlama, etc.)
@@ -20,7 +21,7 @@ forge-core          Shared traits (Backend, Model, Scheduler, KvCache), error ty
 forge-backend       Backend trait abstraction
 forge-backend-cpu   CPU backend (OpenBLAS)
 forge-backend-cuda  CUDA backend (cuBLAS + custom kernels)
-forge-kernels       CUDA kernels (RMSNorm, SiLU, Softmax, RoPE, Embedding)
+forge-kernels       CUDA kernel sources (elementwise, norm, positional, memory, attention)
 forge-kvcache       Naive and paged KV cache implementations
 forge-loader        SafeTensors + GGUF model loaders
 forge-model-llama   Llama model (attention, FFN, RoPE, GQA)
