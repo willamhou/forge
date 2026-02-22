@@ -10,411 +10,6 @@ use forge_core::{Backend, DType, ForgeError, Result, Tensor};
 
 use crate::tensor::CudaTensor;
 
-const ELEMENTWISE_PTX_SRC: &str = r#"
-extern "C" __global__ void add_f32(float* out, const float* a, const float* b, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = a[i] + b[i];
-    }
-}
-
-extern "C" __global__ void mul_f32(float* out, const float* a, const float* b, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = a[i] * b[i];
-    }
-}
-
-extern "C" __global__ void mul_scalar_f32(float* out, const float* a, float scalar, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = a[i] * scalar;
-    }
-}
-
-extern "C" __global__ void silu_f32(float* out, const float* a, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float x = a[i];
-        out[i] = x / (1.0f + expf(-x));
-    }
-}
-
-extern "C" __global__ void rms_norm_f32(
-    float* out,
-    const float* input,
-    const float* weight,
-    float eps,
-    unsigned int rows,
-    unsigned int cols
-) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const float* x = input + row * cols;
-    float* o = out + row * cols;
-
-    extern __shared__ float shared[];
-
-    float local_ss = 0.0f;
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = x[i];
-        local_ss += val * val;
-    }
-
-    shared[threadIdx.x] = local_ss;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-
-    float rms = rsqrtf(shared[0] / (float)cols + eps);
-
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        o[i] = x[i] * rms * weight[i];
-    }
-}
-
-extern "C" __global__ void softmax_f32(
-    float* out,
-    const float* input,
-    unsigned int rows,
-    unsigned int cols
-) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const float* x = input + row * cols;
-    float* o = out + row * cols;
-
-    extern __shared__ float shared[];
-
-    // Find max for numerical stability
-    float local_max = -1e30f;
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = x[i];
-        if (val > local_max) local_max = val;
-    }
-    shared[threadIdx.x] = local_max;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            if (shared[threadIdx.x + s] > shared[threadIdx.x]) {
-                shared[threadIdx.x] = shared[threadIdx.x + s];
-            }
-        }
-        __syncthreads();
-    }
-    float max_val = shared[0];
-
-    // Compute exp and sum
-    float local_sum = 0.0f;
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = expf(x[i] - max_val);
-        o[i] = val;
-        local_sum += val;
-    }
-    shared[threadIdx.x] = local_sum;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    float sum = shared[0];
-
-    // Normalize
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        o[i] = o[i] / sum;
-    }
-}
-
-extern "C" __global__ void embedding_f32(
-    float* out,
-    const float* weight,
-    const unsigned int* indices,
-    unsigned int num_indices,
-    unsigned int embedding_dim,
-    unsigned int vocab_size
-) {
-    unsigned int idx = blockIdx.x;
-    if (idx >= num_indices) return;
-
-    unsigned int token_id = indices[idx];
-    if (token_id >= vocab_size) return;
-
-    const float* src = weight + token_id * embedding_dim;
-    float* dst = out + idx * embedding_dim;
-
-    for (unsigned int i = threadIdx.x; i < embedding_dim; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-extern "C" __global__ void rope_f32(
-    float* out,
-    const float* input,
-    const float* cos_freqs,
-    const float* sin_freqs,
-    unsigned int batch,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim
-) {
-    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int half_dim = head_dim / 2;
-    unsigned int total = batch * seq_len * num_heads * half_dim;
-    if (tid >= total) return;
-
-    unsigned int h = tid % half_dim;
-    unsigned int rem = tid / half_dim;
-    unsigned int head = rem % num_heads;
-    rem = rem / num_heads;
-    unsigned int pos = rem % seq_len;
-
-    unsigned int base = (rem / seq_len) * seq_len * num_heads * head_dim
-                      + pos * num_heads * head_dim
-                      + head * head_dim;
-
-    float x0 = input[base + h];
-    float x1 = input[base + h + half_dim];
-    float cos_val = cos_freqs[pos * half_dim + h];
-    float sin_val = sin_freqs[pos * half_dim + h];
-
-    out[base + h] = x0 * cos_val - x1 * sin_val;
-    out[base + h + half_dim] = x0 * sin_val + x1 * cos_val;
-}
-
-extern "C" __global__ void transpose_f32(
-    float* out, const float* in_data,
-    unsigned int rows, unsigned int cols
-) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    unsigned int r = i / cols;
-    unsigned int c = i % cols;
-    out[c * rows + r] = in_data[r * cols + c];
-}
-"#;
-
-const F16_PTX_SRC: &str = r#"
-#include <cuda_fp16.h>
-
-extern "C" __global__ void add_f16(__half* out, const __half* a, const __half* b, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __hadd(a[i], b[i]);
-    }
-}
-
-extern "C" __global__ void mul_f16(__half* out, const __half* a, const __half* b, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __hmul(a[i], b[i]);
-    }
-}
-
-extern "C" __global__ void mul_scalar_f16(__half* out, const __half* a, float scalar, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __float2half(__half2float(a[i]) * scalar);
-    }
-}
-
-extern "C" __global__ void silu_f16(__half* out, const __half* a, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float x = __half2float(a[i]);
-        out[i] = __float2half(x / (1.0f + expf(-x)));
-    }
-}
-
-extern "C" __global__ void rms_norm_f16(
-    __half* out,
-    const __half* input,
-    const __half* weight,
-    float eps,
-    unsigned int rows,
-    unsigned int cols
-) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const __half* x = input + row * cols;
-    __half* o = out + row * cols;
-
-    extern __shared__ float shared[];
-
-    float local_ss = 0.0f;
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = __half2float(x[i]);
-        local_ss += val * val;
-    }
-
-    shared[threadIdx.x] = local_ss;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-
-    float rms = rsqrtf(shared[0] / (float)cols + eps);
-
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        o[i] = __float2half(__half2float(x[i]) * rms * __half2float(weight[i]));
-    }
-}
-
-extern "C" __global__ void softmax_f16(
-    __half* out,
-    const __half* input,
-    unsigned int rows,
-    unsigned int cols
-) {
-    unsigned int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const __half* x = input + row * cols;
-    __half* o = out + row * cols;
-
-    extern __shared__ float shared[];
-
-    float local_max = -1e30f;
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = __half2float(x[i]);
-        if (val > local_max) local_max = val;
-    }
-    shared[threadIdx.x] = local_max;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            if (shared[threadIdx.x + s] > shared[threadIdx.x]) {
-                shared[threadIdx.x] = shared[threadIdx.x + s];
-            }
-        }
-        __syncthreads();
-    }
-    float max_val = shared[0];
-
-    float local_sum = 0.0f;
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = expf(__half2float(x[i]) - max_val);
-        o[i] = __float2half(val);
-        local_sum += val;
-    }
-    shared[threadIdx.x] = local_sum;
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    float sum = shared[0];
-
-    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {
-        o[i] = __float2half(__half2float(o[i]) / sum);
-    }
-}
-
-extern "C" __global__ void embedding_f16(
-    __half* out,
-    const __half* weight,
-    const unsigned int* indices,
-    unsigned int num_indices,
-    unsigned int embedding_dim,
-    unsigned int vocab_size
-) {
-    unsigned int idx = blockIdx.x;
-    if (idx >= num_indices) return;
-
-    unsigned int token_id = indices[idx];
-    if (token_id >= vocab_size) return;
-
-    const __half* src = weight + token_id * embedding_dim;
-    __half* dst = out + idx * embedding_dim;
-
-    for (unsigned int i = threadIdx.x; i < embedding_dim; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-
-extern "C" __global__ void rope_f16(
-    __half* out,
-    const __half* input,
-    const float* cos_freqs,
-    const float* sin_freqs,
-    unsigned int batch,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim
-) {
-    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int half_dim = head_dim / 2;
-    unsigned int total = batch * seq_len * num_heads * half_dim;
-    if (tid >= total) return;
-
-    unsigned int h = tid % half_dim;
-    unsigned int rem = tid / half_dim;
-    unsigned int head = rem % num_heads;
-    rem = rem / num_heads;
-    unsigned int pos = rem % seq_len;
-
-    unsigned int base = (rem / seq_len) * seq_len * num_heads * head_dim
-                      + pos * num_heads * head_dim
-                      + head * head_dim;
-
-    float x0 = __half2float(input[base + h]);
-    float x1 = __half2float(input[base + h + half_dim]);
-    float cos_val = cos_freqs[pos * half_dim + h];
-    float sin_val = sin_freqs[pos * half_dim + h];
-
-    out[base + h] = __float2half(x0 * cos_val - x1 * sin_val);
-    out[base + h + half_dim] = __float2half(x0 * sin_val + x1 * cos_val);
-}
-
-extern "C" __global__ void transpose_f16(
-    __half* out, const __half* in_data,
-    unsigned int rows, unsigned int cols
-) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    unsigned int r = i / cols;
-    unsigned int c = i % cols;
-    out[c * rows + r] = in_data[r * cols + c];
-}
-
-extern "C" __global__ void cast_f16_to_f32(
-    float* out, const __half* input, unsigned int n
-) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __half2float(input[i]);
-    }
-}
-
-extern "C" __global__ void cast_f32_to_f16(
-    __half* out, const float* input, unsigned int n
-) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __float2half(input[i]);
-    }
-}
-"#;
-
 struct KernelFunctions {
     add_f32: CudaFunction,
     mul_f32: CudaFunction,
@@ -437,6 +32,13 @@ struct KernelFunctions {
     transpose_f16: CudaFunction,
     cast_f16_to_f32: CudaFunction,
     cast_f32_to_f16: CudaFunction,
+    // Attention helpers
+    extract_head_f32: CudaFunction,
+    apply_causal_mask_f32: CudaFunction,
+    interleave_heads_f32: CudaFunction,
+    extract_head_f16: CudaFunction,
+    apply_causal_mask_f16: CudaFunction,
+    interleave_heads_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -461,17 +63,33 @@ impl CudaBackend {
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| ForgeError::Cuda(format!("cublas: {e}")))?;
 
-        // Compile F32 kernels
-        let ptx_f32 = compile_ptx(ELEMENTWISE_PTX_SRC)
+        // Compile F32 kernels (concatenate all module sources)
+        let f32_src = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            forge_kernels::elementwise::F32_SRC,
+            forge_kernels::norm::F32_SRC,
+            forge_kernels::positional::F32_SRC,
+            forge_kernels::memory::F32_SRC,
+            forge_kernels::attention::F32_SRC,
+        );
+        let ptx_f32 = compile_ptx(&f32_src)
             .map_err(|e| ForgeError::Cuda(format!("nvrtc f32: {e}")))?;
         let module_f32 = ctx
             .load_module(ptx_f32)
             .map_err(|e| ForgeError::Cuda(format!("module load f32: {e}")))?;
 
         // Compile F16 kernels — requires cuda_fp16.h from CUDA toolkit
+        let f16_src = format!(
+            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}",
+            forge_kernels::elementwise::F16_SRC,
+            forge_kernels::norm::F16_SRC,
+            forge_kernels::positional::F16_SRC,
+            forge_kernels::memory::F16_SRC,
+            forge_kernels::attention::F16_SRC,
+        );
         let cuda_include = Self::find_cuda_include()?;
         let ptx_f16 = cudarc::nvrtc::compile_ptx_with_opts(
-            F16_PTX_SRC,
+            &f16_src,
             cudarc::nvrtc::CompileOptions {
                 use_fast_math: Some(true),
                 include_paths: vec![cuda_include],
@@ -516,6 +134,13 @@ impl CudaBackend {
             transpose_f16: load_f16("transpose_f16")?,
             cast_f16_to_f32: load_f16("cast_f16_to_f32")?,
             cast_f32_to_f16: load_f16("cast_f32_to_f16")?,
+            // Attention helpers
+            extract_head_f32: load_f32("extract_head_f32")?,
+            apply_causal_mask_f32: load_f32("apply_causal_mask_f32")?,
+            interleave_heads_f32: load_f32("interleave_heads_f32")?,
+            extract_head_f16: load_f16("extract_head_f16")?,
+            apply_causal_mask_f16: load_f16("apply_causal_mask_f16")?,
+            interleave_heads_f16: load_f16("interleave_heads_f16")?,
         };
 
         Ok(Self {
@@ -1496,6 +1121,194 @@ impl Backend for CudaBackend {
                 "cast from {:?} to {:?} not supported",
                 from, to
             ))),
+        }
+    }
+
+    fn extract_head(
+        &self,
+        tensor: &CudaTensor,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        head: usize,
+    ) -> Result<CudaTensor> {
+        let n = (seq_len * head_dim) as u32;
+        let seq_len_u32 = seq_len as u32;
+        let num_heads_u32 = num_heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let head_idx_u32 = head as u32;
+
+        match tensor.dtype() {
+            DType::F16 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(n as usize)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self.stream.launch_builder(&self.kernels.extract_head_f16);
+                builder.arg(&mut out);
+                builder.arg(tensor.f16_slice()?);
+                builder.arg(&seq_len_u32);
+                builder.arg(&num_heads_u32);
+                builder.arg(&head_dim_u32);
+                builder.arg(&head_idx_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f16_data(out, vec![seq_len, head_dim]))
+            }
+            DType::F32 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(n as usize)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self.stream.launch_builder(&self.kernels.extract_head_f32);
+                builder.arg(&mut out);
+                builder.arg(tensor.f32_slice()?);
+                builder.arg(&seq_len_u32);
+                builder.arg(&num_heads_u32);
+                builder.arg(&head_dim_u32);
+                builder.arg(&head_idx_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f32_data(out, vec![seq_len, head_dim]))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
+    fn apply_causal_mask(
+        &self,
+        scores: &CudaTensor,
+        seq_len: usize,
+        kv_len: usize,
+    ) -> Result<CudaTensor> {
+        let n = (seq_len * kv_len) as u32;
+        let seq_len_u32 = seq_len as u32;
+        let kv_len_u32 = kv_len as u32;
+
+        match scores.dtype() {
+            DType::F16 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(n as usize)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder =
+                    self.stream.launch_builder(&self.kernels.apply_causal_mask_f16);
+                builder.arg(&mut out);
+                builder.arg(scores.f16_slice()?);
+                builder.arg(&seq_len_u32);
+                builder.arg(&kv_len_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f16_data(out, scores.shape.clone()))
+            }
+            DType::F32 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(n as usize)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder =
+                    self.stream.launch_builder(&self.kernels.apply_causal_mask_f32);
+                builder.arg(&mut out);
+                builder.arg(scores.f32_slice()?);
+                builder.arg(&seq_len_u32);
+                builder.arg(&kv_len_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f32_data(out, scores.shape.clone()))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
+    fn interleave_heads(
+        &self,
+        heads: &[&CudaTensor],
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<CudaTensor> {
+        let num_heads = heads.len();
+        if num_heads == 0 {
+            return Err(ForgeError::InvalidArgument("empty heads list".into()));
+        }
+        let dtype = heads[0].dtype();
+        let n = (seq_len * head_dim) as u32;
+        let seq_len_u32 = seq_len as u32;
+        let num_heads_u32 = num_heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let out_shape = vec![seq_len, num_heads * head_dim];
+
+        match dtype {
+            DType::F16 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(seq_len * num_heads * head_dim)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                for (h_idx, head) in heads.iter().enumerate() {
+                    let head_idx_u32 = h_idx as u32;
+                    let mut builder =
+                        self.stream.launch_builder(&self.kernels.interleave_heads_f16);
+                    builder.arg(&mut out);
+                    builder.arg(head.f16_slice()?);
+                    builder.arg(&seq_len_u32);
+                    builder.arg(&num_heads_u32);
+                    builder.arg(&head_dim_u32);
+                    builder.arg(&head_idx_u32);
+                    unsafe {
+                        builder
+                            .launch(LaunchConfig::for_num_elems(n))
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
+                }
+
+                Ok(CudaTensor::f16_data(out, out_shape))
+            }
+            DType::F32 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(seq_len * num_heads * head_dim)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                for (h_idx, head) in heads.iter().enumerate() {
+                    let head_idx_u32 = h_idx as u32;
+                    let mut builder =
+                        self.stream.launch_builder(&self.kernels.interleave_heads_f32);
+                    builder.arg(&mut out);
+                    builder.arg(head.f32_slice()?);
+                    builder.arg(&seq_len_u32);
+                    builder.arg(&num_heads_u32);
+                    builder.arg(&head_dim_u32);
+                    builder.arg(&head_idx_u32);
+                    unsafe {
+                        builder
+                            .launch(LaunchConfig::for_num_elems(n))
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
+                }
+
+                Ok(CudaTensor::f32_data(out, out_shape))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 }
