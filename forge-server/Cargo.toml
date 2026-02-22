@@ -1,0 +1,36 @@
+[package]
+name = "forge-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cuda"]
+cuda = ["dep:forge-backend-cuda"]
+
+[dependencies]
+forge-core.workspace = true
+forge-runtime.workspace = true
+forge-loader.workspace = true
+forge-model-llama.workspace = true
+forge-backend-cuda = { workspace = true, optional = true }
+forge-backend-cpu.workspace = true
+forge-scheduler.workspace = true
+forge-kvcache.workspace = true
+forge-transport.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio-stream.workspace = true
+minijinja = { version = "2.12", features = ["loader"] }
+tokenizers = "0.21"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

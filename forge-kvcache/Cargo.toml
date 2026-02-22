@@ -1,0 +1,12 @@
+[package]
+name = "forge-kvcache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+half.workspace = true

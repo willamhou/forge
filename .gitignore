@@ -1,0 +1,8 @@
+/target
+*.swp
+*.swo
+.env
+*.gguf
+*.safetensors
+*.bin
+/models/

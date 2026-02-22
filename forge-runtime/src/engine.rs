@@ -1,0 +1,590 @@
+//! Engine: main inference runtime loop that orchestrates scheduling,
+//! model forward passes, and token sampling.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use tracing::{error, warn};
+
+use forge_core::{
+    Backend, FinishReason, InferenceRequest, KvCache, Model, ModelInput, Result, ScheduledSeq,
+    Scheduler, SeqMetadata,
+};
+
+use crate::constraints::fsm::FsmConstraint;
+use crate::sampling::CpuSampler;
+
+/// Events emitted by the engine to consumers (HTTP layer, transport).
+#[derive(Debug, Clone)]
+pub enum EngineEvent {
+    Token {
+        seq_id: u64,
+        token_id: u32,
+        text: Option<String>,
+    },
+    Finish {
+        seq_id: u64,
+        reason: FinishReason,
+    },
+    Error {
+        seq_id: u64,
+        error: String,
+    },
+}
+
+/// A request submitted to the engine via the request channel.
+pub struct EngineRequest {
+    pub inference_req: InferenceRequest,
+    /// Per-request channel for sending events back to the caller.
+    pub event_tx: mpsc::Sender<EngineEvent>,
+    /// Optional FSM constraint for structured output.
+    pub constraint: Option<Box<dyn FsmConstraint>>,
+}
+
+/// Per-sequence FSM constraint state.
+struct SeqConstraint {
+    fsm: Box<dyn FsmConstraint>,
+    state: u32,
+}
+
+/// Optional decode function for stop_strings checking.
+/// Takes a slice of token IDs and returns the decoded text.
+pub type DecodeFn = Arc<dyn Fn(&[u32]) -> Option<String> + Send + Sync>;
+
+/// The inference engine: ties together model, scheduler, KV cache, and sampler.
+pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
+    model: M,
+    backend: B,
+    scheduler: Box<dyn Scheduler>,
+    kv_cache: Box<dyn KvCache<T = B::Tensor>>,
+    sampler: CpuSampler,
+    /// Incoming request channel.
+    request_rx: mpsc::Receiver<EngineRequest>,
+    /// Per-sequence event senders (seq_id → event_tx).
+    event_senders: HashMap<u64, mpsc::Sender<EngineEvent>>,
+    /// Per-sequence FSM constraints (seq_id → constraint + state).
+    constraints: HashMap<u64, SeqConstraint>,
+    /// Optional token decoder for stop_strings enforcement.
+    decode_fn: Option<DecodeFn>,
+    /// Per-sequence token buffer for stop_string look-ahead.
+    /// Tokens are held here until we confirm they don't form part of a
+    /// stop string, then flushed to the event channel.
+    stop_buffers: HashMap<u64, Vec<u32>>,
+}
+
+impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
+    pub fn new(
+        model: M,
+        backend: B,
+        scheduler: Box<dyn Scheduler>,
+        kv_cache: Box<dyn KvCache<T = B::Tensor>>,
+        request_rx: mpsc::Receiver<EngineRequest>,
+    ) -> Self {
+        Self {
+            model,
+            backend,
+            scheduler,
+            kv_cache,
+            sampler: CpuSampler,
+            request_rx,
+            event_senders: HashMap::new(),
+            constraints: HashMap::new(),
+            decode_fn: None,
+            stop_buffers: HashMap::new(),
+        }
+    }
+
+    /// Set a decode function for stop_strings enforcement.
+    pub fn with_decode_fn(mut self, f: DecodeFn) -> Self {
+        self.decode_fn = Some(f);
+        self
+    }
+
+    /// Main engine loop. Runs until the request channel is closed.
+    pub async fn run(&mut self) -> Result<()> {
+        loop {
+            // Drain incoming requests (non-blocking)
+            let drained = self.drain_requests();
+
+            let cache_usage = self.kv_cache.usage();
+            let batch = self.scheduler.schedule(&cache_usage)?;
+
+            // Notify clients of rejected sequences before checking whether
+            // the batch is empty.  `is_empty()` ignores `rejected`, so
+            // a scheduling round that only rejects requests would otherwise skip
+            // error emission entirely, leaving request handlers hanging.
+            for (seq_id, reason) in &batch.rejected {
+                self.send_event(
+                    *seq_id,
+                    EngineEvent::Error {
+                        seq_id: *seq_id,
+                        error: reason.clone(),
+                    },
+                );
+                self.event_senders.remove(seq_id);
+                self.constraints.remove(seq_id);
+                self.stop_buffers.remove(seq_id);
+            }
+
+            if batch.is_empty() {
+                if drained == 0 && batch.rejected.is_empty() {
+                    // No work, no rejections, no new requests — wait for a request
+                    tokio::select! {
+                        req = self.request_rx.recv() => {
+                            match req {
+                                Some(r) => self.enqueue_request(r),
+                                None => return Ok(()), // channel closed, shutdown
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
+                continue;
+            }
+
+            // Allocate KV cache for new prefill sequences (first chunk only).
+            // Allocation errors are handled per-sequence rather than killing the
+            // engine loop, so transient OOM only drops the affected request.
+            let mut failed_seq_ids = Vec::new();
+            for seq in &batch.prefill_seqs {
+                // Only allocate on the first prefill chunk (offset == 0).
+                // Subsequent chunks append to an already-allocated cache entry.
+                if seq.position_offset != 0 {
+                    continue;
+                }
+                if let Err(e) = self.kv_cache.allocate(seq.seq_id, seq.total_prompt_len) {
+                    error!(seq_id = seq.seq_id, error = %e, "KV cache allocation failed");
+                    self.send_event(
+                        seq.seq_id,
+                        EngineEvent::Error {
+                            seq_id: seq.seq_id,
+                            error: format!("cache allocation failed: {e}"),
+                        },
+                    );
+                    let _ = self.scheduler.cancel(seq.seq_id);
+                    self.event_senders.remove(&seq.seq_id);
+                    self.constraints.remove(&seq.seq_id);
+                    self.stop_buffers.remove(&seq.seq_id);
+                    failed_seq_ids.push(seq.seq_id);
+                }
+            }
+
+            // Phase 1: process one sequence at a time
+            let all_seqs: Vec<ScheduledSeq> = batch
+                .prefill_seqs
+                .into_iter()
+                .chain(batch.decode_seqs)
+                .filter(|s| !failed_seq_ids.contains(&s.seq_id))
+                .collect();
+
+            for seq in &all_seqs {
+                if let Err(e) = self.process_sequence(seq) {
+                    error!(seq_id = seq.seq_id, error = %e, "sequence processing failed");
+                    self.send_event(
+                        seq.seq_id,
+                        EngineEvent::Error {
+                            seq_id: seq.seq_id,
+                            error: e.to_string(),
+                        },
+                    );
+                    // Clean up failed sequence
+                    let _ = self.scheduler.cancel(seq.seq_id);
+                    let _ = self.kv_cache.free(seq.seq_id);
+                    self.event_senders.remove(&seq.seq_id);
+                    self.constraints.remove(&seq.seq_id);
+                    self.stop_buffers.remove(&seq.seq_id);
+                }
+            }
+        }
+    }
+
+    /// Drain all pending requests from the channel (non-blocking).
+    fn drain_requests(&mut self) -> usize {
+        let mut count = 0;
+        while let Ok(req) = self.request_rx.try_recv() {
+            self.enqueue_request(req);
+            count += 1;
+        }
+        count
+    }
+
+    /// Enqueue a request into the scheduler and register its event sender.
+    fn enqueue_request(&mut self, req: EngineRequest) {
+        match self.scheduler.enqueue(req.inference_req) {
+            Ok(handle) => {
+                self.event_senders.insert(handle.seq_id, req.event_tx);
+                if let Some(fsm) = req.constraint {
+                    let initial = fsm.initial_state();
+                    self.constraints.insert(
+                        handle.seq_id,
+                        SeqConstraint {
+                            fsm,
+                            state: initial,
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                // Best-effort error notification
+                let _ = req.event_tx.try_send(EngineEvent::Error {
+                    seq_id: 0,
+                    error: format!("failed to enqueue: {e}"),
+                });
+            }
+        }
+    }
+
+    /// Send an event to a specific sequence's consumer. Uses `try_send` to
+    /// avoid blocking the engine loop when a consumer is slow. If the channel
+    /// is full or disconnected, cancel the sequence and clean up resources.
+    fn send_event(&mut self, seq_id: u64, event: EngineEvent) {
+        if let Some(tx) = self.event_senders.get(&seq_id) {
+            match tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(seq_id, "event channel full, cancelling slow consumer");
+                    let _ = self.scheduler.cancel(seq_id);
+                    let _ = self.kv_cache.free(seq_id);
+                    self.event_senders.remove(&seq_id);
+                    self.constraints.remove(&seq_id);
+                    self.stop_buffers.remove(&seq_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(seq_id, "event receiver dropped, cancelling sequence");
+                    let _ = self.scheduler.cancel(seq_id);
+                    let _ = self.kv_cache.free(seq_id);
+                    self.event_senders.remove(&seq_id);
+                    self.constraints.remove(&seq_id);
+                    self.stop_buffers.remove(&seq_id);
+                }
+            }
+        }
+    }
+
+    /// Process a single sequence: forward pass + sample + emit event.
+    /// For chunked prefill, non-final chunks only run the forward pass (no sampling).
+    fn process_sequence(&mut self, seq: &ScheduledSeq) -> Result<()> {
+        // Short-circuit: if max_tokens is already reached (e.g. max_tokens=0),
+        // finish immediately without running the forward pass.
+        let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
+        if generated.len() >= seq.sampling_params.max_tokens {
+            self.scheduler
+                .finish(seq.seq_id, FinishReason::MaxTokens)?;
+            self.kv_cache.free(seq.seq_id)?;
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Finish {
+                    seq_id: seq.seq_id,
+                    reason: FinishReason::MaxTokens,
+                },
+            );
+            self.event_senders.remove(&seq.seq_id);
+            self.constraints.remove(&seq.seq_id);
+            self.stop_buffers.remove(&seq.seq_id);
+            return Ok(());
+        }
+
+        let input = self.build_input(seq);
+
+        let output = self.model.forward(&input, &mut *self.kv_cache)?;
+        self.backend.synchronize()?;
+
+        // For non-final prefill chunks, skip sampling — just populate KV cache.
+        if seq.is_prefill && !seq.is_last_prefill_chunk {
+            return Ok(());
+        }
+
+        // Copy logits to host for CPU sampling
+        let logits_host = self.backend.copy_to_host_f32(&output.logits)?;
+
+        // Only look at the last token's logits (for both prefill and decode)
+        let vocab_size = self.model.config().vocab_size;
+        if vocab_size == 0 || logits_host.len() < vocab_size {
+            return Err(forge_core::ForgeError::InvalidArgument(format!(
+                "empty or undersized logits: got {} elements, vocab_size={}",
+                logits_host.len(),
+                vocab_size
+            )));
+        }
+        let num_tokens = logits_host.len() / vocab_size;
+        let last_logits = &logits_host[(num_tokens - 1) * vocab_size..];
+
+        // Build constraint reference for sampling
+        let constraint_ref = self
+            .constraints
+            .get(&seq.seq_id)
+            .map(|c| (&*c.fsm as &dyn FsmConstraint, c.state));
+
+        // If FSM is in a terminal state with no allowed tokens, finish cleanly
+        // instead of sampling (which would pick an arbitrary token and fail).
+        if let Some((fsm, state)) = constraint_ref {
+            let no_tokens = fsm
+                .allowed_tokens(state)
+                .is_none_or(|t| t.is_empty());
+            if no_tokens && fsm.is_final_state(state) {
+                self.scheduler.finish(seq.seq_id, FinishReason::StopString)?;
+                self.kv_cache.free(seq.seq_id)?;
+                self.send_event(
+                    seq.seq_id,
+                    EngineEvent::Finish {
+                        seq_id: seq.seq_id,
+                        reason: FinishReason::StopString,
+                    },
+                );
+                self.event_senders.remove(&seq.seq_id);
+                self.constraints.remove(&seq.seq_id);
+                self.stop_buffers.remove(&seq.seq_id);
+                return Ok(());
+            }
+        }
+
+        // When the FSM is in an accepting state, unmask EOS/stop tokens so the
+        // model can choose to stop at a valid completion boundary instead of being
+        // forced to continue until max_tokens.
+        let result = if let Some((fsm, state)) = constraint_ref {
+            if fsm.is_final_state(state) {
+                // Apply the FSM mask manually, then restore EOS tokens.
+                let mut masked_logits = last_logits.to_vec();
+                fsm.mask_logits(state, &mut masked_logits);
+                for &eos_id in &seq.sampling_params.stop_token_ids {
+                    if (eos_id as usize) < masked_logits.len() {
+                        masked_logits[eos_id as usize] = last_logits[eos_id as usize];
+                    }
+                }
+                self.sampler
+                    .sample_single(&masked_logits, &seq.sampling_params, &generated)?
+            } else {
+                self.sampler.sample_with_constraint(
+                    last_logits,
+                    &seq.sampling_params,
+                    &generated,
+                    constraint_ref,
+                )?
+            }
+        } else {
+            self.sampler
+                .sample_single(last_logits, &seq.sampling_params, &generated)?
+        };
+
+        let token_id = result.token_id;
+        self.scheduler.append_token(seq.seq_id, token_id)?;
+
+        // Advance FSM state if constraint is active.
+        // We use a two-phase approach: first compute the result inside the
+        // borrow, then handle abort outside to avoid double-borrow of `self`.
+        let mut fsm_finished = false;
+        let mut fsm_abort: Option<(u32, u32)> = None; // (fsm_state, token_id)
+        if let Some(seq_constraint) = self.constraints.get_mut(&seq.seq_id) {
+            match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
+                Some(next) => {
+                    seq_constraint.state = next;
+                    // If the FSM reached a final state and has no further transitions,
+                    // the structured output is complete.
+                    if seq_constraint.fsm.is_final_state(next) {
+                        let has_transitions = seq_constraint
+                            .fsm
+                            .allowed_tokens(next)
+                            .is_some_and(|t| !t.is_empty());
+                        if !has_transitions {
+                            fsm_finished = true;
+                        }
+                    }
+                }
+                None => {
+                    // If the token is an EOS/stop token and the FSM is in an
+                    // accepting state, this is a valid completion — the model
+                    // chose to stop at a valid boundary (EOS was unmasked).
+                    if seq_constraint.fsm.is_final_state(seq_constraint.state)
+                        && seq.sampling_params.stop_token_ids.contains(&token_id)
+                    {
+                        fsm_finished = true;
+                    } else {
+                        // Record state for abort handling after the borrow ends.
+                        fsm_abort = Some((seq_constraint.state, token_id));
+                    }
+                }
+            }
+        }
+
+        // Handle FSM abort outside the borrow scope.
+        if let Some((fsm_state, bad_token)) = fsm_abort {
+            error!(
+                seq_id = seq.seq_id,
+                token_id = bad_token,
+                fsm_state,
+                "FSM transition invalid for sampled token; aborting sequence"
+            );
+            self.constraints.remove(&seq.seq_id);
+            self.stop_buffers.remove(&seq.seq_id);
+            self.scheduler.finish(seq.seq_id, FinishReason::Cancelled)?;
+            self.kv_cache.free(seq.seq_id)?;
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Error {
+                    seq_id: seq.seq_id,
+                    error: format!(
+                        "structured output constraint violated: \
+                         no valid FSM transition from state {fsm_state} for token {bad_token}"
+                    ),
+                },
+            );
+            self.event_senders.remove(&seq.seq_id);
+            return Ok(());
+        }
+
+        // Check stop conditions
+        let stop_token_hit = seq.sampling_params.stop_token_ids.contains(&token_id);
+        let max_tokens_hit = generated.len() + 1 >= seq.sampling_params.max_tokens;
+
+        // Stop-string handling with look-ahead buffering.
+        //
+        // When stop_strings are configured, tokens are buffered until we can
+        // confirm they don't form part of a stop string. This prevents partial
+        // stop-string leakage in streaming mode.
+        let has_stop_strings = !seq.sampling_params.stop_strings.is_empty();
+        let stop_string_hit = if has_stop_strings {
+            // Buffer this token
+            self.stop_buffers
+                .entry(seq.seq_id)
+                .or_default()
+                .push(token_id);
+
+            self.decode_fn.as_ref().and_then(|decode| {
+                let mut all_tokens = generated.clone();
+                all_tokens.push(token_id);
+                let text = decode(&all_tokens)?;
+                seq.sampling_params
+                    .stop_strings
+                    .iter()
+                    .any(|s| text.contains(s))
+                    .then_some(true)
+            })
+        } else {
+            None
+        };
+
+        let should_finish =
+            stop_token_hit || max_tokens_hit || stop_string_hit.unwrap_or(false) || fsm_finished;
+
+        if stop_string_hit.unwrap_or(false) {
+            // Stop string hit — discard all buffered tokens (they contain
+            // the stop sequence and should not be emitted per OpenAI semantics).
+            self.stop_buffers.remove(&seq.seq_id);
+        } else if has_stop_strings {
+            // No stop string yet. Check if the current decoded text ends
+            // with a prefix of any stop string — if so, keep buffering.
+            // Otherwise flush safe tokens.
+            let flush_all = should_finish; // finishing for other reasons → flush everything
+            let prefix_match = if !flush_all {
+                self.decode_fn.as_ref().and_then(|decode| {
+                    let mut all_tokens = generated.clone();
+                    all_tokens.push(token_id);
+                    let text = decode(&all_tokens)?;
+                    let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
+                        // Check if the text ends with any non-empty prefix of s.
+                        // Use char_indices to iterate on character boundaries
+                        // (byte slicing on non-ASCII would panic).
+                        s.char_indices().skip(1).any(|(byte_pos, _)| {
+                            text.ends_with(&s[..byte_pos])
+                        }) || text.ends_with(s)
+                    });
+                    Some(is_prefix)
+                })
+            } else {
+                Some(false)
+            };
+
+            if !prefix_match.unwrap_or(false) || flush_all {
+                // Safe to flush all buffered tokens
+                if let Some(buf) = self.stop_buffers.remove(&seq.seq_id) {
+                    for &tid in &buf {
+                        self.send_event(
+                            seq.seq_id,
+                            EngineEvent::Token {
+                                seq_id: seq.seq_id,
+                                token_id: tid,
+                                text: None,
+                            },
+                        );
+                    }
+                }
+            }
+            // else: keep buffering — text ends with stop-string prefix
+        } else {
+            // No stop_strings configured — emit immediately
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Token {
+                    seq_id: seq.seq_id,
+                    token_id,
+                    text: None,
+                },
+            );
+        }
+
+        if should_finish {
+            let reason = if stop_token_hit {
+                FinishReason::EosToken
+            } else if stop_string_hit.unwrap_or(false) {
+                FinishReason::StopString
+            } else if fsm_finished {
+                FinishReason::EosToken
+            } else {
+                FinishReason::MaxTokens
+            };
+            self.scheduler.finish(seq.seq_id, reason)?;
+            self.kv_cache.free(seq.seq_id)?;
+            // Clean up any remaining stop buffer
+            self.stop_buffers.remove(&seq.seq_id);
+            self.send_event(
+                seq.seq_id,
+                EngineEvent::Finish {
+                    seq_id: seq.seq_id,
+                    reason,
+                },
+            );
+            self.event_senders.remove(&seq.seq_id);
+            self.constraints.remove(&seq.seq_id);
+        }
+
+        Ok(())
+    }
+
+    /// Build a single-sequence ModelInput from a ScheduledSeq.
+    fn build_input(&self, seq: &ScheduledSeq) -> ModelInput {
+        let gen_count = self.get_generated_count(seq.seq_id);
+
+        let (prompt_len, generated_len) = if seq.is_prefill {
+            // For chunked prefill, position_offset is the starting position of this chunk.
+            // prompt_len reflects the total tokens fed so far (offset + chunk size).
+            (seq.position_offset + seq.token_ids.len(), 0)
+        } else {
+            // Invariant: position_offset = prompt_len + generated_len - 1
+            let prompt_len = (seq.position_offset + 1).saturating_sub(gen_count).max(1);
+            (prompt_len, gen_count)
+        };
+
+        // Positions are absolute: [offset, offset+1, ..., offset+len-1]
+        let offset = seq.position_offset as u32;
+        let positions: Vec<u32> = (offset..offset + seq.token_ids.len() as u32).collect();
+
+        ModelInput {
+            token_ids: vec![seq.token_ids.clone()],
+            positions: vec![positions],
+            seq_metadata: vec![SeqMetadata {
+                seq_id: seq.seq_id,
+                prompt_len,
+                generated_len,
+                is_prefill: seq.is_prefill,
+            }],
+        }
+    }
+
+    fn get_generated_count(&self, seq_id: u64) -> usize {
+        self.scheduler
+            .get_generated_tokens(seq_id)
+            .map(|t| t.len())
+            .unwrap_or(0)
+    }
+}

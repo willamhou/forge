@@ -1,0 +1,18 @@
+[package]
+name = "forge-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+safetensors = "0.7"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+memmap2 = "0.9"
+half.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

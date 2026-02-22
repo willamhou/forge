@@ -1,0 +1,10 @@
+[package]
+name = "forge-model-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-core.workspace = true
+forge-loader.workspace = true
+tracing.workspace = true
