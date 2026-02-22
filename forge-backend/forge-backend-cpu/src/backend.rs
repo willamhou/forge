@@ -414,9 +414,14 @@ impl Backend for CpuBackend {
         q_size: usize,
         kv_size: usize,
     ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
+        if qkv.shape().len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "split_qkv requires 2D tensor".into(),
+            ));
+        }
         let rows = qkv.shape()[0];
         let total_cols = q_size + 2 * kv_size;
-        if qkv.len() != rows * total_cols {
+        if qkv.shape()[1] != total_cols {
             return Err(ForgeError::ShapeMismatch {
                 expected: vec![rows, total_cols],
                 got: qkv.shape().to_vec(),

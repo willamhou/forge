@@ -1311,7 +1311,7 @@ impl Backend for CudaBackend {
         let rows_u32 = rows as u32;
         let q_cols_u32 = q_size as u32;
         let kv_cols_u32 = kv_size as u32;
-        let block_dim = (256u32).min(q_size.max(kv_size) as u32);
+        let block_dim = next_power_of_2((256u32).min(q_size.max(kv_size) as u32));
 
         match qkv.dtype() {
             DType::F16 => {
