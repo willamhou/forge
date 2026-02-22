@@ -142,7 +142,7 @@ impl<B: Backend> LlamaAttention<B> {
         backend.matmul(&attn_out, &self.wo)
     }
 
-    /// Compute scaled dot-product attention per head.
+    /// Compute scaled dot-product attention per head (GPU-native, no CPU copies).
     ///
     /// Q: [1, seq_len, num_heads, head_dim]
     /// K: [1, kv_len, num_kv_heads, head_dim]
@@ -161,77 +161,42 @@ impl<B: Backend> LlamaAttention<B> {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let heads_per_group = self.num_heads / self.num_kv_heads;
 
-        // Read all data to host for per-head slicing (naive path).
-        // FlashAttention in Task 16 will eliminate this CPU roundtrip.
-        let q_data = backend.copy_to_host_f32(q)?;
-        let k_data = backend.copy_to_host_f32(k)?;
-        let v_data = backend.copy_to_host_f32(v)?;
+        // Reshape to 3D for extract_head: strip batch dim (always 1)
+        let q = backend.reshape(q, &[seq_len, self.num_heads, self.head_dim])?;
+        let k = backend.reshape(k, &[kv_len, self.num_kv_heads, self.head_dim])?;
+        let v = backend.reshape(v, &[kv_len, self.num_kv_heads, self.head_dim])?;
 
-        let mut all_head_outputs: Vec<f32> =
-            Vec::with_capacity(seq_len * self.num_heads * self.head_dim);
+        let mut head_outputs = Vec::with_capacity(self.num_heads);
 
-        // Process in token-first order for correct output layout
-        for t in 0..seq_len {
-            for h in 0..self.num_heads {
-                let kv_h = h / heads_per_group;
+        for h in 0..self.num_heads {
+            let kv_h = h / heads_per_group;
 
-                // Extract Q[t,h]: single row [1, head_dim]
-                let q_offset = t * self.num_heads * self.head_dim + h * self.head_dim;
-                let q_row = &q_data[q_offset..q_offset + self.head_dim];
-                let q_tensor = backend.copy_from_host_f32(q_row, &[1, self.head_dim])?;
+            // Extract per-head slices — GPU-native, no CPU copies
+            let q_head = backend.extract_head(&q, seq_len, self.num_heads, self.head_dim, h)?;
+            let k_head =
+                backend.extract_head(&k, kv_len, self.num_kv_heads, self.head_dim, kv_h)?;
+            let v_head =
+                backend.extract_head(&v, kv_len, self.num_kv_heads, self.head_dim, kv_h)?;
 
-                // Extract K[:,kv_h]: [kv_len, head_dim]
-                let mut k_head = Vec::with_capacity(kv_len * self.head_dim);
-                for kv_t in 0..kv_len {
-                    let k_offset =
-                        kv_t * self.num_kv_heads * self.head_dim + kv_h * self.head_dim;
-                    k_head.extend_from_slice(&k_data[k_offset..k_offset + self.head_dim]);
-                }
-                let k_tensor = backend.copy_from_host_f32(&k_head, &[kv_len, self.head_dim])?;
-                let k_t = backend.transpose(&k_tensor, 0, 1)?;
+            // scores = Q @ K^T * scale
+            let k_t = backend.transpose(&k_head, 0, 1)?;
+            let scores = backend.matmul(&q_head, &k_t)?;
+            let scores = backend.mul_scalar(&scores, scale)?;
 
-                // scores = Q @ K^T * scale: [1, head_dim] @ [head_dim, kv_len] -> [1, kv_len]
-                let scores = backend.matmul(&q_tensor, &k_t)?;
-                let scores = backend.mul_scalar(&scores, scale)?;
+            // Apply causal mask for prefill (seq_len > 1)
+            let scores = if seq_len > 1 {
+                backend.apply_causal_mask(&scores, seq_len, kv_len)?
+            } else {
+                scores
+            };
 
-                // Apply causal mask: query at offset t can attend to KV positions
-                // 0..=(kv_len - seq_len + t). Mask out future positions.
-                // During decode (seq_len == 1), no mask needed — single query at
-                // latest position naturally attends to all cached entries.
-                let scores = if seq_len > 1 {
-                    let abs_pos = kv_len - seq_len + t;
-                    let mut scores_data = backend.copy_to_host_f32(&scores)?;
-                    for k_pos in (abs_pos + 1)..kv_len {
-                        scores_data[k_pos] = f32::NEG_INFINITY;
-                    }
-                    backend.copy_from_host_f32(&scores_data, &[1, kv_len])?
-                } else {
-                    scores
-                };
-
-                let attn_weights = backend.softmax(&scores, -1)?;
-
-                // Extract V[:,kv_h]: [kv_len, head_dim]
-                let mut v_head = Vec::with_capacity(kv_len * self.head_dim);
-                for kv_t in 0..kv_len {
-                    let v_offset =
-                        kv_t * self.num_kv_heads * self.head_dim + kv_h * self.head_dim;
-                    v_head.extend_from_slice(&v_data[v_offset..v_offset + self.head_dim]);
-                }
-                let v_tensor = backend.copy_from_host_f32(&v_head, &[kv_len, self.head_dim])?;
-
-                // out = attn_weights @ V: [1, kv_len] @ [kv_len, head_dim] -> [1, head_dim]
-                let head_out = backend.matmul(&attn_weights, &v_tensor)?;
-                let head_out_data = backend.copy_to_host_f32(&head_out)?;
-                all_head_outputs.extend_from_slice(&head_out_data);
-            }
+            let attn = backend.softmax(&scores, -1)?;
+            head_outputs.push(backend.matmul(&attn, &v_head)?);
         }
 
-        // Result is [seq_len, num_heads * head_dim]
-        backend.copy_from_host_f32(
-            &all_head_outputs,
-            &[seq_len, self.num_heads * self.head_dim],
-        )
+        // Interleave per-head outputs → [seq_len, num_heads * head_dim]
+        let refs: Vec<&B::Tensor> = head_outputs.iter().collect();
+        backend.interleave_heads(&refs, seq_len, self.head_dim)
     }
 }
 

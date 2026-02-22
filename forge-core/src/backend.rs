@@ -46,4 +46,67 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Cast a tensor to a different dtype. Returns the input unchanged if already the target dtype.
     fn cast(&self, x: &Self::Tensor, dtype: DType) -> Result<Self::Tensor>;
+
+    // ── Attention helpers ───────────────────────────────────────
+    // Default impls go through host; CudaBackend overrides with GPU kernels.
+
+    /// Extract head `head` from `[seq_len, num_heads, head_dim]` layout → `[seq_len, head_dim]`.
+    fn extract_head(
+        &self,
+        tensor: &Self::Tensor,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        head: usize,
+    ) -> Result<Self::Tensor> {
+        let data = self.copy_to_host_f32(tensor)?;
+        let stride = num_heads * head_dim;
+        let mut out = Vec::with_capacity(seq_len * head_dim);
+        for t in 0..seq_len {
+            let start = t * stride + head * head_dim;
+            out.extend_from_slice(&data[start..start + head_dim]);
+        }
+        self.copy_from_host_f32(&out, &[seq_len, head_dim])
+    }
+
+    /// Apply causal mask: `scores[q][k] = -inf` for `k > kv_len - seq_len + q`.
+    ///
+    /// Input/output: `[seq_len, kv_len]`.
+    fn apply_causal_mask(
+        &self,
+        scores: &Self::Tensor,
+        seq_len: usize,
+        kv_len: usize,
+    ) -> Result<Self::Tensor> {
+        let mut data = self.copy_to_host_f32(scores)?;
+        for q_pos in 0..seq_len {
+            let abs_pos = kv_len - seq_len + q_pos;
+            for k_pos in (abs_pos + 1)..kv_len {
+                data[q_pos * kv_len + k_pos] = f32::NEG_INFINITY;
+            }
+        }
+        self.copy_from_host_f32(&data, scores.shape())
+    }
+
+    /// Interleave per-head `[seq_len, head_dim]` outputs → `[seq_len, num_heads * head_dim]`.
+    fn interleave_heads(
+        &self,
+        heads: &[&Self::Tensor],
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<Self::Tensor> {
+        let num_heads = heads.len();
+        let mut head_data: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
+        for h in heads {
+            head_data.push(self.copy_to_host_f32(h)?);
+        }
+        let mut result = Vec::with_capacity(seq_len * num_heads * head_dim);
+        for t in 0..seq_len {
+            for data in &head_data {
+                let offset = t * head_dim;
+                result.extend_from_slice(&data[offset..offset + head_dim]);
+            }
+        }
+        self.copy_from_host_f32(&result, &[seq_len, num_heads * head_dim])
+    }
 }
