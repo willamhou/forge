@@ -48,12 +48,20 @@ fn build_tiny_model(backend: &CpuBackend) -> LlamaModel<CpuBackend> {
         config.rms_norm_eps,
     );
 
-    // Create concatenated wqkv: [h, q_dim + 2*kv_dim]
+    // Construct wqkv by concatenating separate wq/wk/wv (same pattern as the loader)
     let q_dim = config.num_attention_heads * config.head_dim;
     let kv_dim = config.num_key_value_heads * config.head_dim;
+    let wq = make_weight(h, q_dim);
+    let wk = make_weight(h, kv_dim);
+    let wv = make_weight(h, kv_dim);
+    let wq_t = backend.transpose(&wq, 0, 1).unwrap();
+    let wk_t = backend.transpose(&wk, 0, 1).unwrap();
+    let wv_t = backend.transpose(&wv, 0, 1).unwrap();
+    let cat_t = backend.cat(&[&wq_t, &wk_t, &wv_t], 0).unwrap();
+    let wqkv = backend.transpose(&cat_t, 0, 1).unwrap();
     let attn = LlamaAttention::new(
-        make_weight(h, q_dim + 2 * kv_dim), // wqkv
-        make_weight(q_dim, h),              // wo
+        wqkv,
+        make_weight(q_dim, h), // wo
         &config,
     );
 
@@ -182,7 +190,7 @@ fn test_batch_decode_matches_sequential() {
     // Verify batch matches sequential (within floating-point tolerance)
     for i in 0..config.vocab_size {
         assert!(
-            (batch_logits_1[i] - logits_1[i]).abs() < 0.1,
+            (batch_logits_1[i] - logits_1[i]).abs() < 1e-3,
             "seq1 logit[{i}]: batch={} sequential={} diff={}",
             batch_logits_1[i],
             logits_1[i],
@@ -191,7 +199,7 @@ fn test_batch_decode_matches_sequential() {
     }
     for i in 0..config.vocab_size {
         assert!(
-            (batch_logits_2[i] - logits_2[i]).abs() < 0.1,
+            (batch_logits_2[i] - logits_2[i]).abs() < 1e-3,
             "seq2 logit[{i}]: batch={} sequential={} diff={}",
             batch_logits_2[i],
             logits_2[i],
