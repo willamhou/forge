@@ -26,6 +26,13 @@ pub trait Backend: Send + Sync + 'static {
     fn mul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn mul_scalar(&self, a: &Self::Tensor, scalar: f32) -> Result<Self::Tensor>;
     fn silu(&self, a: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Fused SiLU activation and element-wise multiply: out = silu(gate) * up
+    fn fused_silu_mul(&self, gate: &Self::Tensor, up: &Self::Tensor) -> Result<Self::Tensor> {
+        let activated = self.silu(gate)?;
+        self.mul(&activated, up)
+    }
+
     fn rms_norm(
         &self,
         x: &Self::Tensor,

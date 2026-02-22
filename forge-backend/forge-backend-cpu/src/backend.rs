@@ -174,6 +174,17 @@ impl Backend for CpuBackend {
         Ok(CpuTensor::new(data, a.shape().to_vec()))
     }
 
+    fn fused_silu_mul(&self, gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        let g = gate.data();
+        let u = up.data();
+        let data: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
+            .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
+            .collect();
+        Ok(CpuTensor::new(data, gate.shape().to_vec()))
+    }
+
     fn rms_norm(&self, x: &CpuTensor, weight: &CpuTensor, eps: f32) -> Result<CpuTensor> {
         let shape = x.shape();
         let cols = *shape.last().unwrap();

@@ -15,6 +15,7 @@ struct KernelFunctions {
     mul_f32: CudaFunction,
     mul_scalar_f32: CudaFunction,
     silu_f32: CudaFunction,
+    fused_silu_mul_f32: CudaFunction,
     rms_norm_f32: CudaFunction,
     softmax_f32: CudaFunction,
     embedding_f32: CudaFunction,
@@ -25,6 +26,7 @@ struct KernelFunctions {
     mul_f16: CudaFunction,
     mul_scalar_f16: CudaFunction,
     silu_f16: CudaFunction,
+    fused_silu_mul_f16: CudaFunction,
     rms_norm_f16: CudaFunction,
     softmax_f16: CudaFunction,
     embedding_f16: CudaFunction,
@@ -117,6 +119,7 @@ impl CudaBackend {
             mul_f32: load_f32("mul_f32")?,
             mul_scalar_f32: load_f32("mul_scalar_f32")?,
             silu_f32: load_f32("silu_f32")?,
+            fused_silu_mul_f32: load_f32("fused_silu_mul_f32")?,
             rms_norm_f32: load_f32("rms_norm_f32")?,
             softmax_f32: load_f32("softmax_f32")?,
             embedding_f32: load_f32("embedding_f32")?,
@@ -127,6 +130,7 @@ impl CudaBackend {
             mul_f16: load_f16("mul_f16")?,
             mul_scalar_f16: load_f16("mul_scalar_f16")?,
             silu_f16: load_f16("silu_f16")?,
+            fused_silu_mul_f16: load_f16("fused_silu_mul_f16")?,
             rms_norm_f16: load_f16("rms_norm_f16")?,
             softmax_f16: load_f16("softmax_f16")?,
             embedding_f16: load_f16("embedding_f16")?,
@@ -604,6 +608,57 @@ impl Backend for CudaBackend {
                 }
 
                 Ok(CudaTensor::f32_data(out, a.shape.clone()))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
+    fn fused_silu_mul(&self, gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
+        validate_same_shape(gate, up)?;
+        let n = gate.len() as u32;
+
+        match gate.dtype() {
+            DType::F16 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(n as usize)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_silu_mul_f16);
+                builder.arg(&mut out);
+                builder.arg(gate.f16_slice()?);
+                builder.arg(up.f16_slice()?);
+                builder.arg(&n);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f16_data(out, gate.shape.clone()))
+            }
+            DType::F32 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(n as usize)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_silu_mul_f32);
+                builder.arg(&mut out);
+                builder.arg(gate.f32_slice()?);
+                builder.arg(up.f32_slice()?);
+                builder.arg(&n);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f32_data(out, gate.shape.clone()))
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }

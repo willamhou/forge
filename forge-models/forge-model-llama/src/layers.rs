@@ -35,15 +35,14 @@ impl<B: Backend> LlamaMLP<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
-        // gate = silu(x @ gate_proj)  — weights already transposed at load
+        // gate = x @ gate_proj  — weights already transposed at load
         let gate = backend.matmul(x, &self.gate_proj)?;
-        let gate = backend.silu(&gate)?;
 
         // up = x @ up_proj
         let up = backend.matmul(x, &self.up_proj)?;
 
-        // output = (gate * up) @ down_proj
-        let fused = backend.mul(&gate, &up)?;
+        // output = (silu(gate) * up) @ down_proj — fused into one kernel
+        let fused = backend.fused_silu_mul(&gate, &up)?;
         backend.matmul(&fused, &self.down_proj)
     }
 }

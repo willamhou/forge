@@ -290,6 +290,25 @@ fn test_slice_rows_first_row() {
 }
 
 #[test]
+fn test_fused_silu_mul() {
+    let backend = CpuBackend::new();
+    let gate = backend
+        .copy_from_host_f32(&[1.0, -1.0, 2.0, 0.0], &[4])
+        .unwrap();
+    let up = backend
+        .copy_from_host_f32(&[2.0, 3.0, 1.0, 5.0], &[4])
+        .unwrap();
+    let ref_silu = backend.silu(&gate).unwrap();
+    let ref_result = backend.mul(&ref_silu, &up).unwrap();
+    let fused = backend.fused_silu_mul(&gate, &up).unwrap();
+    let ref_data = ref_result.data();
+    let fused_data = fused.data();
+    for (a, b) in ref_data.iter().zip(fused_data.iter()) {
+        assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);
+    }
+}
+
+#[test]
 fn test_allocate_any_dtype() {
     let backend = CpuBackend::new();
     // CPU backend should accept all dtypes (stores as f32 internally)
