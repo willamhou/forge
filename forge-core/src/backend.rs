@@ -55,6 +55,7 @@ pub trait Backend: Send + Sync + 'static {
         let normed = self.rms_norm(&sum, weight, eps)?;
         Ok((normed, sum))
     }
+
     fn rope(
         &self,
         x: &Self::Tensor,

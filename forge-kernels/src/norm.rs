@@ -1,4 +1,4 @@
-//! Normalization CUDA kernels: rms_norm, softmax.
+//! Normalization CUDA kernels: rms_norm, fused_residual_rms_norm, softmax.
 
 pub const F32_SRC: &str = r#"
 extern "C" __global__ void rms_norm_f32(
