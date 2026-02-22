@@ -3,3 +3,4 @@
 pub mod naive;
 pub mod paged;
 pub mod paged_cache;
+pub mod radix;
