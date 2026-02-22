@@ -334,6 +334,21 @@ fn test_fused_residual_rms_norm() {
 }
 
 #[test]
+fn test_split_qkv() {
+    let backend = CpuBackend::new();
+    // 2 rows, q_size=3, kv_size=2 -> total_cols=7
+    let qkv_data: Vec<f32> = (1..=14).map(|i| i as f32).collect();
+    let qkv = backend.copy_from_host_f32(&qkv_data, &[2, 7]).unwrap();
+    let (q, k, v) = backend.split_qkv(&qkv, 3, 2).unwrap();
+    assert_eq!(q.shape(), &[2, 3]);
+    assert_eq!(k.shape(), &[2, 2]);
+    assert_eq!(v.shape(), &[2, 2]);
+    assert_eq!(q.data(), &[1.0, 2.0, 3.0, 8.0, 9.0, 10.0]);
+    assert_eq!(k.data(), &[4.0, 5.0, 11.0, 12.0]);
+    assert_eq!(v.data(), &[6.0, 7.0, 13.0, 14.0]);
+}
+
+#[test]
 fn test_allocate_any_dtype() {
     let backend = CpuBackend::new();
     // CPU backend should accept all dtypes (stores as f32 internally)

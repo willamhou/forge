@@ -34,8 +34,10 @@ struct KernelFunctions {
     embedding_f16: CudaFunction,
     rope_f16: CudaFunction,
     transpose_f16: CudaFunction,
+    split_qkv_f32: CudaFunction,
     cast_f16_to_f32: CudaFunction,
     cast_f32_to_f16: CudaFunction,
+    split_qkv_f16: CudaFunction,
     // Attention helpers
     extract_head_f32: CudaFunction,
     apply_causal_mask_f32: CudaFunction,
@@ -128,6 +130,7 @@ impl CudaBackend {
             embedding_f32: load_f32("embedding_f32")?,
             rope_f32: load_f32("rope_f32")?,
             transpose_f32: load_f32("transpose_f32")?,
+            split_qkv_f32: load_f32("split_qkv_f32")?,
             // F16 kernels
             add_f16: load_f16("add_f16")?,
             mul_f16: load_f16("mul_f16")?,
@@ -142,6 +145,7 @@ impl CudaBackend {
             transpose_f16: load_f16("transpose_f16")?,
             cast_f16_to_f32: load_f16("cast_f16_to_f32")?,
             cast_f32_to_f16: load_f16("cast_f32_to_f16")?,
+            split_qkv_f16: load_f16("split_qkv_f16")?,
             // Attention helpers
             extract_head_f32: load_f32("extract_head_f32")?,
             apply_causal_mask_f32: load_f32("apply_causal_mask_f32")?,
@@ -1280,6 +1284,113 @@ impl Backend for CudaBackend {
                 "cast from {:?} to {:?} not supported",
                 from, to
             ))),
+        }
+    }
+
+    fn split_qkv(
+        &self,
+        qkv: &CudaTensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<(CudaTensor, CudaTensor, CudaTensor)> {
+        let shape = qkv.shape();
+        if shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "split_qkv requires 2D tensor".into(),
+            ));
+        }
+        let rows = shape[0];
+        let total_cols = q_size + 2 * kv_size;
+        if shape[1] != total_cols {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![rows, total_cols],
+                got: shape.to_vec(),
+            });
+        }
+
+        let rows_u32 = rows as u32;
+        let q_cols_u32 = q_size as u32;
+        let kv_cols_u32 = kv_size as u32;
+        let block_dim = (256u32).min(q_size.max(kv_size) as u32);
+
+        match qkv.dtype() {
+            DType::F16 => {
+                let mut q_out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(rows * q_size)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut k_out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(rows * kv_size)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut v_out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(rows * kv_size)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self.stream.launch_builder(&self.kernels.split_qkv_f16);
+                builder.arg(&mut q_out);
+                builder.arg(&mut k_out);
+                builder.arg(&mut v_out);
+                builder.arg(qkv.f16_slice()?);
+                builder.arg(&rows_u32);
+                builder.arg(&q_cols_u32);
+                builder.arg(&kv_cols_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (rows as u32, 1, 1),
+                            block_dim: (block_dim, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok((
+                    CudaTensor::f16_data(q_out, vec![rows, q_size]),
+                    CudaTensor::f16_data(k_out, vec![rows, kv_size]),
+                    CudaTensor::f16_data(v_out, vec![rows, kv_size]),
+                ))
+            }
+            DType::F32 => {
+                let mut q_out = self
+                    .stream
+                    .alloc_zeros::<f32>(rows * q_size)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut k_out = self
+                    .stream
+                    .alloc_zeros::<f32>(rows * kv_size)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut v_out = self
+                    .stream
+                    .alloc_zeros::<f32>(rows * kv_size)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self.stream.launch_builder(&self.kernels.split_qkv_f32);
+                builder.arg(&mut q_out);
+                builder.arg(&mut k_out);
+                builder.arg(&mut v_out);
+                builder.arg(qkv.f32_slice()?);
+                builder.arg(&rows_u32);
+                builder.arg(&q_cols_u32);
+                builder.arg(&kv_cols_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (rows as u32, 1, 1),
+                            block_dim: (block_dim, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok((
+                    CudaTensor::f32_data(q_out, vec![rows, q_size]),
+                    CudaTensor::f32_data(k_out, vec![rows, kv_size]),
+                    CudaTensor::f32_data(v_out, vec![rows, kv_size]),
+                ))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 

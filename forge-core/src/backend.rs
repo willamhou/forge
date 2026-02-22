@@ -56,6 +56,33 @@ pub trait Backend: Send + Sync + 'static {
         Ok((normed, sum))
     }
 
+    /// Split a concatenated QKV tensor [rows, q_size + kv_size + kv_size] into
+    /// (Q [rows, q_size], K [rows, kv_size], V [rows, kv_size]).
+    fn split_qkv(
+        &self,
+        qkv: &Self::Tensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor)> {
+        let rows = qkv.shape()[0];
+        let total_cols = q_size + 2 * kv_size;
+        let data = self.copy_to_host_f32(qkv)?;
+        let mut q_data = Vec::with_capacity(rows * q_size);
+        let mut k_data = Vec::with_capacity(rows * kv_size);
+        let mut v_data = Vec::with_capacity(rows * kv_size);
+        for r in 0..rows {
+            let row = &data[r * total_cols..(r + 1) * total_cols];
+            q_data.extend_from_slice(&row[..q_size]);
+            k_data.extend_from_slice(&row[q_size..q_size + kv_size]);
+            v_data.extend_from_slice(&row[q_size + kv_size..]);
+        }
+        Ok((
+            self.copy_from_host_f32(&q_data, &[rows, q_size])?,
+            self.copy_from_host_f32(&k_data, &[rows, kv_size])?,
+            self.copy_from_host_f32(&v_data, &[rows, kv_size])?,
+        ))
+    }
+
     fn rope(
         &self,
         x: &Self::Tensor,

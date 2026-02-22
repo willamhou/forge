@@ -53,31 +53,29 @@ impl<B: Backend> LlamaMLP<B> {
 /// KV cache is used: during prefill, K/V are appended to cache; during decode,
 /// cached K/V are retrieved so attention sees the full context.
 pub struct LlamaAttention<B: Backend> {
-    wq: B::Tensor,
-    wk: B::Tensor,
-    wv: B::Tensor,
+    wqkv: B::Tensor,    // [hidden_size, q_proj_size + 2 * kv_proj_size]
     wo: B::Tensor,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    q_proj_size: usize,
+    kv_proj_size: usize,
 }
 
 impl<B: Backend> LlamaAttention<B> {
     pub fn new(
-        wq: B::Tensor,
-        wk: B::Tensor,
-        wv: B::Tensor,
+        wqkv: B::Tensor,
         wo: B::Tensor,
         config: &ModelConfig,
     ) -> Self {
         Self {
-            wq,
-            wk,
-            wv,
+            wqkv,
             wo,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
+            q_proj_size: config.num_attention_heads * config.head_dim,
+            kv_proj_size: config.num_key_value_heads * config.head_dim,
         }
     }
 
@@ -101,10 +99,9 @@ impl<B: Backend> LlamaAttention<B> {
         let shape = x.shape();
         let seq_len = shape[0];
 
-        // Q, K, V projections — weights are [hidden_size, proj_size] after transpose
-        let q = backend.matmul(x, &self.wq)?; // [seq_len, num_heads * head_dim]
-        let k = backend.matmul(x, &self.wk)?; // [seq_len, num_kv_heads * head_dim]
-        let v = backend.matmul(x, &self.wv)?; // [seq_len, num_kv_heads * head_dim]
+        // Fused QKV projection — single GEMM + split
+        let qkv = backend.matmul(x, &self.wqkv)?;
+        let (q, k, v) = backend.split_qkv(&qkv, self.q_proj_size, self.kv_proj_size)?;
 
         // Reshape for RoPE: [1, seq_len, num_heads/kv_heads, head_dim]
         let q = backend.reshape(&q, &[1, seq_len, self.num_heads, self.head_dim])?;
@@ -160,10 +157,9 @@ impl<B: Backend> LlamaAttention<B> {
     ) -> Result<B::Tensor> {
         let n = x.shape()[0];
 
-        // Batch QKV projections: [N, hidden_size] @ weights → [N, proj_size]
-        let q = backend.matmul(x, &self.wq)?;
-        let k = backend.matmul(x, &self.wk)?;
-        let v = backend.matmul(x, &self.wv)?;
+        // Fused QKV projection — single GEMM + split
+        let qkv = backend.matmul(x, &self.wqkv)?;
+        let (q, k, v) = backend.split_qkv(&qkv, self.q_proj_size, self.kv_proj_size)?;
 
         // Reshape for RoPE: [1, N, num_heads/kv_heads, head_dim]
         let q = backend.reshape(&q, &[1, n, self.num_heads, self.head_dim])?;

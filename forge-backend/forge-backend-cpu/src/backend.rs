@@ -408,6 +408,37 @@ impl Backend for CpuBackend {
         Ok(CpuTensor::new(data, out_shape))
     }
 
+    fn split_qkv(
+        &self,
+        qkv: &CpuTensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
+        let rows = qkv.shape()[0];
+        let total_cols = q_size + 2 * kv_size;
+        if qkv.len() != rows * total_cols {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![rows, total_cols],
+                got: qkv.shape().to_vec(),
+            });
+        }
+        let data = qkv.data();
+        let mut q = Vec::with_capacity(rows * q_size);
+        let mut k = Vec::with_capacity(rows * kv_size);
+        let mut v = Vec::with_capacity(rows * kv_size);
+        for r in 0..rows {
+            let row = &data[r * total_cols..(r + 1) * total_cols];
+            q.extend_from_slice(&row[..q_size]);
+            k.extend_from_slice(&row[q_size..q_size + kv_size]);
+            v.extend_from_slice(&row[q_size + kv_size..]);
+        }
+        Ok((
+            CpuTensor::new(q, vec![rows, q_size]),
+            CpuTensor::new(k, vec![rows, kv_size]),
+            CpuTensor::new(v, vec![rows, kv_size]),
+        ))
+    }
+
     fn fused_residual_rms_norm(
         &self,
         x: &CpuTensor,

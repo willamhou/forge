@@ -69,7 +69,16 @@ fn load_decoder_layer<B: Backend>(
     let wk = load_linear(loader, &format!("{prefix}.self_attn.k_proj.weight"), backend)?;
     let wv = load_linear(loader, &format!("{prefix}.self_attn.v_proj.weight"), backend)?;
     let wo = load_linear(loader, &format!("{prefix}.self_attn.o_proj.weight"), backend)?;
-    let attn = LlamaAttention::new(wq, wk, wv, wo, config);
+
+    // Concatenate wq/wk/wv into a single wqkv tensor at load time.
+    // load_linear produces [hidden, proj_size]. We need to cat along the proj dimension (dim=1),
+    // but cat only supports dim=0, so: transpose → cat along dim=0 → transpose back.
+    let wq_t = backend.transpose(&wq, 0, 1)?; // [q_proj, hidden]
+    let wk_t = backend.transpose(&wk, 0, 1)?; // [kv_proj, hidden]
+    let wv_t = backend.transpose(&wv, 0, 1)?; // [kv_proj, hidden]
+    let cat_t = backend.cat(&[&wq_t, &wk_t, &wv_t], 0)?; // [q+2*kv, hidden]
+    let wqkv = backend.transpose(&cat_t, 0, 1)?; // [hidden, q+2*kv]
+    let attn = LlamaAttention::new(wqkv, wo, config);
 
     // MLP weights (transposed at load)
     let gate_proj = load_linear(loader, &format!("{prefix}.mlp.gate_proj.weight"), backend)?;
