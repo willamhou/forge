@@ -311,17 +311,6 @@ fn object_schema_to_regex(
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
-    // Reject required keys that are missing from properties.
-    if let Some(props) = properties {
-        for key in &required {
-            if !props.contains_key(*key) {
-                return Err(ForgeError::InvalidArgument(format!(
-                    "required key \"{key}\" is not defined in properties"
-                )));
-            }
-        }
-    }
-
     match properties {
         Some(props) if !props.is_empty() => {
             let prop_entries: Vec<(&String, &serde_json::Value)> = props.iter().collect();
@@ -409,7 +398,15 @@ fn object_schema_to_regex(
             }
         }
         _ => {
-            // Empty object or no properties specified
+            // No properties specified. If required fields exist, we cannot
+            // generate a conforming object because we don't know the value
+            // schemas for the required keys.
+            if !required.is_empty() {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "required fields {:?} have no corresponding property schemas",
+                    required.iter().collect::<Vec<_>>()
+                )));
+            }
             Ok(format!(r"\{{{WS}\}}"))
         }
     }
