@@ -124,8 +124,8 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
 
     match type_str {
         "string" => string_schema_to_regex(obj),
-        "integer" => Ok(INTEGER.to_string()),
-        "number" => Ok(NUMBER.to_string()),
+        "integer" => integer_schema_to_regex(obj),
+        "number" => number_schema_to_regex(obj),
         "boolean" => Ok(BOOLEAN.to_string()),
         "null" => Ok(NULL.to_string()),
         "array" => array_schema_to_regex(obj),
@@ -180,6 +180,47 @@ fn string_schema_to_regex(
     };
 
     Ok(format!(r#""{}{}""#, char_pattern, quantifier))
+}
+
+/// Convert an integer schema to regex, rejecting unsupported bound constraints.
+///
+/// Numeric bounds (minimum, maximum, exclusiveMinimum, exclusiveMaximum) cannot
+/// be faithfully expressed as DFA-compatible regex patterns. Rather than silently
+/// ignoring these constraints, we reject schemas that use them.
+fn integer_schema_to_regex(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    reject_numeric_bounds(obj)?;
+    Ok(INTEGER.to_string())
+}
+
+/// Convert a number schema to regex, rejecting unsupported bound constraints.
+fn number_schema_to_regex(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    reject_numeric_bounds(obj)?;
+    Ok(NUMBER.to_string())
+}
+
+/// Reject schemas that use numeric bound keywords we cannot enforce in regex.
+fn reject_numeric_bounds(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    const BOUND_KEYS: &[&str] = &[
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+    ];
+    for &key in BOUND_KEYS {
+        if obj.contains_key(key) {
+            return Err(ForgeError::InvalidArgument(format!(
+                "numeric bound `{key}` cannot be enforced via regex; \
+                 remove it or validate post-generation"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert an array schema to regex.
@@ -530,7 +571,7 @@ fn value_satisfies_schema(
             return false;
         }
     }
-    // String length constraints
+    // String constraints
     if let Some(s) = value.as_str() {
         let char_len = s.chars().count() as u64;
         if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
@@ -540,6 +581,36 @@ fn value_satisfies_schema(
         }
         if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
             if char_len > max {
+                return false;
+            }
+        }
+        if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
+            if let Ok(re) = regex_automata::meta::Regex::new(pattern) {
+                if !re.is_match(s) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Numeric constraints
+    if let Some(n) = value.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
+            if n < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64()) {
+            if n > max {
+                return false;
+            }
+        }
+        if let Some(ex_min) = schema.get("exclusiveMinimum").and_then(|v| v.as_f64()) {
+            if n <= ex_min {
+                return false;
+            }
+        }
+        if let Some(ex_max) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
+            if n >= ex_max {
                 return false;
             }
         }
@@ -679,10 +750,34 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
                         merged.insert(key.clone(), value.clone());
                     }
                 }
+                // Lower-bound constraints: take the maximum (most restrictive).
+                "minLength" | "minimum" | "exclusiveMinimum" | "minItems" | "minProperties" => {
+                    if let (Some(existing), Some(new_val)) = (
+                        merged.get(key).and_then(|v| v.as_f64()),
+                        value.as_f64(),
+                    ) {
+                        if new_val > existing {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                    } else {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+                // Upper-bound constraints: take the minimum (most restrictive).
+                "maxLength" | "maximum" | "exclusiveMaximum" | "maxItems" | "maxProperties" => {
+                    if let (Some(existing), Some(new_val)) = (
+                        merged.get(key).and_then(|v| v.as_f64()),
+                        value.as_f64(),
+                    ) {
+                        if new_val < existing {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                    } else {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
                 _ => {
-                    // For other keys (const, format, etc.), last-write wins.
-                    // This is acceptable since most non-structural constraints
-                    // (minLength, pattern, etc.) are inherently additive.
+                    // For other keys (const, format, pattern, etc.), last-write wins.
                     merged.insert(key.clone(), value.clone());
                 }
             }
