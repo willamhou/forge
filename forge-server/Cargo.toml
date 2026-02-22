@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["cuda"]
+cuda = ["dep:forge-backend-cuda"]
+
 [dependencies]
 forge-core.workspace = true
 forge-runtime.workspace = true
 forge-loader.workspace = true
 forge-model-llama.workspace = true
-forge-backend-cuda.workspace = true
+forge-backend-cuda = { workspace = true, optional = true }
 forge-backend-cpu.workspace = true
 forge-scheduler.workspace = true
 forge-kvcache.workspace = true

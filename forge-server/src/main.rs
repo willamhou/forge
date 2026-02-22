@@ -12,6 +12,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use forge_backend_cpu::CpuBackend;
+#[cfg(feature = "cuda")]
 use forge_backend_cuda::CudaBackend;
 use forge_core::{Backend, ModelConfig};
 use forge_kvcache::naive::NaiveKvCache;
@@ -98,11 +99,14 @@ async fn main() -> anyhow::Result<()> {
             info!("CPU backend initialized");
             run_server(backend, &cli, model_config).await
         }
+        #[cfg(feature = "cuda")]
         "cuda" => {
             let backend = CudaBackend::new(cli.device)?;
             info!("CUDA backend initialized (device {})", cli.device);
             run_server(backend, &cli, model_config).await
         }
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => anyhow::bail!("CUDA backend not available: compile with --features cuda"),
         other => anyhow::bail!("Unknown backend: {other}. Use 'cpu' or 'cuda'."),
     }
 }

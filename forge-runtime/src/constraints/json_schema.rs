@@ -48,24 +48,14 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         ForgeError::InvalidArgument("schema must be an object or boolean".into())
     })?;
 
-    // Handle enum — filter by type constraint if both are present.
+    // Handle enum — filter values by all active constraints (type, minLength, etc.).
     if let Some(enum_values) = obj.get("enum") {
-        if let Some(type_val) = obj.get("type") {
-            return typed_enum_to_regex(enum_values, type_val);
-        }
-        return enum_to_regex(enum_values);
+        return constrained_enum_to_regex(enum_values, obj);
     }
 
-    // Handle const — validate against type constraint if present.
+    // Handle const — validate against all active constraints (type, length, etc.).
     if let Some(const_val) = obj.get("const") {
-        if let Some(type_val) = obj.get("type") {
-            if !json_value_matches_type(const_val, type_val) {
-                return Err(ForgeError::InvalidArgument(format!(
-                    "const value {} does not match type constraint {}",
-                    const_val, type_val
-                )));
-            }
-        }
+        validate_const_against_schema(const_val, obj)?;
         return Ok(json_value_to_regex_literal(const_val));
     }
 
@@ -472,6 +462,12 @@ fn enum_to_regex(values: &serde_json::Value) -> Result<String> {
         ForgeError::InvalidArgument("enum must be an array".into())
     })?;
 
+    if arr.is_empty() {
+        return Err(ForgeError::InvalidArgument(
+            "enum array must not be empty".into(),
+        ));
+    }
+
     let alternatives: Vec<String> = arr
         .iter()
         .map(|v| json_value_to_regex_literal(v))
@@ -480,12 +476,13 @@ fn enum_to_regex(values: &serde_json::Value) -> Result<String> {
     Ok(format!("({})", alternatives.join("|")))
 }
 
-/// Convert an enum to regex, filtering values by a type constraint.
+/// Convert an enum to regex, filtering values by all active constraints on the schema.
 ///
 /// `{"type":"integer","enum":[1,"x",null]}` → only keeps `1`.
-fn typed_enum_to_regex(
+/// `{"type":"string","enum":["ab","abcdef"],"minLength":3}` → only keeps `"abcdef"`.
+fn constrained_enum_to_regex(
     values: &serde_json::Value,
-    type_constraint: &serde_json::Value,
+    schema: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
     let arr = values.as_array().ok_or_else(|| {
         ForgeError::InvalidArgument("enum must be an array".into())
@@ -493,17 +490,61 @@ fn typed_enum_to_regex(
 
     let filtered: Vec<String> = arr
         .iter()
-        .filter(|v| json_value_matches_type(v, type_constraint))
+        .filter(|v| value_satisfies_schema(v, schema))
         .map(|v| json_value_to_regex_literal(v))
         .collect();
 
     if filtered.is_empty() {
         return Err(ForgeError::InvalidArgument(
-            "no enum values match the type constraint".into(),
+            "no enum values satisfy the schema constraints".into(),
         ));
     }
 
     Ok(format!("({})", filtered.join("|")))
+}
+
+/// Validate a const value against all active schema constraints.
+fn validate_const_against_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    if !value_satisfies_schema(value, schema) {
+        return Err(ForgeError::InvalidArgument(format!(
+            "const value {} does not satisfy schema constraints",
+            value
+        )));
+    }
+    Ok(())
+}
+
+/// Check if a JSON value satisfies the active constraints in a schema object.
+///
+/// Checks: `type`, `minLength`, `maxLength` (for strings).
+fn value_satisfies_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    // Type check
+    if let Some(type_val) = schema.get("type") {
+        if !json_value_matches_type(value, type_val) {
+            return false;
+        }
+    }
+    // String length constraints
+    if let Some(s) = value.as_str() {
+        let char_len = s.chars().count() as u64;
+        if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
+            if char_len < min {
+                return false;
+            }
+        }
+        if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
+            if char_len > max {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Check if a JSON value matches a `"type"` constraint.
