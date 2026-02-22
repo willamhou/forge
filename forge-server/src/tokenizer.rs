@@ -69,6 +69,10 @@ impl ForgeTokenizer {
 pub struct IncrementalDecoder {
     pending_ids: Vec<u32>,
     prev_text_len: usize,
+    /// Cached prefix text corresponding to `prev_text_len` bytes. Used to
+    /// detect suffix rewrites where `decoded.len()` stays the same but the
+    /// content changes (e.g. tokenizer whitespace normalization).
+    prev_text: String,
 }
 
 impl IncrementalDecoder {
@@ -85,10 +89,14 @@ impl IncrementalDecoder {
         }
 
         // Guard against tokenizers that rewrite earlier text on new tokens
-        // (e.g. whitespace normalization). If decoded is shorter than expected,
-        // reset prev_text_len to avoid panic or dropped characters.
-        if decoded.len() < self.prev_text_len {
+        // (e.g. whitespace normalization). If the decoded prefix no longer
+        // matches what we previously emitted (shorter OR same-length rewrite),
+        // reset prev_text_len so we re-emit the full decoded text.
+        if decoded.len() < self.prev_text_len
+            || !decoded.starts_with(&self.prev_text)
+        {
             self.prev_text_len = 0;
+            self.prev_text.clear();
         }
         let new_text = decoded[self.prev_text_len..].to_string();
 
@@ -101,13 +109,13 @@ impl IncrementalDecoder {
         if self.pending_ids.len() > 4 {
             let keep = self.pending_ids.len().saturating_sub(2);
             self.pending_ids.drain(..keep);
-            // Recompute prev_text_len relative to the trimmed buffer
-            self.prev_text_len = tokenizer
-                .decode(&self.pending_ids)
-                .map(|s| s.len())
-                .unwrap_or(0);
+            // Recompute prev_text relative to the trimmed buffer
+            let trimmed = tokenizer.decode(&self.pending_ids).unwrap_or_default();
+            self.prev_text_len = trimmed.len();
+            self.prev_text = trimmed;
         } else {
             self.prev_text_len = decoded.len();
+            self.prev_text = decoded;
         }
 
         Some(new_text)
@@ -119,12 +127,13 @@ impl IncrementalDecoder {
             return None;
         }
         let decoded = tokenizer.decode(&self.pending_ids).ok()?;
-        if decoded.len() < self.prev_text_len {
+        if decoded.len() < self.prev_text_len || !decoded.starts_with(&self.prev_text) {
             self.prev_text_len = 0;
         }
         let new_text = decoded[self.prev_text_len..].to_string();
         self.pending_ids.clear();
         self.prev_text_len = 0;
+        self.prev_text.clear();
         if new_text.is_empty() {
             None
         } else {

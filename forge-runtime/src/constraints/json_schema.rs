@@ -519,9 +519,59 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
                         }
                     }
                 }
+                "enum" => {
+                    // Intersect enum arrays: only values present in all
+                    // subschemas survive. This correctly narrows
+                    // {"allOf": [{"enum":["a","b"]}, {"enum":["b","c"]}]} → "b".
+                    if let Some(existing) = merged.get_mut("enum") {
+                        if let (Some(existing_arr), Some(new_arr)) =
+                            (existing.as_array().map(|a| a.to_vec()), value.as_array())
+                        {
+                            let intersected: Vec<serde_json::Value> = existing_arr
+                                .into_iter()
+                                .filter(|v| new_arr.contains(v))
+                                .collect();
+                            *existing = serde_json::Value::Array(intersected);
+                        }
+                    } else {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+                "type" => {
+                    // Intersect type constraints. A single string type narrows
+                    // against another by requiring equality; type arrays are
+                    // intersected element-wise.
+                    if let Some(existing) = merged.get("type").cloned() {
+                        let existing_set = type_value_to_set(&existing);
+                        let new_set = type_value_to_set(value);
+                        let intersected: Vec<&str> = existing_set
+                            .iter()
+                            .copied()
+                            .filter(|t| new_set.contains(t))
+                            .collect();
+                        let result = match intersected.len() {
+                            0 => {
+                                // Empty intersection — contradiction; will
+                                // produce an error downstream via type dispatch.
+                                serde_json::Value::Array(Vec::new())
+                            }
+                            1 => serde_json::Value::String(intersected[0].to_string()),
+                            _ => serde_json::Value::Array(
+                                intersected
+                                    .iter()
+                                    .map(|t| serde_json::Value::String(t.to_string()))
+                                    .collect(),
+                            ),
+                        };
+                        merged.insert(key.clone(), result);
+                    } else {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
                 _ => {
-                    // For other keys (type, enum, const, etc.), later schemas
-                    // override earlier ones (most restrictive wins).
+                    // For other keys (const, format, etc.), last-write wins.
+                    // This is acceptable since most non-structural constraints
+                    // (minLength, pattern, etc.) are inherently additive.
                     merged.insert(key.clone(), value.clone());
                 }
             }
@@ -529,6 +579,19 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
     }
 
     schema_node_to_regex(&serde_json::Value::Object(merged))
+}
+
+/// Extract the set of type names from a `"type"` value.
+///
+/// Handles both `"type": "string"` and `"type": ["string", "null"]`.
+fn type_value_to_set(value: &serde_json::Value) -> Vec<&str> {
+    if let Some(s) = value.as_str() {
+        vec![s]
+    } else if let Some(arr) = value.as_array() {
+        arr.iter().filter_map(|v| v.as_str()).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Convert a JSON value to its regex literal representation.
