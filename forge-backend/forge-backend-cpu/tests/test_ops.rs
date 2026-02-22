@@ -309,6 +309,31 @@ fn test_fused_silu_mul() {
 }
 
 #[test]
+fn test_fused_residual_rms_norm() {
+    let backend = CpuBackend::new();
+    let x = backend
+        .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])
+        .unwrap();
+    let res = backend
+        .copy_from_host_f32(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3])
+        .unwrap();
+    let w = backend
+        .copy_from_host_f32(&[1.0, 1.0, 1.0], &[3])
+        .unwrap();
+    let ref_sum = backend.add(&x, &res).unwrap();
+    let ref_norm = backend.rms_norm(&ref_sum, &w, 1e-5).unwrap();
+    let (fused_norm, fused_res) = backend
+        .fused_residual_rms_norm(&x, &res, &w, 1e-5)
+        .unwrap();
+    for (a, b) in ref_norm.data().iter().zip(fused_norm.data().iter()) {
+        assert!((a - b).abs() < 1e-5, "norm mismatch: {} vs {}", a, b);
+    }
+    for (a, b) in ref_sum.data().iter().zip(fused_res.data().iter()) {
+        assert!((a - b).abs() < 1e-5, "residual mismatch: {} vs {}", a, b);
+    }
+}
+
+#[test]
 fn test_allocate_any_dtype() {
     let backend = CpuBackend::new();
     // CPU backend should accept all dtypes (stores as f32 internally)

@@ -39,6 +39,22 @@ pub trait Backend: Send + Sync + 'static {
         weight: &Self::Tensor,
         eps: f32,
     ) -> Result<Self::Tensor>;
+
+    /// Fused residual addition + RMSNorm.
+    /// Returns (normalized, updated_residual) where:
+    ///   updated_residual = x + residual_in
+    ///   normalized = rms_norm(updated_residual, weight, eps)
+    fn fused_residual_rms_norm(
+        &self,
+        x: &Self::Tensor,
+        residual: &Self::Tensor,
+        weight: &Self::Tensor,
+        eps: f32,
+    ) -> Result<(Self::Tensor, Self::Tensor)> {
+        let sum = self.add(x, residual)?;
+        let normed = self.rms_norm(&sum, weight, eps)?;
+        Ok((normed, sum))
+    }
     fn rope(
         &self,
         x: &Self::Tensor,

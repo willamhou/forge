@@ -408,6 +408,18 @@ impl Backend for CpuBackend {
         Ok(CpuTensor::new(data, out_shape))
     }
 
+    fn fused_residual_rms_norm(
+        &self,
+        x: &CpuTensor,
+        residual: &CpuTensor,
+        weight: &CpuTensor,
+        eps: f32,
+    ) -> Result<(CpuTensor, CpuTensor)> {
+        let sum = self.add(x, residual)?;
+        let normed = self.rms_norm(&sum, weight, eps)?;
+        Ok((normed, sum))
+    }
+
     fn cast(&self, x: &CpuTensor, _dtype: DType) -> Result<CpuTensor> {
         // CPU backend stores everything as f32 internally, so cast is a no-op.
         Ok(x.clone())

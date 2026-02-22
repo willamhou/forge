@@ -17,6 +17,7 @@ struct KernelFunctions {
     silu_f32: CudaFunction,
     fused_silu_mul_f32: CudaFunction,
     rms_norm_f32: CudaFunction,
+    fused_residual_rms_norm_f32: CudaFunction,
     softmax_f32: CudaFunction,
     embedding_f32: CudaFunction,
     rope_f32: CudaFunction,
@@ -28,6 +29,7 @@ struct KernelFunctions {
     silu_f16: CudaFunction,
     fused_silu_mul_f16: CudaFunction,
     rms_norm_f16: CudaFunction,
+    fused_residual_rms_norm_f16: CudaFunction,
     softmax_f16: CudaFunction,
     embedding_f16: CudaFunction,
     rope_f16: CudaFunction,
@@ -121,6 +123,7 @@ impl CudaBackend {
             silu_f32: load_f32("silu_f32")?,
             fused_silu_mul_f32: load_f32("fused_silu_mul_f32")?,
             rms_norm_f32: load_f32("rms_norm_f32")?,
+            fused_residual_rms_norm_f32: load_f32("fused_residual_rms_norm_f32")?,
             softmax_f32: load_f32("softmax_f32")?,
             embedding_f32: load_f32("embedding_f32")?,
             rope_f32: load_f32("rope_f32")?,
@@ -132,6 +135,7 @@ impl CudaBackend {
             silu_f16: load_f16("silu_f16")?,
             fused_silu_mul_f16: load_f16("fused_silu_mul_f16")?,
             rms_norm_f16: load_f16("rms_norm_f16")?,
+            fused_residual_rms_norm_f16: load_f16("fused_residual_rms_norm_f16")?,
             softmax_f16: load_f16("softmax_f16")?,
             embedding_f16: load_f16("embedding_f16")?,
             rope_f16: load_f16("rope_f16")?,
@@ -731,6 +735,106 @@ impl Backend for CudaBackend {
                 }
 
                 Ok(CudaTensor::f32_data(out, shape.to_vec()))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
+    fn fused_residual_rms_norm(
+        &self,
+        x: &CudaTensor,
+        residual: &CudaTensor,
+        weight: &CudaTensor,
+        eps: f32,
+    ) -> Result<(CudaTensor, CudaTensor)> {
+        validate_same_shape(x, residual)?;
+        let shape = x.shape();
+        let cols = *shape.last().unwrap();
+        if weight.len() != cols {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: weight.shape().to_vec(),
+            });
+        }
+        let rows = x.len() / cols;
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+
+        let block_dim = next_power_of_2(256u32.min(cols as u32));
+        let shared_mem = block_dim * 4;
+
+        match x.dtype() {
+            DType::F16 => {
+                let mut norm_out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(rows * cols)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut residual_out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(rows * cols)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_residual_rms_norm_f16);
+                builder.arg(&mut norm_out);
+                builder.arg(&mut residual_out);
+                builder.arg(x.f16_slice()?);
+                builder.arg(residual.f16_slice()?);
+                builder.arg(weight.f16_slice()?);
+                builder.arg(&eps);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (rows as u32, 1, 1),
+                            block_dim: (block_dim, 1, 1),
+                            shared_mem_bytes: shared_mem,
+                        })
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok((
+                    CudaTensor::f16_data(norm_out, shape.to_vec()),
+                    CudaTensor::f16_data(residual_out, shape.to_vec()),
+                ))
+            }
+            DType::F32 => {
+                let mut norm_out = self
+                    .stream
+                    .alloc_zeros::<f32>(rows * cols)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut residual_out = self
+                    .stream
+                    .alloc_zeros::<f32>(rows * cols)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_residual_rms_norm_f32);
+                builder.arg(&mut norm_out);
+                builder.arg(&mut residual_out);
+                builder.arg(x.f32_slice()?);
+                builder.arg(residual.f32_slice()?);
+                builder.arg(weight.f32_slice()?);
+                builder.arg(&eps);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (rows as u32, 1, 1),
+                            block_dim: (block_dim, 1, 1),
+                            shared_mem_bytes: shared_mem,
+                        })
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok((
+                    CudaTensor::f32_data(norm_out, shape.to_vec()),
+                    CudaTensor::f32_data(residual_out, shape.to_vec()),
+                ))
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }

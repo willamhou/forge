@@ -4,8 +4,8 @@ use crate::rope::RopeFreqs;
 
 /// RMS normalization layer.
 pub struct RMSNorm<B: Backend> {
-    weight: B::Tensor,
-    eps: f32,
+    pub(crate) weight: B::Tensor,
+    pub(crate) eps: f32,
 }
 
 impl<B: Backend> RMSNorm<B> {
@@ -309,10 +309,14 @@ impl<B: Backend> LlamaDecoderLayer<B> {
             layer_idx,
             backend,
         )?;
-        let x = backend.add(x, &attn_out)?;
 
-        // Post-attention norm + MLP + residual
-        let normed = self.post_attention_layernorm.forward(&x, backend)?;
+        // Fused residual add + post-attention norm
+        let (normed, x) = backend.fused_residual_rms_norm(
+            &attn_out,
+            x,
+            &self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )?;
         let mlp_out = self.mlp.forward(&normed, backend)?;
         backend.add(&x, &mlp_out)
     }
@@ -342,10 +346,14 @@ impl<B: Backend> LlamaDecoderLayer<B> {
             layer_idx,
             backend,
         )?;
-        let x = backend.add(x, &attn_out)?;
 
-        // Post-attention norm + MLP + residual
-        let normed = self.post_attention_layernorm.forward(&x, backend)?;
+        // Fused residual add + post-attention norm
+        let (normed, x) = backend.fused_residual_rms_norm(
+            &attn_out,
+            x,
+            &self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )?;
         let mlp_out = self.mlp.forward(&normed, backend)?;
         backend.add(&x, &mlp_out)
     }
