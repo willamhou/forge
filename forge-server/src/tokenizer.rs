@@ -90,13 +90,16 @@ impl IncrementalDecoder {
 
         // Guard against tokenizers that rewrite earlier text on new tokens
         // (e.g. whitespace normalization). If the decoded prefix no longer
-        // matches what we previously emitted (shorter OR same-length rewrite),
-        // reset prev_text_len so we re-emit the full decoded text.
+        // matches what we previously emitted, skip this token's output since
+        // we cannot unsend already-streamed text.
         if decoded.len() < self.prev_text_len
             || !decoded.starts_with(&self.prev_text)
         {
-            self.prev_text_len = 0;
-            self.prev_text.clear();
+            // Update tracking to the full decoded text so subsequent tokens
+            // diff correctly against the current decode state.
+            self.prev_text_len = decoded.len();
+            self.prev_text = decoded;
+            return None;
         }
         let new_text = decoded[self.prev_text_len..].to_string();
 
@@ -104,19 +107,8 @@ impl IncrementalDecoder {
             return None;
         }
 
-        // Reset to avoid O(N^2) re-decoding. Keep the last token as context
-        // for multi-byte character boundaries.
-        if self.pending_ids.len() > 4 {
-            let keep = self.pending_ids.len().saturating_sub(2);
-            self.pending_ids.drain(..keep);
-            // Recompute prev_text relative to the trimmed buffer
-            let trimmed = tokenizer.decode(&self.pending_ids).unwrap_or_default();
-            self.prev_text_len = trimmed.len();
-            self.prev_text = trimmed;
-        } else {
-            self.prev_text_len = decoded.len();
-            self.prev_text = decoded;
-        }
+        self.prev_text_len = decoded.len();
+        self.prev_text = decoded;
 
         Some(new_text)
     }
@@ -127,11 +119,17 @@ impl IncrementalDecoder {
             return None;
         }
         let decoded = tokenizer.decode(&self.pending_ids).ok()?;
-        if decoded.len() < self.prev_text_len || !decoded.starts_with(&self.prev_text) {
-            self.prev_text_len = 0;
-        }
-        let new_text = decoded[self.prev_text_len..].to_string();
         self.pending_ids.clear();
+
+        // On rewrite, skip re-emitting already-streamed text.
+        let new_text = if decoded.len() < self.prev_text_len
+            || !decoded.starts_with(&self.prev_text)
+        {
+            String::new()
+        } else {
+            decoded[self.prev_text_len..].to_string()
+        };
+
         self.prev_text_len = 0;
         self.prev_text.clear();
         if new_text.is_empty() {

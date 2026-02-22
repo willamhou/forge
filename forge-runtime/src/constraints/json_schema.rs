@@ -311,6 +311,17 @@ fn object_schema_to_regex(
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
+    // Reject required keys that are missing from properties.
+    if let Some(props) = properties {
+        for key in &required {
+            if !props.contains_key(*key) {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "required key \"{key}\" is not defined in properties"
+                )));
+            }
+        }
+    }
+
     match properties {
         Some(props) if !props.is_empty() => {
             let prop_entries: Vec<(&String, &serde_json::Value)> = props.iter().collect();

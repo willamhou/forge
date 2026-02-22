@@ -44,6 +44,13 @@ pub struct ContinuousBatchingScheduler {
 
 impl ContinuousBatchingScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
+        // Clamp max_batch_size to at least 1 to prevent requests from
+        // queuing forever (the schedule loop exits immediately when the
+        // limit is already reached at 0).
+        let config = SchedulerConfig {
+            max_batch_size: config.max_batch_size.max(1),
+            ..config
+        };
         // Treat prefill_chunk_size == 0 as disabled (None) to prevent
         // infinite-loop where zero-sized chunks never advance offset.
         let config = if config.prefill_chunk_size == Some(0) {
