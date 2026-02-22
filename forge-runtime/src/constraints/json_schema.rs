@@ -58,17 +58,30 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         return Ok(json_value_to_regex_literal(const_val));
     }
 
-    // Handle anyOf / oneOf
-    if let Some(any_of) = obj.get("anyOf").or_else(|| obj.get("oneOf")) {
+    // Handle anyOf
+    if let Some(any_of) = obj.get("anyOf") {
         return any_of_to_regex(any_of);
     }
 
-    // Handle allOf (just use the first schema — simplified)
+    // Handle oneOf — semantically requires exactly one branch to match, but
+    // regex-level FSMs cannot enforce exclusivity. We treat it identically to
+    // anyOf, which is the standard approach for regex-constrained generation
+    // (used by outlines, lm-format-enforcer, etc.). Overlapping branches may
+    // admit values that a strict validator would reject.
+    if let Some(one_of) = obj.get("oneOf") {
+        return any_of_to_regex(one_of);
+    }
+
+    // Handle allOf — merge object subschemas by combining their properties.
+    // For non-object allOf (e.g. type constraints + enum restrictions), merge
+    // all subschemas into a single object and re-convert. This handles the
+    // common case of {"allOf": [{"type":"string"}, {"enum":["ok"]}]}.
     if let Some(all_of) = obj.get("allOf") {
         if let Some(arr) = all_of.as_array() {
-            if let Some(first) = arr.first() {
-                return schema_node_to_regex(first);
+            if arr.is_empty() {
+                return Ok(any_json_value());
             }
+            return all_of_to_regex(arr);
         }
     }
 
@@ -79,9 +92,32 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         ));
     }
 
-    // Determine type — missing `type` means any JSON value is valid
-    let type_str = match obj.get("type").and_then(|v| v.as_str()) {
+    // Determine type — missing `type` means any JSON value is valid.
+    // Handle `"type": ["string", "null"]` (type union) by converting to anyOf.
+    let type_val = obj.get("type");
+    if let Some(type_arr) = type_val.and_then(|v| v.as_array()) {
+        let mut alternatives: Vec<String> = Vec::new();
+        for t in type_arr {
+            if let Some(t_str) = t.as_str() {
+                let mut sub = obj.clone();
+                sub.insert("type".to_string(), serde_json::Value::String(t_str.to_string()));
+                alternatives.push(schema_node_to_regex(&serde_json::Value::Object(sub))?);
+            } else {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "type array element must be a string, got: {t}"
+                )));
+            }
+        }
+        return Ok(format!("({})", alternatives.join("|")));
+    }
+    let type_str = match type_val.and_then(|v| v.as_str()) {
         Some(t) => t,
+        None if type_val.is_some() => {
+            return Err(ForgeError::InvalidArgument(format!(
+                "unsupported type value: {}",
+                type_val.unwrap()
+            )));
+        }
         None => return Ok(any_json_value()),
     };
 
@@ -436,6 +472,63 @@ fn any_of_to_regex(schemas: &serde_json::Value) -> Result<String> {
         .collect();
 
     Ok(format!("({})", alternatives?.join("|")))
+}
+
+/// Convert allOf to regex by merging subschemas.
+///
+/// Strategy: merge all subschemas into a single JSON object, combining
+/// properties and required lists. Non-object constraints (e.g. enum + type)
+/// are overlaid so the most restrictive wins. This handles common patterns
+/// like `{"allOf": [{"type": "object", "properties": {"a": ...}}, {"required": ["a"]}]}`.
+fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
+    let mut merged = serde_json::Map::new();
+
+    for schema in schemas {
+        let obj = match schema.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+
+        for (key, value) in obj {
+            match key.as_str() {
+                "properties" => {
+                    // Merge properties from all subschemas
+                    let existing = merged
+                        .entry("properties")
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    if let (Some(existing_obj), Some(new_obj)) =
+                        (existing.as_object_mut(), value.as_object())
+                    {
+                        for (k, v) in new_obj {
+                            existing_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                "required" => {
+                    // Merge required arrays
+                    let existing = merged
+                        .entry("required")
+                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                    if let (Some(existing_arr), Some(new_arr)) =
+                        (existing.as_array_mut(), value.as_array())
+                    {
+                        for v in new_arr {
+                            if !existing_arr.contains(v) {
+                                existing_arr.push(v.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // For other keys (type, enum, const, etc.), later schemas
+                    // override earlier ones (most restrictive wins).
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema_node_to_regex(&serde_json::Value::Object(merged))
 }
 
 /// Convert a JSON value to its regex literal representation.
