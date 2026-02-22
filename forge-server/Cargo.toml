@@ -30,3 +30,7 @@ clap.workspace = true
 tokio-stream.workspace = true
 minijinja = { version = "2.12", features = ["loader"] }
 tokenizers = "0.21"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -9,6 +9,14 @@ pub struct ForgeTokenizer {
 }
 
 impl ForgeTokenizer {
+    /// Create from an existing HuggingFace tokenizer instance.
+    pub fn from_inner(inner: HfTokenizer, eos_token_id: u32) -> Self {
+        Self {
+            inner,
+            eos_token_id,
+        }
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let inner =
             HfTokenizer::from_file(path).map_err(|e| ForgeError::Tokenizer(e.to_string()))?;
