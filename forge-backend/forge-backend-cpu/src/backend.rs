@@ -175,6 +175,7 @@ impl Backend for CpuBackend {
     }
 
     fn fused_silu_mul(&self, gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        validate_same_shape(gate, up)?;
         let g = gate.data();
         let u = up.data();
         let data: Vec<f32> = g
