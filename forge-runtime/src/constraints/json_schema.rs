@@ -596,10 +596,13 @@ fn value_satisfies_schema(
             }
         }
         if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
-            if let Ok(re) = regex_automata::meta::Regex::new(pattern) {
-                if !re.is_match(s) {
-                    return false;
+            match regex_automata::meta::Regex::new(pattern) {
+                Ok(re) => {
+                    if !re.is_match(s) {
+                        return false;
+                    }
                 }
+                Err(_) => return false, // invalid pattern → value cannot satisfy
             }
         }
     }
@@ -676,6 +679,16 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
     let mut merged = serde_json::Map::new();
 
     for schema in schemas {
+        // Boolean subschemas: `true` is a no-op, `false` makes the entire
+        // allOf unsatisfiable.
+        if let Some(b) = schema.as_bool() {
+            if !b {
+                return Err(ForgeError::InvalidArgument(
+                    "allOf contains `false` subschema — no value can satisfy all branches".into(),
+                ));
+            }
+            continue;
+        }
         let obj = match schema.as_object() {
             Some(o) => o,
             None => continue,
@@ -684,7 +697,10 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
         for (key, value) in obj {
             match key.as_str() {
                 "properties" => {
-                    // Merge properties from all subschemas
+                    // Merge properties from all subschemas. When the same
+                    // property key appears in multiple branches, merge their
+                    // constraint objects so constraints are intersected rather
+                    // than overwritten.
                     let existing = merged
                         .entry("properties")
                         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -692,7 +708,18 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
                         (existing.as_object_mut(), value.as_object())
                     {
                         for (k, v) in new_obj {
-                            existing_obj.insert(k.clone(), v.clone());
+                            if let Some(existing_prop) = existing_obj.get_mut(k) {
+                                // Both branches define this property — merge constraints.
+                                if let (Some(ep), Some(np)) =
+                                    (existing_prop.as_object_mut(), v.as_object())
+                                {
+                                    for (ck, cv) in np {
+                                        ep.insert(ck.clone(), cv.clone());
+                                    }
+                                }
+                            } else {
+                                existing_obj.insert(k.clone(), v.clone());
+                            }
                         }
                     }
                 }
