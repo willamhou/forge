@@ -16,6 +16,21 @@ members = [
     "forge-transport",
     "forge-quantize",
 ]
+default-members = [
+    "forge-core",
+    "forge-server",
+    "forge-backend",
+    "forge-backend/forge-backend-cuda",
+    "forge-backend/forge-backend-cpu",
+    "forge-runtime",
+    "forge-scheduler",
+    "forge-kvcache",
+    "forge-models/forge-model-llama",
+    "forge-loader",
+    "forge-kernels",
+    "forge-transport",
+    "forge-quantize",
+]
 
 [workspace.package]
 version = "0.1.0"
