@@ -173,34 +173,36 @@ impl<B: Backend> LlamaAttention<B> {
         let q = backend.reshape(&q, &[n, self.num_heads * self.head_dim])?;
         let k = backend.reshape(&k, &[n, self.num_kv_heads * self.head_dim])?;
 
-        // Per-sequence attention loop (KV cache is per-sequence)
-        let mut attn_outputs = Vec::with_capacity(n);
+        // Per-sequence cache append (still per-seq)
         for i in 0..n {
-            let q_row = backend.slice_rows(&q, i, 1)?;
             let k_row = backend.slice_rows(&k, i, 1)?;
             let v_row = backend.slice_rows(&v, i, 1)?;
-
             kv_cache.append(seq_ids[i], layer_idx, &k_row, &v_row)?;
-            let (k_full, v_full) = kv_cache.get_kv(seq_ids[i], layer_idx)?;
-            let kv_len = k_full.shape()[0];
-
-            let q_4d =
-                backend.reshape(&q_row, &[1, 1, self.num_heads, self.head_dim])?;
-            let k_4d =
-                backend.reshape(&k_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
-            let v_4d =
-                backend.reshape(&v_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
-
-            let attn_out =
-                self.compute_attention(&q_4d, &k_4d, &v_4d, 1, kv_len, backend)?;
-            attn_outputs.push(attn_out);
         }
 
-        // Cat → [N, num_heads * head_dim], cast, batch output projection
-        let refs: Vec<&B::Tensor> = attn_outputs.iter().collect();
-        let concat = backend.cat(&refs, 0)?;
-        let concat = backend.cast(&concat, self.wo.dtype())?;
-        backend.matmul(&concat, &self.wo)
+        // Retrieve full KV caches for all sequences
+        let mut k_caches = Vec::with_capacity(n);
+        let mut v_caches = Vec::with_capacity(n);
+        for i in 0..n {
+            let (k_full, v_full) = kv_cache.get_kv(seq_ids[i], layer_idx)?;
+            k_caches.push(k_full);
+            v_caches.push(v_full);
+        }
+
+        // Batched decode attention -- single kernel for all sequences
+        let attn_out = backend.batched_decode_attention(
+            &q,
+            &k_caches,
+            &v_caches,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+
+        // Cast + output projection
+        let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
+        backend.matmul(&attn_out, &self.wo)
     }
 
     /// Compute scaled dot-product attention per head (GPU-native, no CPU copies).

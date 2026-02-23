@@ -83,6 +83,61 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
+    /// Batched decode attention: N sequences x 1 query token each.
+    /// Processes Q@K^T -> softmax -> @V for all sequences.
+    ///
+    /// `q`: [num_seqs, num_heads * head_dim]
+    /// `k_caches`: per-sequence K caches, each [kv_len_i, num_kv_heads * head_dim]
+    /// `v_caches`: per-sequence V caches, each [kv_len_i, num_kv_heads * head_dim]
+    ///
+    /// Returns: [num_seqs, num_heads * head_dim]
+    fn batched_decode_attention(
+        &self,
+        q: &Self::Tensor,
+        k_caches: &[Self::Tensor],
+        v_caches: &[Self::Tensor],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<Self::Tensor> {
+        let n = k_caches.len();
+        let heads_per_group = num_heads / num_kv_heads;
+        let mut seq_outputs = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let q_row = self.slice_rows(q, i, 1)?;
+            let kv_len = k_caches[i].shape()[0];
+
+            // Reshape for per-head extraction: [seq_len, num_heads, head_dim]
+            let q_3d = self.reshape(&q_row, &[1, num_heads, head_dim])?;
+            let k_3d = self.reshape(&k_caches[i], &[kv_len, num_kv_heads, head_dim])?;
+            let v_3d = self.reshape(&v_caches[i], &[kv_len, num_kv_heads, head_dim])?;
+
+            let mut head_outputs = Vec::with_capacity(num_heads);
+            for h in 0..num_heads {
+                let kv_h = h / heads_per_group;
+                let q_head = self.extract_head(&q_3d, 1, num_heads, head_dim, h)?;
+                let k_head = self.extract_head(&k_3d, kv_len, num_kv_heads, head_dim, kv_h)?;
+                let v_head = self.extract_head(&v_3d, kv_len, num_kv_heads, head_dim, kv_h)?;
+
+                let k_t = self.transpose(&k_head, 0, 1)?;
+                let scores = self.matmul(&q_head, &k_t)?;
+                let scores = self.mul_scalar(&scores, scale)?;
+                // No causal mask needed for decode (seq_len=1)
+                let attn = self.softmax(&scores, -1)?;
+                head_outputs.push(self.matmul(&attn, &v_head)?);
+            }
+
+            let refs: Vec<&Self::Tensor> = head_outputs.iter().collect();
+            let seq_out = self.interleave_heads(&refs, 1, head_dim)?;
+            seq_outputs.push(seq_out);
+        }
+
+        let refs: Vec<&Self::Tensor> = seq_outputs.iter().collect();
+        self.cat(&refs, 0)
+    }
+
     fn rope(
         &self,
         x: &Self::Tensor,
