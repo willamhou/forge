@@ -357,3 +357,72 @@ fn test_allocate_any_dtype() {
     let data = backend.copy_to_host_f32(&t).unwrap();
     assert_eq!(data, vec![0.0; 6]);
 }
+
+#[test]
+fn test_multi_head_attention_basic() {
+    let backend = CpuBackend::new();
+    // Q: [1, 2, 2, 4] (batch=1, seq_len=2, num_heads=2, head_dim=4)
+    let q_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+    let q = backend.copy_from_host_f32(&q_data, &[1, 2, 2, 4]).unwrap();
+
+    // K, V: [1, 3, 2, 4] (batch=1, kv_len=3, num_kv_heads=2, head_dim=4)
+    let k_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.05).collect();
+    let k = backend.copy_from_host_f32(&k_data, &[1, 3, 2, 4]).unwrap();
+    let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02 + 0.1).collect();
+    let v = backend.copy_from_host_f32(&v_data, &[1, 3, 2, 4]).unwrap();
+
+    let scale = 1.0 / (4.0_f32).sqrt();
+    let result = backend
+        .multi_head_attention(&q, &k, &v, 2, 2, 4, scale, true)
+        .unwrap();
+
+    // Output should be [2, 8] (seq_len=2, num_heads*head_dim=8)
+    assert_eq!(result.shape(), &[2, 8]);
+}
+
+#[test]
+fn test_multi_head_attention_gqa() {
+    let backend = CpuBackend::new();
+    // GQA: num_heads=4, num_kv_heads=2 (heads_per_group=2)
+    // Q: [1, 1, 4, 4], K/V: [1, 3, 2, 4]
+    let q_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+    let q = backend.copy_from_host_f32(&q_data, &[1, 1, 4, 4]).unwrap();
+
+    let k_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.05).collect();
+    let k = backend.copy_from_host_f32(&k_data, &[1, 3, 2, 4]).unwrap();
+    let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02 + 0.1).collect();
+    let v = backend.copy_from_host_f32(&v_data, &[1, 3, 2, 4]).unwrap();
+
+    let scale = 1.0 / (4.0_f32).sqrt();
+    let result = backend
+        .multi_head_attention(&q, &k, &v, 4, 2, 4, scale, false)
+        .unwrap();
+
+    // Output: [1, 16] (seq_len=1, num_heads*head_dim=16)
+    assert_eq!(result.shape(), &[1, 16]);
+}
+
+#[test]
+fn test_multi_head_attention_causal_mask() {
+    let backend = CpuBackend::new();
+    // Q: [1, 3, 2, 4] (seq_len=3), K/V: [1, 3, 2, 4]
+    let q_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.1).collect();
+    let q = backend.copy_from_host_f32(&q_data, &[1, 3, 2, 4]).unwrap();
+    let k = backend.copy_from_host_f32(&q_data, &[1, 3, 2, 4]).unwrap();
+    let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02).collect();
+    let v = backend.copy_from_host_f32(&v_data, &[1, 3, 2, 4]).unwrap();
+
+    let scale = 1.0 / (4.0_f32).sqrt();
+
+    let causal = backend
+        .multi_head_attention(&q, &k, &v, 2, 2, 4, scale, true)
+        .unwrap();
+    let non_causal = backend
+        .multi_head_attention(&q, &k, &v, 2, 2, 4, scale, false)
+        .unwrap();
+
+    let c = backend.copy_to_host_f32(&causal).unwrap();
+    let nc = backend.copy_to_host_f32(&non_causal).unwrap();
+
+    assert_ne!(c, nc, "causal and non-causal should produce different results");
+}
