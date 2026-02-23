@@ -186,25 +186,38 @@ impl<B: Backend> LlamaAttention<B> {
             kv_cache.append(seq_ids[i], layer_idx, &k_row, &v_row)?;
         }
 
-        // Retrieve full KV caches for all sequences
-        let mut k_caches = Vec::with_capacity(n);
-        let mut v_caches = Vec::with_capacity(n);
-        for i in 0..n {
-            let (k_full, v_full) = kv_cache.get_kv(seq_ids[i], layer_idx)?;
-            k_caches.push(k_full);
-            v_caches.push(v_full);
-        }
-
-        // Batched decode attention -- single kernel for all sequences
-        let attn_out = backend.batched_decode_attention(
-            &q,
-            &k_caches,
-            &v_caches,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1.0 / (self.head_dim as f32).sqrt(),
-        )?;
+        // Dispatch to paged or batched decode attention
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let attn_out = if kv_cache.supports_paged_attention() {
+            // Paged path: kernel reads KV directly from block pool via block table
+            let meta = kv_cache.paged_attention_meta(seq_ids, layer_idx)?;
+            backend.paged_decode_attention(
+                &q,
+                &meta,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                scale,
+            )?
+        } else {
+            // Legacy path: gather contiguous KV per sequence
+            let mut k_caches = Vec::with_capacity(n);
+            let mut v_caches = Vec::with_capacity(n);
+            for i in 0..n {
+                let (k_full, v_full) = kv_cache.get_kv(seq_ids[i], layer_idx)?;
+                k_caches.push(k_full);
+                v_caches.push(v_full);
+            }
+            backend.batched_decode_attention(
+                &q,
+                &k_caches,
+                &v_caches,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                scale,
+            )?
+        };
 
         // Cast + output projection
         let attn_out = backend.cast(&attn_out, self.wo.dtype())?;

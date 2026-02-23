@@ -11,7 +11,7 @@ pub mod types;
 
 pub use backend::Backend;
 pub use error::{ForgeError, Result};
-pub use kvcache::{CacheUsage, KvCache};
+pub use kvcache::{CacheUsage, KvCache, PagedAttentionMeta};
 pub use model::{Model, ModelOutput};
 pub use sampling::{SampleResult, SamplingContext};
 pub use scheduler::{InferenceRequest, RequestHandle, ScheduleBatch, ScheduledSeq, Scheduler};

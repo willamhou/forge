@@ -53,7 +53,7 @@ struct Cli {
     #[arg(long, default_value = "cuda")]
     backend: String,
 
-    /// KV cache type: "naive" or "paged"
+    /// KV cache type: "naive", "paged", or "gpu_paged" (CUDA only)
     #[arg(long, default_value = "paged")]
     kv_cache: String,
 
@@ -95,15 +95,40 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.backend.as_str() {
         "cpu" => {
+            if cli.kv_cache == "gpu_paged" {
+                anyhow::bail!("gpu_paged KV cache requires CUDA backend");
+            }
             let backend = CpuBackend::new();
             info!("CPU backend initialized");
-            run_server(backend, &cli, model_config).await
+            run_server(backend, &cli, model_config, None).await
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
             let backend = CudaBackend::new(cli.device)?;
             info!("CUDA backend initialized (device {})", cli.device);
-            run_server(backend, &cli, model_config).await
+            // Build GPU paged cache if requested (must be done here where we have CudaBackend)
+            let gpu_cache: Option<
+                Box<dyn forge_core::KvCache<T = forge_backend_cuda::CudaTensor> + Send + Sync>,
+            > = if cli.kv_cache == "gpu_paged" {
+                let cache = forge_backend_cuda::GpuPagedKvCache::new(
+                    backend.clone(),
+                    cli.num_blocks,
+                    cli.block_size,
+                    model_config.num_hidden_layers,
+                    model_config.num_key_value_heads,
+                    model_config.head_dim,
+                )?;
+                info!(
+                    "GPU paged KV cache: {} blocks x {} tokens, kv_dim={}",
+                    cli.num_blocks,
+                    cli.block_size,
+                    model_config.num_key_value_heads * model_config.head_dim,
+                );
+                Some(Box::new(cache))
+            } else {
+                None
+            };
+            run_server(backend, &cli, model_config, gpu_cache).await
         }
         #[cfg(not(feature = "cuda"))]
         "cuda" => anyhow::bail!("CUDA backend not available: compile with --features cuda"),
@@ -115,6 +140,7 @@ async fn run_server<B: Backend + Clone>(
     backend: B,
     cli: &Cli,
     model_config: ModelConfig,
+    pre_built_cache: Option<Box<dyn forge_core::KvCache<T = B::Tensor> + Send + Sync>>,
 ) -> anyhow::Result<()> {
     // --- Load model weights ---
     info!("Loading model from {}...", cli.model_path.display());
@@ -136,34 +162,38 @@ async fn run_server<B: Backend + Clone>(
 
     // --- Create engine components ---
     let kv_cache: Box<dyn forge_core::KvCache<T = B::Tensor> + Send + Sync> =
-        match cli.kv_cache.as_str() {
-            "paged" => {
-                let cache = PagedKvCache::new(
-                    backend.clone(),
-                    cli.num_blocks,
-                    cli.block_size,
-                    model_config.num_hidden_layers,
-                    model_config.num_key_value_heads,
-                    model_config.head_dim,
-                );
-                info!(
-                    "Paged KV cache: {} blocks x {} tokens, kv_dim={}",
-                    cli.num_blocks,
-                    cli.block_size,
-                    model_config.num_key_value_heads * model_config.head_dim,
-                );
-                Box::new(cache)
+        if let Some(cache) = pre_built_cache {
+            cache
+        } else {
+            match cli.kv_cache.as_str() {
+                "paged" => {
+                    let cache = PagedKvCache::new(
+                        backend.clone(),
+                        cli.num_blocks,
+                        cli.block_size,
+                        model_config.num_hidden_layers,
+                        model_config.num_key_value_heads,
+                        model_config.head_dim,
+                    );
+                    info!(
+                        "Paged KV cache: {} blocks x {} tokens, kv_dim={}",
+                        cli.num_blocks,
+                        cli.block_size,
+                        model_config.num_key_value_heads * model_config.head_dim,
+                    );
+                    Box::new(cache)
+                }
+                "naive" => {
+                    let cache = NaiveKvCache::new(
+                        backend.clone(),
+                        model_config.num_hidden_layers,
+                        cli.max_batch_size,
+                    );
+                    info!("Naive KV cache (CPU-side, max {} sequences)", cli.max_batch_size);
+                    Box::new(cache)
+                }
+                other => anyhow::bail!("Unknown kv-cache type: {other}. Use 'naive', 'paged', or 'gpu_paged'."),
             }
-            "naive" => {
-                let cache = NaiveKvCache::new(
-                    backend.clone(),
-                    model_config.num_hidden_layers,
-                    cli.max_batch_size,
-                );
-                info!("Naive KV cache (CPU-side, max {} sequences)", cli.max_batch_size);
-                Box::new(cache)
-            }
-            other => anyhow::bail!("Unknown kv-cache type: {other}. Use 'naive' or 'paged'."),
         };
     let scheduler_config = SchedulerConfig {
         max_batch_size: cli.max_batch_size,

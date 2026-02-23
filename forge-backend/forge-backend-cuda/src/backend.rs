@@ -6,7 +6,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
-use forge_core::{Backend, DType, ForgeError, Result, Tensor};
+use forge_core::{Backend, DType, ForgeError, PagedAttentionMeta, Result, Tensor};
 
 use crate::tensor::CudaTensor;
 
@@ -48,6 +48,9 @@ struct KernelFunctions {
     // Batched decode attention
     batched_decode_attention_f32: CudaFunction,
     batched_decode_attention_f16: CudaFunction,
+    // Paged decode attention
+    paged_decode_attention_f32: CudaFunction,
+    paged_decode_attention_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -74,13 +77,14 @@ impl CudaBackend {
 
         // Compile F32 kernels (concatenate all module sources)
         let f32_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F32_SRC,
             forge_kernels::norm::F32_SRC,
             forge_kernels::positional::F32_SRC,
             forge_kernels::memory::F32_SRC,
             forge_kernels::attention::F32_SRC,
             forge_kernels::decode_attention::F32_SRC,
+            forge_kernels::paged_attention::F32_SRC,
         );
         let ptx_f32 = compile_ptx(&f32_src)
             .map_err(|e| ForgeError::Cuda(format!("nvrtc f32: {e}")))?;
@@ -90,13 +94,14 @@ impl CudaBackend {
 
         // Compile F16 kernels — requires cuda_fp16.h from CUDA toolkit
         let f16_src = format!(
-            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}",
+            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F16_SRC,
             forge_kernels::norm::F16_SRC,
             forge_kernels::positional::F16_SRC,
             forge_kernels::memory::F16_SRC,
             forge_kernels::attention::F16_SRC,
             forge_kernels::decode_attention::F16_SRC,
+            forge_kernels::paged_attention::F16_SRC,
         );
         let cuda_include = Self::find_cuda_include()?;
         let ptx_f16 = cudarc::nvrtc::compile_ptx_with_opts(
@@ -161,6 +166,9 @@ impl CudaBackend {
             // Batched decode attention
             batched_decode_attention_f32: load_f32("batched_decode_attention_f32")?,
             batched_decode_attention_f16: load_f16("batched_decode_attention_f16")?,
+            // Paged decode attention
+            paged_decode_attention_f32: load_f32("paged_decode_attention_f32")?,
+            paged_decode_attention_f16: load_f16("paged_decode_attention_f16")?,
         };
 
         Ok(Self {
@@ -1808,6 +1816,123 @@ impl Backend for CudaBackend {
                 }
 
                 Ok(CudaTensor::f32_data(
+                    out,
+                    vec![num_seqs, num_heads * head_dim],
+                ))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
+    fn paged_decode_attention(
+        &self,
+        q: &CudaTensor,
+        meta: &PagedAttentionMeta,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<CudaTensor> {
+        let num_seqs = meta.num_seqs;
+        if num_seqs == 0 {
+            return self.allocate(&[0, num_heads * head_dim], q.dtype());
+        }
+        if q.shape()[0] != num_seqs {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![num_seqs, num_heads * head_dim],
+                got: q.shape().to_vec(),
+            });
+        }
+
+        let block_dim = next_power_of_2(128u32.min(head_dim as u32));
+        let shared_mem = (block_dim + head_dim as u32) * 4; // scratch + output accumulator
+
+        let num_heads_i32 = num_heads as i32;
+        let num_kv_heads_i32 = num_kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let block_size_i32 = meta.block_size as i32;
+        let max_blocks_i32 = meta.max_blocks_per_seq as i32;
+        let kv_dim_i32 = meta.kv_dim as i32;
+
+        // Reconstruct device pointers from raw u64 values.
+        // SAFETY: The caller (GpuPagedKvCache) guarantees these pointers are valid
+        // GPU device pointers that will remain valid through this kernel launch.
+        let block_tables_ptr = meta.block_tables_ptr;
+        let kv_lens_ptr = meta.kv_lens_ptr;
+        let k_pool_ptr = meta.k_pool_ptr;
+        let v_pool_ptr = meta.v_pool_ptr;
+
+        match q.dtype() {
+            DType::F32 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(num_seqs * num_heads * head_dim)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.paged_decode_attention_f32);
+                builder.arg(&mut out);
+                builder.arg(q.f32_slice()?);
+                builder.arg(&k_pool_ptr);
+                builder.arg(&v_pool_ptr);
+                builder.arg(&block_tables_ptr);
+                builder.arg(&kv_lens_ptr);
+                builder.arg(&scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&kv_dim_i32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                            block_dim: (block_dim, 1, 1),
+                            shared_mem_bytes: shared_mem,
+                        })
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f32_data(
+                    out,
+                    vec![num_seqs, num_heads * head_dim],
+                ))
+            }
+            DType::F16 => {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<half::f16>(num_seqs * num_heads * head_dim)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.paged_decode_attention_f16);
+                builder.arg(&mut out);
+                builder.arg(q.f16_slice()?);
+                builder.arg(&k_pool_ptr);
+                builder.arg(&v_pool_ptr);
+                builder.arg(&block_tables_ptr);
+                builder.arg(&kv_lens_ptr);
+                builder.arg(&scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&kv_dim_i32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                            block_dim: (block_dim, 1, 1),
+                            shared_mem_bytes: shared_mem,
+                        })
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+
+                Ok(CudaTensor::f16_data(
                     out,
                     vec![num_seqs, num_heads * head_dim],
                 ))

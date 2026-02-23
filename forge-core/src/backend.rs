@@ -1,3 +1,4 @@
+use crate::kvcache::PagedAttentionMeta;
 use crate::tensor::Tensor;
 use crate::{DType, Result};
 
@@ -136,6 +137,26 @@ pub trait Backend: Send + Sync + 'static {
 
         let refs: Vec<&Self::Tensor> = seq_outputs.iter().collect();
         self.cat(&refs, 0)
+    }
+
+    /// Paged decode attention: reads KV from block pools via block table indirection.
+    ///
+    /// `q`: [num_seqs, num_heads * head_dim]
+    /// `meta`: PagedAttentionMeta with GPU pointers to block tables, kv_lens, and KV pools
+    ///
+    /// Returns: [num_seqs, num_heads * head_dim]
+    fn paged_decode_attention(
+        &self,
+        _q: &Self::Tensor,
+        _meta: &PagedAttentionMeta,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+    ) -> Result<Self::Tensor> {
+        Err(crate::ForgeError::InvalidArgument(
+            "paged_decode_attention not supported by this backend".into(),
+        ))
     }
 
     /// Multi-head scaled dot-product attention.

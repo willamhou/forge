@@ -10,4 +10,5 @@ pub mod decode_attention;
 pub mod elementwise;
 pub mod memory;
 pub mod norm;
+pub mod paged_attention;
 pub mod positional;
