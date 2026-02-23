@@ -174,6 +174,18 @@ impl Backend for CpuBackend {
         Ok(CpuTensor::new(data, a.shape().to_vec()))
     }
 
+    fn fused_silu_mul(&self, gate: &CpuTensor, up: &CpuTensor) -> Result<CpuTensor> {
+        validate_same_shape(gate, up)?;
+        let g = gate.data();
+        let u = up.data();
+        let data: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
+            .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
+            .collect();
+        Ok(CpuTensor::new(data, gate.shape().to_vec()))
+    }
+
     fn rms_norm(&self, x: &CpuTensor, weight: &CpuTensor, eps: f32) -> Result<CpuTensor> {
         let shape = x.shape();
         let cols = *shape.last().unwrap();
@@ -374,6 +386,74 @@ impl Backend for CpuBackend {
         let mut out_shape = tensors[0].shape().to_vec();
         out_shape[0] = total_first_dim;
         Ok(CpuTensor::new(all_data, out_shape))
+    }
+
+    fn slice_rows(
+        &self,
+        tensor: &CpuTensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<CpuTensor> {
+        let shape = tensor.shape();
+        let cols: usize = if shape.len() > 1 {
+            shape[1..].iter().product()
+        } else {
+            1
+        };
+        let offset = start_row * cols;
+        let len = num_rows * cols;
+        let data = tensor.data()[offset..offset + len].to_vec();
+        let mut out_shape = shape.to_vec();
+        out_shape[0] = num_rows;
+        Ok(CpuTensor::new(data, out_shape))
+    }
+
+    fn split_qkv(
+        &self,
+        qkv: &CpuTensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
+        if qkv.shape().len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "split_qkv requires 2D tensor".into(),
+            ));
+        }
+        let rows = qkv.shape()[0];
+        let total_cols = q_size + 2 * kv_size;
+        if qkv.shape()[1] != total_cols {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![rows, total_cols],
+                got: qkv.shape().to_vec(),
+            });
+        }
+        let data = qkv.data();
+        let mut q = Vec::with_capacity(rows * q_size);
+        let mut k = Vec::with_capacity(rows * kv_size);
+        let mut v = Vec::with_capacity(rows * kv_size);
+        for r in 0..rows {
+            let row = &data[r * total_cols..(r + 1) * total_cols];
+            q.extend_from_slice(&row[..q_size]);
+            k.extend_from_slice(&row[q_size..q_size + kv_size]);
+            v.extend_from_slice(&row[q_size + kv_size..]);
+        }
+        Ok((
+            CpuTensor::new(q, vec![rows, q_size]),
+            CpuTensor::new(k, vec![rows, kv_size]),
+            CpuTensor::new(v, vec![rows, kv_size]),
+        ))
+    }
+
+    fn fused_residual_rms_norm(
+        &self,
+        x: &CpuTensor,
+        residual: &CpuTensor,
+        weight: &CpuTensor,
+        eps: f32,
+    ) -> Result<(CpuTensor, CpuTensor)> {
+        let sum = self.add(x, residual)?;
+        let normed = self.rms_norm(&sum, weight, eps)?;
+        Ok((normed, sum))
     }
 
     fn cast(&self, x: &CpuTensor, _dtype: DType) -> Result<CpuTensor> {

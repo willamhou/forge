@@ -6,6 +6,7 @@
 //! **Note:** F16 sources assume `cuda_fp16.h` is already included by the caller.
 
 pub mod attention;
+pub mod decode_attention;
 pub mod elementwise;
 pub mod memory;
 pub mod norm;

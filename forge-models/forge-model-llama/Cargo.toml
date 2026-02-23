@@ -8,3 +8,7 @@ license.workspace = true
 forge-core.workspace = true
 forge-loader.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+forge-backend-cpu = { path = "../../forge-backend/forge-backend-cpu" }
+forge-kvcache = { path = "../../forge-kvcache" }

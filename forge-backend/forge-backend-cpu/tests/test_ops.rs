@@ -254,6 +254,101 @@ fn test_copy_from_host_bf16() {
 }
 
 #[test]
+fn test_slice_rows_basic() {
+    let backend = CpuBackend::new();
+    let data: Vec<f32> = (1..=12).map(|i| i as f32).collect();
+    let t = backend.copy_from_host_f32(&data, &[3, 4]).unwrap();
+    let sliced = backend.slice_rows(&t, 1, 2).unwrap();
+    assert_eq!(sliced.shape(), &[2, 4]);
+    assert_eq!(
+        backend.copy_to_host_f32(&sliced).unwrap(),
+        vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    );
+}
+
+#[test]
+fn test_slice_rows_single_row() {
+    let backend = CpuBackend::new();
+    let data: Vec<f32> = (1..=6).map(|i| i as f32).collect();
+    let t = backend.copy_from_host_f32(&data, &[3, 2]).unwrap();
+    let sliced = backend.slice_rows(&t, 2, 1).unwrap();
+    assert_eq!(sliced.shape(), &[1, 2]);
+    assert_eq!(backend.copy_to_host_f32(&sliced).unwrap(), vec![5.0, 6.0]);
+}
+
+#[test]
+fn test_slice_rows_first_row() {
+    let backend = CpuBackend::new();
+    let data: Vec<f32> = (1..=6).map(|i| i as f32).collect();
+    let t = backend.copy_from_host_f32(&data, &[2, 3]).unwrap();
+    let sliced = backend.slice_rows(&t, 0, 1).unwrap();
+    assert_eq!(sliced.shape(), &[1, 3]);
+    assert_eq!(
+        backend.copy_to_host_f32(&sliced).unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn test_fused_silu_mul() {
+    let backend = CpuBackend::new();
+    let gate = backend
+        .copy_from_host_f32(&[1.0, -1.0, 2.0, 0.0], &[4])
+        .unwrap();
+    let up = backend
+        .copy_from_host_f32(&[2.0, 3.0, 1.0, 5.0], &[4])
+        .unwrap();
+    let ref_silu = backend.silu(&gate).unwrap();
+    let ref_result = backend.mul(&ref_silu, &up).unwrap();
+    let fused = backend.fused_silu_mul(&gate, &up).unwrap();
+    let ref_data = ref_result.data();
+    let fused_data = fused.data();
+    for (a, b) in ref_data.iter().zip(fused_data.iter()) {
+        assert!((a - b).abs() < 1e-6, "mismatch: {} vs {}", a, b);
+    }
+}
+
+#[test]
+fn test_fused_residual_rms_norm() {
+    let backend = CpuBackend::new();
+    let x = backend
+        .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])
+        .unwrap();
+    let res = backend
+        .copy_from_host_f32(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3])
+        .unwrap();
+    let w = backend
+        .copy_from_host_f32(&[1.0, 1.0, 1.0], &[3])
+        .unwrap();
+    let ref_sum = backend.add(&x, &res).unwrap();
+    let ref_norm = backend.rms_norm(&ref_sum, &w, 1e-5).unwrap();
+    let (fused_norm, fused_res) = backend
+        .fused_residual_rms_norm(&x, &res, &w, 1e-5)
+        .unwrap();
+    for (a, b) in ref_norm.data().iter().zip(fused_norm.data().iter()) {
+        assert!((a - b).abs() < 1e-5, "norm mismatch: {} vs {}", a, b);
+    }
+    for (a, b) in ref_sum.data().iter().zip(fused_res.data().iter()) {
+        assert!((a - b).abs() < 1e-5, "residual mismatch: {} vs {}", a, b);
+    }
+}
+
+#[test]
+fn test_split_qkv() {
+    let backend = CpuBackend::new();
+    // 2 rows, q_size=3, kv_size=2 -> total_cols=7
+    let qkv_data: Vec<f32> = (1..=14).map(|i| i as f32).collect();
+    let qkv = backend.copy_from_host_f32(&qkv_data, &[2, 7]).unwrap();
+    let (q, k, v) = backend.split_qkv(&qkv, 3, 2).unwrap();
+    assert_eq!(q.shape(), &[2, 3]);
+    assert_eq!(k.shape(), &[2, 2]);
+    assert_eq!(v.shape(), &[2, 2]);
+    assert_eq!(q.data(), &[1.0, 2.0, 3.0, 8.0, 9.0, 10.0]);
+    assert_eq!(k.data(), &[4.0, 5.0, 11.0, 12.0]);
+    assert_eq!(v.data(), &[6.0, 7.0, 13.0, 14.0]);
+}
+
+#[test]
 fn test_allocate_any_dtype() {
     let backend = CpuBackend::new();
     // CPU backend should accept all dtypes (stores as f32 internally)

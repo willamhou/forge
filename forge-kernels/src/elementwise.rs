@@ -29,6 +29,16 @@ extern "C" __global__ void silu_f32(float* out, const float* a, unsigned int n) 
         out[i] = x / (1.0f + expf(-x));
     }
 }
+
+extern "C" __global__ void fused_silu_mul_f32(
+    float* out, const float* gate, const float* up, unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        out[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
 "#;
 
 pub const F16_SRC: &str = r#"
@@ -58,6 +68,16 @@ extern "C" __global__ void silu_f16(__half* out, const __half* a, unsigned int n
     if (i < n) {
         float x = __half2float(a[i]);
         out[i] = __float2half(x / (1.0f + expf(-x)));
+    }
+}
+
+extern "C" __global__ void fused_silu_mul_f16(
+    __half* out, const __half* gate, const __half* up, unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = __half2float(gate[i]);
+        out[i] = __float2half((g / (1.0f + expf(-g))) * __half2float(up[i]));
     }
 }
 "#;

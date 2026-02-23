@@ -4,8 +4,8 @@ use crate::rope::RopeFreqs;
 
 /// RMS normalization layer.
 pub struct RMSNorm<B: Backend> {
-    weight: B::Tensor,
-    eps: f32,
+    pub(crate) weight: B::Tensor,
+    pub(crate) eps: f32,
 }
 
 impl<B: Backend> RMSNorm<B> {
@@ -35,15 +35,14 @@ impl<B: Backend> LlamaMLP<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
-        // gate = silu(x @ gate_proj)  — weights already transposed at load
+        // gate = x @ gate_proj  — weights already transposed at load
         let gate = backend.matmul(x, &self.gate_proj)?;
-        let gate = backend.silu(&gate)?;
 
         // up = x @ up_proj
         let up = backend.matmul(x, &self.up_proj)?;
 
-        // output = (gate * up) @ down_proj
-        let fused = backend.mul(&gate, &up)?;
+        // output = (silu(gate) * up) @ down_proj — fused into one kernel
+        let fused = backend.fused_silu_mul(&gate, &up)?;
         backend.matmul(&fused, &self.down_proj)
     }
 }
@@ -54,31 +53,29 @@ impl<B: Backend> LlamaMLP<B> {
 /// KV cache is used: during prefill, K/V are appended to cache; during decode,
 /// cached K/V are retrieved so attention sees the full context.
 pub struct LlamaAttention<B: Backend> {
-    wq: B::Tensor,
-    wk: B::Tensor,
-    wv: B::Tensor,
+    wqkv: B::Tensor,    // [hidden_size, q_proj_size + 2 * kv_proj_size]
     wo: B::Tensor,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    q_proj_size: usize,
+    kv_proj_size: usize,
 }
 
 impl<B: Backend> LlamaAttention<B> {
     pub fn new(
-        wq: B::Tensor,
-        wk: B::Tensor,
-        wv: B::Tensor,
+        wqkv: B::Tensor,
         wo: B::Tensor,
         config: &ModelConfig,
     ) -> Self {
         Self {
-            wq,
-            wk,
-            wv,
+            wqkv,
             wo,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
+            q_proj_size: config.num_attention_heads * config.head_dim,
+            kv_proj_size: config.num_key_value_heads * config.head_dim,
         }
     }
 
@@ -102,10 +99,9 @@ impl<B: Backend> LlamaAttention<B> {
         let shape = x.shape();
         let seq_len = shape[0];
 
-        // Q, K, V projections — weights are [hidden_size, proj_size] after transpose
-        let q = backend.matmul(x, &self.wq)?; // [seq_len, num_heads * head_dim]
-        let k = backend.matmul(x, &self.wk)?; // [seq_len, num_kv_heads * head_dim]
-        let v = backend.matmul(x, &self.wv)?; // [seq_len, num_kv_heads * head_dim]
+        // Fused QKV projection — single GEMM + split
+        let qkv = backend.matmul(x, &self.wqkv)?;
+        let (q, k, v) = backend.split_qkv(&qkv, self.q_proj_size, self.kv_proj_size)?;
 
         // Reshape for RoPE: [1, seq_len, num_heads/kv_heads, head_dim]
         let q = backend.reshape(&q, &[1, seq_len, self.num_heads, self.head_dim])?;
@@ -139,6 +135,73 @@ impl<B: Backend> LlamaAttention<B> {
         let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
 
         // Output projection: [seq_len, num_heads * head_dim] @ wo
+        backend.matmul(&attn_out, &self.wo)
+    }
+
+    /// Batched attention for decode: each sequence contributes exactly 1 token.
+    ///
+    /// `x`: `[N, hidden_size]` (N concatenated decode tokens)
+    /// `positions`: per-token absolute positions, length N
+    /// `seq_ids`: per-sequence IDs for KV cache, length N
+    ///
+    /// Returns: `[N, hidden_size]`
+    pub fn forward_batch(
+        &self,
+        x: &B::Tensor,
+        rope_freqs: &RopeFreqs<B>,
+        positions: &[u32],
+        seq_ids: &[u64],
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        layer_idx: usize,
+        backend: &B,
+    ) -> Result<B::Tensor> {
+        let n = x.shape()[0];
+
+        // Fused QKV projection — single GEMM + split
+        let qkv = backend.matmul(x, &self.wqkv)?;
+        let (q, k, v) = backend.split_qkv(&qkv, self.q_proj_size, self.kv_proj_size)?;
+
+        // Reshape for RoPE: [1, N, num_heads/kv_heads, head_dim]
+        let q = backend.reshape(&q, &[1, n, self.num_heads, self.head_dim])?;
+        let k = backend.reshape(&k, &[1, n, self.num_kv_heads, self.head_dim])?;
+
+        // Apply RoPE with per-token positions
+        let q = rope_freqs.apply_with_positions(&q, positions, backend)?;
+        let k = rope_freqs.apply_with_positions(&k, positions, backend)?;
+
+        // Flatten back to 2D
+        let q = backend.reshape(&q, &[n, self.num_heads * self.head_dim])?;
+        let k = backend.reshape(&k, &[n, self.num_kv_heads * self.head_dim])?;
+
+        // Per-sequence cache append (still per-seq)
+        for i in 0..n {
+            let k_row = backend.slice_rows(&k, i, 1)?;
+            let v_row = backend.slice_rows(&v, i, 1)?;
+            kv_cache.append(seq_ids[i], layer_idx, &k_row, &v_row)?;
+        }
+
+        // Retrieve full KV caches for all sequences
+        let mut k_caches = Vec::with_capacity(n);
+        let mut v_caches = Vec::with_capacity(n);
+        for i in 0..n {
+            let (k_full, v_full) = kv_cache.get_kv(seq_ids[i], layer_idx)?;
+            k_caches.push(k_full);
+            v_caches.push(v_full);
+        }
+
+        // Batched decode attention -- single kernel for all sequences
+        let attn_out = backend.batched_decode_attention(
+            &q,
+            &k_caches,
+            &v_caches,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+
+        // Cast + output projection
+        let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
         backend.matmul(&attn_out, &self.wo)
     }
 
@@ -244,10 +307,51 @@ impl<B: Backend> LlamaDecoderLayer<B> {
             layer_idx,
             backend,
         )?;
-        let x = backend.add(x, &attn_out)?;
 
-        // Post-attention norm + MLP + residual
-        let normed = self.post_attention_layernorm.forward(&x, backend)?;
+        // Fused residual add + post-attention norm
+        let (normed, x) = backend.fused_residual_rms_norm(
+            &attn_out,
+            x,
+            &self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )?;
+        let mlp_out = self.mlp.forward(&normed, backend)?;
+        backend.add(&x, &mlp_out)
+    }
+
+    /// Batched forward for decode: N sequences, 1 token each.
+    ///
+    /// Norms and MLP operate row-wise and batch naturally on `[N, hidden_size]`.
+    /// Attention loops per-sequence for KV cache.
+    pub fn forward_batch(
+        &self,
+        x: &B::Tensor,
+        rope_freqs: &RopeFreqs<B>,
+        positions: &[u32],
+        seq_ids: &[u64],
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        layer_idx: usize,
+        backend: &B,
+    ) -> Result<B::Tensor> {
+        // Pre-attention norm + batched attention + residual
+        let normed = self.input_layernorm.forward(x, backend)?;
+        let attn_out = self.self_attn.forward_batch(
+            &normed,
+            rope_freqs,
+            positions,
+            seq_ids,
+            kv_cache,
+            layer_idx,
+            backend,
+        )?;
+
+        // Fused residual add + post-attention norm
+        let (normed, x) = backend.fused_residual_rms_norm(
+            &attn_out,
+            x,
+            &self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )?;
         let mlp_out = self.mlp.forward(&normed, backend)?;
         backend.add(&x, &mlp_out)
     }
