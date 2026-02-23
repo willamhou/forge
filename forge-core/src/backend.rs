@@ -138,6 +138,64 @@ pub trait Backend: Send + Sync + 'static {
         self.cat(&refs, 0)
     }
 
+    /// Multi-head scaled dot-product attention.
+    ///
+    /// Q: [1, seq_len, num_heads, head_dim]
+    /// K: [1, kv_len, num_kv_heads, head_dim]
+    /// V: [1, kv_len, num_kv_heads, head_dim]
+    ///
+    /// Returns: [seq_len, num_heads * head_dim]
+    ///
+    /// Default impl: per-head loop (extract_head -> matmul -> softmax -> interleave).
+    /// CUDA override: FlashAttention v2 when available.
+    fn multi_head_attention(
+        &self,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        is_causal: bool,
+    ) -> Result<Self::Tensor> {
+        let q_shape = q.shape();
+        let seq_len = q_shape[1];
+        let kv_len = k.shape()[1];
+        let heads_per_group = num_heads / num_kv_heads;
+
+        // Reshape to 3D for extract_head: strip batch dim (always 1)
+        let q = self.reshape(q, &[seq_len, num_heads, head_dim])?;
+        let k = self.reshape(k, &[kv_len, num_kv_heads, head_dim])?;
+        let v = self.reshape(v, &[kv_len, num_kv_heads, head_dim])?;
+
+        let mut head_outputs = Vec::with_capacity(num_heads);
+
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+
+            let q_head = self.extract_head(&q, seq_len, num_heads, head_dim, h)?;
+            let k_head = self.extract_head(&k, kv_len, num_kv_heads, head_dim, kv_h)?;
+            let v_head = self.extract_head(&v, kv_len, num_kv_heads, head_dim, kv_h)?;
+
+            let k_t = self.transpose(&k_head, 0, 1)?;
+            let scores = self.matmul(&q_head, &k_t)?;
+            let scores = self.mul_scalar(&scores, scale)?;
+
+            let scores = if is_causal && seq_len > 1 {
+                self.apply_causal_mask(&scores, seq_len, kv_len)?
+            } else {
+                scores
+            };
+
+            let attn = self.softmax(&scores, -1)?;
+            head_outputs.push(self.matmul(&attn, &v_head)?);
+        }
+
+        let refs: Vec<&Self::Tensor> = head_outputs.iter().collect();
+        self.interleave_heads(&refs, seq_len, head_dim)
+    }
+
     fn rope(
         &self,
         x: &Self::Tensor,
