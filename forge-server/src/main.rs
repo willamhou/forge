@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
                     model_config.num_hidden_layers,
                     model_config.num_key_value_heads,
                     model_config.head_dim,
+                    model_config.dtype,
                 )?;
                 info!(
                     "GPU paged KV cache: {} blocks x {} tokens, kv_dim={}",

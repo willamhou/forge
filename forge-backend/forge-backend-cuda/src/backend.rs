@@ -1747,7 +1747,9 @@ impl Backend for CudaBackend {
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
         let block_dim = next_power_of_2(128u32.min(head_dim as u32));
-        let shared_mem = (block_dim + head_dim as u32) * 4; // scratch + output accumulator
+        // Both F32 and F16 kernels use float32 accumulators in shared memory
+        // for numerical stability, so shared mem is always 4 bytes/element.
+        let shared_mem = (block_dim + head_dim as u32) * 4;
 
         let num_heads_i32 = num_heads as i32;
         let num_kv_heads_i32 = num_kv_heads as i32;
@@ -1845,7 +1847,9 @@ impl Backend for CudaBackend {
         }
 
         let block_dim = next_power_of_2(128u32.min(head_dim as u32));
-        let shared_mem = (block_dim + head_dim as u32) * 4; // scratch + output accumulator
+        // Both F32 and F16 kernels use float32 accumulators in shared memory
+        // for numerical stability, so shared mem is always 4 bytes/element.
+        let shared_mem = (block_dim + head_dim as u32) * 4;
 
         let num_heads_i32 = num_heads as i32;
         let num_kv_heads_i32 = num_kv_heads as i32;
@@ -1854,9 +1858,18 @@ impl Backend for CudaBackend {
         let max_blocks_i32 = meta.max_blocks_per_seq as i32;
         let kv_dim_i32 = meta.kv_dim as i32;
 
-        // Reconstruct device pointers from raw u64 values.
-        // SAFETY: The caller (GpuPagedKvCache) guarantees these pointers are valid
-        // GPU device pointers that will remain valid through this kernel launch.
+        // Raw u64 device pointers from PagedAttentionMeta.
+        //
+        // SAFETY: These are valid CUDA device addresses (64-bit unsigned integers)
+        // guaranteed by GpuPagedKvCache:
+        //   - Pool pointers: cached at construction, valid for cache lifetime.
+        //   - Block tables / kv_lens: backed by Arc<CudaSlice<i32>> in the meta's
+        //     _keepalive fields — memory stays valid until meta is dropped.
+        //
+        // cudarc's PushKernelArg for &u64 pushes the raw 8 bytes, which the CUDA
+        // kernel interprets as a typed device pointer (const float*, const int*, etc.).
+        // This is correct on 64-bit platforms where sizeof(pointer) == sizeof(u64),
+        // enforced by the compile-time assertion in gpu_paged_cache.rs.
         let block_tables_ptr = meta.block_tables_ptr;
         let kv_lens_ptr = meta.kv_lens_ptr;
         let k_pool_ptr = meta.k_pool_ptr;
