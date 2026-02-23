@@ -1648,6 +1648,19 @@ impl Backend for CudaBackend {
         if num_seqs == 0 {
             return self.allocate(&[0, num_heads * head_dim], q.dtype());
         }
+        if v_caches.len() != num_seqs {
+            return Err(ForgeError::InvalidArgument(format!(
+                "k_caches.len()={} != v_caches.len()={}",
+                num_seqs,
+                v_caches.len()
+            )));
+        }
+        if q.shape()[0] != num_seqs {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![num_seqs, num_heads * head_dim],
+                got: q.shape().to_vec(),
+            });
+        }
 
         // Build pointer tables and kv_lens on host.
         // device_ptr() returns (CUdeviceptr, SyncOnDrop). CUdeviceptr is u64.
@@ -1674,7 +1687,7 @@ impl Backend for CudaBackend {
                     kv_lens_host.push(k_caches[i].shape()[0] as i32);
                 }
             }
-            _ => {
+            DType::F32 => {
                 for i in 0..num_seqs {
                     let k_slice = k_caches[i].f32_slice()?;
                     let v_slice = v_caches[i].f32_slice()?;
@@ -1687,6 +1700,7 @@ impl Backend for CudaBackend {
                     kv_lens_host.push(k_caches[i].shape()[0] as i32);
                 }
             }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
         }
 
         // Upload pointer tables and kv_lens to GPU
