@@ -690,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "forge-core",
+ "forge-flash",
  "forge-kernels",
  "half",
 ]
