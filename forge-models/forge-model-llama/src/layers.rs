@@ -128,7 +128,13 @@ impl<B: Backend> LlamaAttention<B> {
         let v_4d = backend.reshape(&v_full, &[1, kv_len, self.num_kv_heads, self.head_dim])?;
 
         // Compute attention with Q over full K,V (including cached)
-        let attn_out = self.compute_attention(&q, &k_4d, &v_4d, seq_len, kv_len, backend)?;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let is_causal = seq_len > 1;
+        let attn_out = backend.multi_head_attention(
+            &q, &k_4d, &v_4d,
+            self.num_heads, self.num_kv_heads, self.head_dim,
+            scale, is_causal,
+        )?;
 
         // Cast attention output to match weight dtype (naive attention produces F32,
         // but weights may be F16). FlashAttention will natively produce matching dtype.
@@ -205,62 +211,6 @@ impl<B: Backend> LlamaAttention<B> {
         backend.matmul(&attn_out, &self.wo)
     }
 
-    /// Compute scaled dot-product attention per head (GPU-native, no CPU copies).
-    ///
-    /// Q: [1, seq_len, num_heads, head_dim]
-    /// K: [1, kv_len, num_kv_heads, head_dim]
-    /// V: [1, kv_len, num_kv_heads, head_dim]
-    ///
-    /// Returns: [seq_len, num_heads * head_dim]
-    fn compute_attention(
-        &self,
-        q: &B::Tensor,
-        k: &B::Tensor,
-        v: &B::Tensor,
-        seq_len: usize,
-        kv_len: usize,
-        backend: &B,
-    ) -> Result<B::Tensor> {
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let heads_per_group = self.num_heads / self.num_kv_heads;
-
-        // Reshape to 3D for extract_head: strip batch dim (always 1)
-        let q = backend.reshape(q, &[seq_len, self.num_heads, self.head_dim])?;
-        let k = backend.reshape(k, &[kv_len, self.num_kv_heads, self.head_dim])?;
-        let v = backend.reshape(v, &[kv_len, self.num_kv_heads, self.head_dim])?;
-
-        let mut head_outputs = Vec::with_capacity(self.num_heads);
-
-        for h in 0..self.num_heads {
-            let kv_h = h / heads_per_group;
-
-            // Extract per-head slices — GPU-native, no CPU copies
-            let q_head = backend.extract_head(&q, seq_len, self.num_heads, self.head_dim, h)?;
-            let k_head =
-                backend.extract_head(&k, kv_len, self.num_kv_heads, self.head_dim, kv_h)?;
-            let v_head =
-                backend.extract_head(&v, kv_len, self.num_kv_heads, self.head_dim, kv_h)?;
-
-            // scores = Q @ K^T * scale
-            let k_t = backend.transpose(&k_head, 0, 1)?;
-            let scores = backend.matmul(&q_head, &k_t)?;
-            let scores = backend.mul_scalar(&scores, scale)?;
-
-            // Apply causal mask for prefill (seq_len > 1)
-            let scores = if seq_len > 1 {
-                backend.apply_causal_mask(&scores, seq_len, kv_len)?
-            } else {
-                scores
-            };
-
-            let attn = backend.softmax(&scores, -1)?;
-            head_outputs.push(backend.matmul(&attn, &v_head)?);
-        }
-
-        // Interleave per-head outputs → [seq_len, num_heads * head_dim]
-        let refs: Vec<&B::Tensor> = head_outputs.iter().collect();
-        backend.interleave_heads(&refs, seq_len, self.head_dim)
-    }
 }
 
 /// A single Llama decoder layer (attention + MLP with residual connections).
