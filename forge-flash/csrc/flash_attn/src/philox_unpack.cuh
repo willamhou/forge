@@ -7,7 +7,7 @@
 #include <tuple>
 #include <cstdint>
 namespace at { namespace cuda { namespace philox {
-inline std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState const& state) {
+__host__ __device__ inline std::tuple<uint64_t, uint64_t> unpack(at::PhiloxCudaState const& state) {
     return {state.seed_, state.offset_};
 }
 }}} // namespace at::cuda::philox
