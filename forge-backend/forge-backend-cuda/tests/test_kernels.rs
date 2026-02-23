@@ -333,3 +333,133 @@ fn test_attention_fwd_f16_fallback() {
         );
     }
 }
+
+/// Test that `multi_head_attention` Backend method routes through attention_fwd
+/// and produces output matching naive attention (reshaped to 2D).
+#[test]
+fn test_multi_head_attention_matches_naive() {
+    let backend = CudaBackend::new(0).unwrap();
+    // Q: [1, 2, 2, 4], K/V: [1, 3, 2, 4]
+    let q_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+    let q = backend
+        .copy_from_host_f32(&q_data, &[1, 2, 2, 4])
+        .unwrap();
+
+    let k_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.05).collect();
+    let k = backend
+        .copy_from_host_f32(&k_data, &[1, 3, 2, 4])
+        .unwrap();
+    let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02 + 0.1).collect();
+    let v = backend
+        .copy_from_host_f32(&v_data, &[1, 3, 2, 4])
+        .unwrap();
+
+    let scale = 1.0 / (4.0_f32).sqrt();
+
+    // Via Backend trait method (routes through attention_fwd → naive)
+    let mha_out = backend
+        .multi_head_attention(&q, &k, &v, 2, 2, 4, scale, true)
+        .unwrap();
+
+    // Via direct attention_fwd + manual reshape
+    let fwd_out = attention_fwd(&backend, &q, &k, &v, scale, true).unwrap();
+    let fwd_flat = backend.reshape(&fwd_out, &[2, 8]).unwrap();
+
+    assert_eq!(mha_out.shape(), &[2, 8]);
+    let mha_data = backend.copy_to_host_f32(&mha_out).unwrap();
+    let fwd_data = backend.copy_to_host_f32(&fwd_flat).unwrap();
+
+    for (i, (&a, &b)) in mha_data.iter().zip(fwd_data.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-5,
+            "multi_head_attention vs attention_fwd mismatch at {i}: {a} vs {b}"
+        );
+    }
+}
+
+/// Test GQA config through multi_head_attention on CUDA.
+#[test]
+fn test_multi_head_attention_gqa_cuda() {
+    let backend = CudaBackend::new(0).unwrap();
+    // GQA: num_heads=4, num_kv_heads=2
+    let q_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
+    let q = backend
+        .copy_from_host_f32(&q_data, &[1, 1, 4, 4])
+        .unwrap();
+
+    let k_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.05).collect();
+    let k = backend
+        .copy_from_host_f32(&k_data, &[1, 3, 2, 4])
+        .unwrap();
+    let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02 + 0.1).collect();
+    let v = backend
+        .copy_from_host_f32(&v_data, &[1, 3, 2, 4])
+        .unwrap();
+
+    let scale = 1.0 / (4.0_f32).sqrt();
+    let result = backend
+        .multi_head_attention(&q, &k, &v, 4, 2, 4, scale, false)
+        .unwrap();
+
+    // Output: [1, 4*4] = [1, 16]
+    assert_eq!(result.shape(), &[1, 16]);
+}
+
+/// FA2-vs-naive correctness test (only runs with flash-attn feature).
+#[test]
+#[cfg(feature = "flash-attn")]
+fn test_flash_attn_matches_naive_f16() {
+    use forge_core::DType;
+
+    let backend = CudaBackend::new(0).unwrap();
+
+    let seq_len = 32;
+    let kv_len = 32;
+    let num_heads = 4;
+    let num_kv_heads = 2;
+    let head_dim = 64;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q_data: Vec<f32> = (0..seq_len * num_heads * head_dim)
+        .map(|i| ((i as f32 * 0.017) % 1.0) - 0.5)
+        .collect();
+    let k_data: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i as f32 * 0.013) % 1.0) - 0.5)
+        .collect();
+    let v_data: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i as f32 * 0.011) % 1.0) - 0.5)
+        .collect();
+
+    let q = backend
+        .copy_from_host_f32(&q_data, &[1, seq_len, num_heads, head_dim])
+        .unwrap();
+    let k = backend
+        .copy_from_host_f32(&k_data, &[1, kv_len, num_kv_heads, head_dim])
+        .unwrap();
+    let v = backend
+        .copy_from_host_f32(&v_data, &[1, kv_len, num_kv_heads, head_dim])
+        .unwrap();
+
+    // Naive attention (always available)
+    let naive_out = naive_attention(&backend, &q, &k, &v, scale).unwrap();
+    let naive_flat = backend
+        .reshape(&naive_out, &[seq_len, num_heads * head_dim])
+        .unwrap();
+    let naive_host = backend.copy_to_host_f32(&naive_flat).unwrap();
+
+    // FA2 via multi_head_attention (feature-gated dispatch)
+    let fa2_out = backend
+        .multi_head_attention(&q, &k, &v, num_heads, num_kv_heads, head_dim, scale, true)
+        .unwrap();
+    let fa2_host = backend.copy_to_host_f32(&fa2_out).unwrap();
+
+    for i in 0..fa2_host.len() {
+        assert!(
+            (fa2_host[i] - naive_host[i]).abs() < 1e-2,
+            "FA2 vs naive mismatch at {i}: fa2={} naive={} diff={}",
+            fa2_host[i],
+            naive_host[i],
+            (fa2_host[i] - naive_host[i]).abs()
+        );
+    }
+}

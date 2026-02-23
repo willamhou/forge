@@ -1634,6 +1634,27 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn multi_head_attention(
+        &self,
+        q: &CudaTensor,
+        k: &CudaTensor,
+        v: &CudaTensor,
+        num_heads: usize,
+        _num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        is_causal: bool,
+    ) -> Result<CudaTensor> {
+        let seq_len = q.shape()[1];
+
+        // Route through attention_fwd (FA2 when feature enabled, naive otherwise)
+        let result_4d =
+            crate::flash_attention::attention_fwd(self, q, k, v, scale, is_causal)?;
+
+        // Flatten from [1, seq_len, num_heads, head_dim] → [seq_len, num_heads * head_dim]
+        self.reshape(&result_4d, &[seq_len, num_heads * head_dim])
+    }
+
     fn batched_decode_attention(
         &self,
         q: &CudaTensor,

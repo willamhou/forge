@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+flash-attn = ["dep:forge-flash"]
+
 [dependencies]
 forge-core.workspace = true
 forge-kernels.workspace = true
 cudarc = { version = "0.17", features = ["cublas", "nvrtc", "f16", "cuda-version-from-build-system"] }
 half.workspace = true
+forge-flash = { workspace = true, optional = true }

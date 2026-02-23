@@ -12,6 +12,7 @@ members = [
     "forge-models/forge-model-llama",
     "forge-loader",
     "forge-kernels",
+    "forge-flash",
     "forge-transport",
     "forge-quantize",
 ]
@@ -33,6 +34,7 @@ forge-kvcache = { path = "forge-kvcache" }
 forge-model-llama = { path = "forge-models/forge-model-llama" }
 forge-loader = { path = "forge-loader" }
 forge-kernels = { path = "forge-kernels" }
+forge-flash = { path = "forge-flash" }
 forge-transport = { path = "forge-transport" }
 forge-quantize = { path = "forge-quantize" }
 
