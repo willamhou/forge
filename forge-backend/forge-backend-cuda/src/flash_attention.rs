@@ -79,6 +79,11 @@ fn flash_attn_dispatch(
             let v = backend.cast(v, DType::F16)?;
             (q, k, v, forge_flash::FlashDType::F16)
         }
+        dt => {
+            return Err(ForgeError::InvalidArgument(format!(
+                "FA2 requires F16/BF16/F32, got {dt:?}"
+            )));
+        }
     };
 
     // Allocate output tensor (same shape + dtype as Q after cast)
