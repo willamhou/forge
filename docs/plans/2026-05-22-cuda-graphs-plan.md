@@ -8,7 +8,7 @@
 
 **Strategy:** Bottom-up. Land the prerequisites (stream fix, paged attention kernel) before touching graph capture. Every task is independently shippable, gated behind `--cuda-graph` (default off until Task 8 flips it on).
 
-**Order of operations:** 0 → 1 (spike, then continue or pivot) → 2 → 3 → 4 → 5 → 6 → 7 → 8.
+**Order of operations:** 0 → 1 (spike, then continue or pivot) → 2 → **2.5** → 3 → 4 → 5 → 6 → 7 → 8. Task 2.5 was added 2026-05-23 after the Task 1 spike (commit 6ecf839) surfaced that Backend's per-op `alloc_zeros` makes capture impossible regardless of the rest of the plan.
 
 ---
 
@@ -36,9 +36,8 @@ The FA2 wrapper currently passes `stream_ptr = 0` (default stream). For CUDA Gra
 Before committing to the plan, confirm cudarc 0.17 exposes everything we need. If it doesn't, this task pivots the design (raw FFI fallback or wait for cudarc upgrade).
 
 **What to verify:**
-- `stream.begin_capture(mode)` + `stream.end_capture() -> CudaGraph` works
-- `CudaGraph::instantiate() -> CudaGraphExec` is callable
-- `CudaGraphExec::launch(&stream)` re-runs the captured kernels
+- `stream.begin_capture(mode)` + `stream.end_capture(flags) -> Result<Option<CudaGraph>>` works (cudarc 0.17.8 folds instantiation into `end_capture` — no separate `CudaGraphExec` type)
+- `CudaGraph::launch()` re-runs the captured kernels (no stream arg — the graph remembers the stream it was captured on)
 - A captured graph that includes a cuBLAS GEMM (via `CudaBlas` on the same stream) actually replays the GEMM
 - Persistent device buffer + memcpy from host *before* graph launch updates the contents seen by the next replay
 
@@ -50,6 +49,13 @@ Before committing to the plan, confirm cudarc 0.17 exposes everything we need. I
 - ❌ Fundamental gap → stop, write a 1-pager on alternatives, return to design
 
 **No commit unless decision gate ✅ or ⚠️.** If the spike fails, file the example as `examples/graph_spike.rs.disabled` and update this plan.
+
+**Findings absorbed from the actual spike (2026-05-23, commit 6ecf839):** decision gate was ✅ GREEN with two non-obvious gotchas that Task 2/3 must apply:
+
+1. `ctx.default_stream()` returns the NULL/legacy stream (literally `cu_stream: null_mut()`); CUDA Graphs **cannot capture the NULL stream**. Task 2's first change is `CudaBackend::new` → `ctx.new_stream()`. Every call site that depends on default-stream's implicit device-wide sync needs an explicit `synchronize()` audit.
+2. cudarc's safe `launch_builder.arg(&mut CudaSlice)` auto-records `cuStreamWaitEvent` deps in multi-stream mode. These reference events from outside the capture region and trip `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. Call `unsafe { ctx.disable_event_tracking() }` before any capture-bound op (per-context, permanent — multi-stream callers lose cudarc's auto-sync and must order ops via the graph topology themselves).
+
+Additional issues found by review (Claude + Codex) that the spike does not in fact cover and Task 2/3 must address rather than inherit the GREEN gate uncritically: (a) the spike pre-allocates all buffers outside capture but production `Backend` ops call `alloc_zeros` per op — cudaMalloc-in-capture is illegal, so Task 2.5 below adds a persistent-output-buffer migration; (b) the spike uses `CU_STREAM_CAPTURE_MODE_RELAXED`, not `GLOBAL`, so capture-mode strictness is not yet validated; (c) FA2 (`forge_flash::flash_fwd`) is not captured at all in the spike and may issue its own cudaMalloc/cudaEventRecord; Task 2 should add a FA2-in-capture sub-spike before relying on attention being graph-compatible.
 
 ---
 
@@ -99,6 +105,33 @@ Default to A. B is the fallback if FA2 varlen turns out to require contiguous KV
 
 ---
 
+## Task 2.5: Capture-safe Backend ops (persistent output pool + cuBLAS workspace)
+
+`CudaMalloc` is illegal during stream capture. Today every `Backend` op (`matmul`, `rms_norm`, `add`, `mul`, ~60 sites in `forge-backend-cuda/src/backend.rs`) ends with `self.stream.alloc_zeros::<T>(numel)` to produce its output tensor. Wrapping decode forward in `begin_capture/end_capture` therefore fails at the first op, regardless of whether Task 3 / 4 are correct.
+
+Likewise, cuBLAS GEMM allocates a per-handle workspace lazily on first call. The Task 1 spike got away with capturing a GEMM only because Stage A had pre-warmed the workspace — production capture-first runs would fail with `STREAM_CAPTURE_UNSUPPORTED` on a `cudaMalloc` inside cuBLAS.
+
+**Files:**
+- Modify: `forge-core/src/backend.rs` — extend `Backend` trait so hot ops accept a caller-owned `out` tensor (e.g. add `matmul_into`, `add_into`, etc., or a single `with_output` adapter). Keep the existing alloc-returning variants for code outside capture; mark them `#[deprecated]` to surface remaining alloc-in-hot-path call sites at compile time.
+- Modify: `forge-backend/forge-backend-cuda/src/backend.rs` — add `cublasSetWorkspace` on a backend-owned `CudaSlice<u8>` (size from `cublasGetCudartVersion`-keyed table; 32 MiB is a safe default for modern Ampere/Blackwell) in `CudaBackend::new`. Implement the `_into` variants by skipping the trailing `alloc_zeros` and writing directly to the caller's tensor.
+- Modify: `forge-backend/forge-backend-cpu/src/backend.rs` — naive `_into` impls (just a copy into the out tensor). No perf concern.
+- Modify: `forge-models/forge-model-llama/src/{lib,attention,mlp}.rs` — migrate decode-path call sites to `_into` variants, threading through a per-layer set of persistent intermediates owned by `LlamaForward`. Prefill / one-shot paths can stay on the alloc-returning variants for now.
+- Modify: `forge-backend/forge-backend-cuda/src/flash_attention.rs` — same treatment for `multi_head_attention` and FA2 output buffer. The FA2 C++ side may need a workspace patch; investigate as part of this task.
+- Test: `forge-backend/forge-backend-cuda/tests/test_capture_safe_ops.rs` — wrap each migrated op inside `begin_capture/end_capture` and assert `end_capture` returns `Ok(Some(_))` with no allocator panic.
+
+**Steps:**
+1. Land `cublasSetWorkspace` in `CudaBackend::new` (single commit, no semantics change for non-capture path).
+2. Add the `_into` trait methods and CUDA/CPU impls for the **decode** hot set: `matmul`, `matmul_f16`, `rms_norm{_f16}`, `add{_f16}`, `mul{_f16}`, `softmax{_f16}`, `silu{_f16}`, `rope{_f16}`, `multi_head_attention`. Keep prefill ops on the legacy alloc-returning path.
+3. Migrate `forge-model-llama` decode forward to use `_into` variants. `LlamaForward` (new or extended) owns the per-layer persistent activation buffers; allocated once at first decode step.
+4. Per-op capture test for each migrated op.
+5. Commit: `feat: capture-safe Backend ops (persistent output buffers + cuBLAS workspace)`.
+
+**Definition of done:** every Backend op the decode hot path touches can be issued inside `begin_capture/end_capture` on a real `CudaBackend` without invalidating the capture or hitting `STREAM_CAPTURE_UNSUPPORTED`. Test file demonstrates this op-by-op.
+
+**Risk:** medium — invasive to the model code, but the migration is mechanical and each op is testable in isolation. Estimate 3–4 days. **This task gates Task 3 and Task 4 entirely; doing Task 3 first would just hit `cudaMalloc-during-capture` and have to be rolled back.**
+
+---
+
 ## Task 3: `CudaGraphCache` infrastructure
 
 Capture/replay framework. No engine integration yet — purely a library.
@@ -108,7 +141,7 @@ Capture/replay framework. No engine integration yet — purely a library.
 - Modify: `forge-backend/forge-backend-cuda/src/lib.rs` — `pub mod cuda_graph`
 - Modify: `forge-backend/forge-backend-cuda/Cargo.toml` — no new deps
 
-**API sketch:**
+**API sketch (aligned to cudarc 0.17.8's actual surface — `CudaGraph` already holds both the captured graph and its instantiated exec; no separate `CudaGraphExec` type):**
 
 ```rust
 pub struct CudaGraphCache {
@@ -118,7 +151,7 @@ pub struct CudaGraphCache {
 }
 
 struct CapturedGraph {
-    exec: CudaGraphExec,
+    graph: CudaGraph,    // cudarc 0.17.8 — already owns cu_graph + cu_graph_exec, RAII drop
     // Persistent input/output buffers, owned by the cache.
     // Populated in Task 5; placeholder here.
 }
@@ -139,8 +172,8 @@ impl CudaGraphCache {
 ```
 
 **Steps:**
-1. Implement `run_or_capture`: on cache miss, `stream.begin_capture(StreamCaptureMode::Global)` → run `fwd` → `stream.end_capture()` → `graph.instantiate()` → insert into `graphs` → `exec.launch(&stream)`. On hit, just `exec.launch(&stream)`.
-2. Implement `Drop` for `CapturedGraph` that releases the exec (cudarc handles via RAII; verify in spike).
+1. Implement `run_or_capture`: on cache miss, `stream.begin_capture(CU_STREAM_CAPTURE_MODE_GLOBAL)` → run `fwd` → `stream.end_capture(flags)?.ok_or(...)?` (returns `CudaGraph`, already instantiated) → insert into `graphs` → `graph.launch()`. On hit, just `graph.launch()`. **Precondition** (per Task 1 findings): `ctx.disable_event_tracking()` and `ctx.new_stream()` must already be in effect from `CudaBackend::new`; if not, capture invalidates. For the `flags` argument cudarc exposes no `_NONE` variant; pass `CUDA_GRAPH_INSTANTIATE_FLAG_UPLOAD` (a pure latency optimization, no semantic effect) or call `cudarc::driver::result::graph::instantiate` directly with `0u32`.
+2. Implement `Drop` for `CapturedGraph` if extra fields need cleanup; the inner `CudaGraph` already RAII-releases cu_graph and cu_graph_exec (see cudarc-0.17.8/src/driver/safe/graph.rs:21).
 3. Test (`tests/test_cuda_graph.rs`): capture a simple add+mul kernel sequence, replay 5 times, compare output vs uncaptured launches. Test with cuBLAS GEMM inside capture.
 4. Commit: `feat: CudaGraphCache for per-bucket graph capture and replay`.
 
@@ -316,13 +349,14 @@ Confirm we hit the perf target before flipping the default.
 | 0. Stream plumbing fix | — | 0.5 day | Low |
 | 1. cudarc Graph API spike | 0 | 1 day | High (gating) |
 | 2. Paged attention kernel | 0 | 4–5 days | Medium |
-| 3. `CudaGraphCache` | 1 | 2 days | Low |
-| 4. `DecodeGraphRunner` + engine wiring | 2, 3 | 2 days | Medium |
+| 2.5. Capture-safe Backend ops | 2 | 3–4 days | Medium (gates 3 & 4) |
+| 3. `CudaGraphCache` | 1, 2.5 | 2 days | Low |
+| 4. `DecodeGraphRunner` + engine wiring | 2.5, 3 | 2 days | Medium |
 | 5. Persistent buffers | 4 | 2 days | Medium |
 | 6. CLI surface | 5 | 0.5 day | Low |
 | 7. Padding & bucket promotion | 5 | 1.5 days | Medium |
 | 8. Perf validation + default flip | 7, vLLM benchmark script | 1 day | Low (gates on data) |
 
-**Total:** ~2.5 weeks if no spike pivots are needed. The hard time-box on Task 1 keeps the plan honest.
+**Total:** ~3 weeks (was ~2.5 before Task 2.5 was added). The hard time-box on Task 1 keeps the plan honest.
 
 **Rollout strategy:** Default off through Tasks 2–7. Only Task 8 changes user-facing behavior, and only if perf gate passes. This keeps `main` shippable at every commit.
