@@ -46,6 +46,7 @@ Forge is a Rust workspace with 13 crates:
 |--------|-------|-------------|
 | `scripts/test_server.sh` | `bash scripts/test_server.sh /path/to/model [port]` | E2E integration test: health, models, non-streaming, streaming |
 | `scripts/benchmark.sh` | `bash scripts/benchmark.sh /path/to/model [num_requests] [max_tokens] [port]` | Performance benchmark: TTFT, ITL, throughput |
+| `scripts/benchmark_vllm.sh` | `bash scripts/benchmark_vllm.sh /path/to/model [served-name]` | Side-by-side benchmark vs vLLM 0.18; writes markdown report to `.reports/` |
 
 ## Build Commands
 
