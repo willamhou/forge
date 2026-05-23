@@ -106,8 +106,15 @@ fn flash_attn_dispatch(
         _ => return Err(ForgeError::InvalidArgument("FA2 requires F16/BF16".into())),
     };
 
-    // Default stream (0); TODO: extract from backend.stream
-    let stream_ptr: u64 = 0;
+    // Execute FA2 on the same stream the backend launches its own kernels
+    // on. Required for two reasons:
+    //   (1) ordering — FA2 ops must serialize against the casts and the
+    //       allocator/copy ops that produced q/k/v/out on backend.stream,
+    //   (2) CUDA Graph capture — when we wrap decode in begin_capture /
+    //       end_capture (see docs/plans/2026-05-22-cuda-graphs-plan.md),
+    //       only ops issued on the captured stream are recorded.
+    // Raw-ptr → integer goes through usize per Rust cast rules.
+    let stream_ptr = backend.stream.cu_stream() as usize as u64;
 
     unsafe {
         forge_flash::flash_fwd(

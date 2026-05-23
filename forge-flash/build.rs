@@ -1,7 +1,9 @@
 /// Build script for forge-flash.
 ///
 /// Compiles vendored FlashAttention v2 CUDA sources using `cc::Build`.
-/// Requires CUDA toolkit with nvcc for SM80 (Ampere) + SM90 (Hopper).
+/// Targets SM80 (Ampere), SM90 (Hopper), and SM120 (Blackwell).
+/// SM120 embeds PTX so the driver JITs forward to sm_121 (GB10) and any
+/// future 12.x silicon. Requires CUDA 13.0+ for sm_120.
 fn main() {
     println!("cargo:rerun-if-changed=csrc/");
 
@@ -26,6 +28,11 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cuda(true)
+        // FA2 + CUTLASS templates expand to GB-scale memory under -G; the
+        // OOM killer reaps parallel nvcc. Always build kernels optimized,
+        // independent of the host cargo profile.
+        .debug(false)
+        .opt_level(3)
         .file("csrc/flash_api_forge.cu")
         .include("csrc/flash_attn/src")
         .include("csrc/flash_attn")
@@ -34,6 +41,7 @@ fn main() {
         .define("FORGE_NO_PYTORCH", None)
         .flag("-gencode=arch=compute_80,code=sm_80")
         .flag("-gencode=arch=compute_90,code=sm_90")
+        .flag("-gencode=arch=compute_120,code=[compute_120,sm_120]")
         .flag("-O3")
         .flag("--use_fast_math")
         .flag("-std=c++17")
