@@ -109,10 +109,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zeros_host: Vec<f32> = vec![0.0; N];
     let fives_host: Vec<f32> = vec![5.0; N];
 
-    // cudarc 0.17.8's bindgen omits the implicit CUDA_GRAPH_INSTANTIATE_FLAG_NONE
-    // (=0) variant; flags are u32 bit-or values. Transmute 0 to get default
-    // instantiation. Upstream issue worth filing for a NONE alias.
-    let none_flag: CUgraphInstantiate_flags = unsafe { std::mem::transmute::<u32, _>(0) };
+    // cudarc 0.17.8's bindgen has no _NONE (=0) variant; transmuting 0 into
+    // a #[repr(u32)] enum is UB. UPLOAD (=2) would be a no-op semantically
+    // but needs the WithParams API to supply an upload stream — passing it
+    // through cudarc's plain end_capture returns CUDA_ERROR_INVALID_VALUE.
+    // AUTO_FREE_ON_LAUNCH (=1) only affects graph-internal allocations,
+    // which our captured ops never make, so it is a genuine no-op here.
+    let instantiate_flag = CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 
     // ===== Stage A: uncaptured baseline (kernels + GEMM) =====
     stream.memcpy_htod(&zeros_host, &mut buf)?;
@@ -135,30 +138,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
     let cap_kernels_err =
         run_kernels(&stream, &inc, &mul, &scale, &mut buf, kernel_cfg, n_i32, scale_value);
-    let graph_kernels_opt = stream.end_capture(none_flag)?;
+    let graph_kernels_result = stream.end_capture(instantiate_flag);
+    // Check dispatch failure FIRST so the diagnostic is the real cause,
+    // not the downstream STREAM_CAPTURE_INVALIDATED that end_capture would surface.
     if let Err(e) = cap_kernels_err {
         return red(&format!("kernel dispatch failed inside capture: {e}"));
     }
-    let graph_kernels = graph_kernels_opt
+    let graph_kernels = graph_kernels_result?
         .ok_or("end_capture returned None for kernels-only capture")?;
     println!("[B captureK ] kernel-only capture ok");
 
-    // Replay REPLAYS× with H2D-reset before each launch
-    let t = Instant::now();
+    // Replay REPLAYS× with H2D-reset before each launch. Separately measure
+    // pure graph-launch overhead (the timer-only loop) vs. with-H2D overhead
+    // so the reported number is not conflated, and compare against an
+    // equivalent direct-launch loop to surface a regression if one exists.
+    let t_replay_only = Instant::now();
     for _ in 0..REPLAYS {
-        stream.memcpy_htod(&zeros_host, &mut buf)?;
         graph_kernels.launch()?;
     }
     stream.synchronize()?;
-    let replay_us_each = t.elapsed().as_micros() as f64 / REPLAYS as f64;
+    let replay_only_us = t_replay_only.elapsed().as_micros() as f64 / REPLAYS as f64;
+
+    let t_direct = Instant::now();
+    for _ in 0..REPLAYS {
+        stream.memcpy_htod(&zeros_host, &mut buf)?;
+        run_kernels(&stream, &inc, &mul, &scale, &mut buf, kernel_cfg, n_i32, scale_value)?;
+    }
+    stream.synchronize()?;
+    let direct_us = t_direct.elapsed().as_micros() as f64 / REPLAYS as f64;
+
+    // Final correctness check: reset, launch graph once, validate ALL elements.
+    stream.memcpy_htod(&zeros_host, &mut buf)?;
+    graph_kernels.launch()?;
+    stream.synchronize()?;
     let replay_buf: Vec<f32> = stream.memcpy_dtov(&buf)?;
-    let kernels_match = (replay_buf[0] - baseline_buf[0]).abs() < 1e-5;
+    let kernels_match = replay_buf
+        .iter()
+        .zip(&baseline_buf)
+        .all(|(r, b)| (r - b).abs() < 1e-5);
     println!(
-        "[B replay×{:>3}] buf[0]={:.6} (expect {:.6})  avg {:.1} µs/replay",
-        REPLAYS, replay_buf[0], baseline_buf[0], replay_us_each,
+        "[B replay×{:>3}] buf[0..2]={:?}  graph-only {:.1} µs  direct-equiv {:.1} µs",
+        REPLAYS, &replay_buf[0..2], replay_only_us, direct_us,
     );
     if !kernels_match {
-        return red("replayed kernel-only graph diverges from baseline");
+        return red("replayed kernel-only graph diverges from baseline (full-buf check)");
     }
 
     // ===== Stage C: H2D-before-replay updates inputs =====
@@ -166,15 +189,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     graph_kernels.launch()?;
     stream.synchronize()?;
     let updated: Vec<f32> = stream.memcpy_dtov(&buf)?;
+    let updated_all_match = updated
+        .iter()
+        .all(|&v| (v - EXPECTED_INPUT_5).abs() < 1e-5);
     println!(
-        "[C h2d→replay] buf[0]={:.6} (expect {:.6} from input=5.0)",
-        updated[0], EXPECTED_INPUT_5,
+        "[C h2d→replay] buf[0..2]={:?} (expect {:.6} for every element)",
+        &updated[0..2], EXPECTED_INPUT_5,
     );
-    if (updated[0] - EXPECTED_INPUT_5).abs() > 1e-5 {
-        return red("H2D memcpy before launch did not propagate into next replay");
+    if !updated_all_match {
+        return red("H2D memcpy before launch did not propagate to every element");
     }
 
     // ===== Stage D: capture kernels + cuBLAS GEMM =====
+    // Establish independent ground truth for the GEMM so we don't just compare
+    // baseline-vs-replay (which a no-op replay would also satisfy).
+    let host_zero_gemm = vec![0.0_f32; GEMM_DIM * GEMM_DIM];
+    let expected_gemm = &host_arange; // identity × arange (col-major) = arange
+
     stream.memcpy_htod(&zeros_host, &mut buf)?;
     stream.synchronize()?;
     stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
@@ -183,40 +214,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { blas.gemm(gemm_cfg, &gemm_a, &gemm_b, &mut gemm_c)? };
         Ok(())
     })();
-    let graph_full_opt = stream.end_capture(none_flag)?;
-
+    let graph_full_result = stream.end_capture(instantiate_flag);
+    // Surface dispatch error before end_capture's downstream symptom.
     if let Err(e) = cap_full_err {
         return yellow(&format!(
             "kernels capture OK but cuBLAS GEMM cannot be captured: {e}. \
-             Task 2 path: pre-allocate cuBLAS workspace via cublasSetWorkspace \
-             before capture, or fall back to a custom GEMM kernel for the \
-             decode hot path.",
+             Task 2.5 path: pre-allocate cuBLAS workspace via \
+             cublasSetWorkspace before capture, or fall back to a custom \
+             GEMM kernel for the decode hot path.",
         ));
     }
-    let graph_full = match graph_full_opt {
-        Some(g) => g,
-        None => {
-            return yellow(
-                "GEMM dispatch returned Ok but end_capture produced no graph — \
-                 cuBLAS likely poisoned the capture stream silently",
-            );
-        }
-    };
-    stream.memcpy_htod(&zeros_host, &mut buf)?;
-    graph_full.launch()?;
+    let graph_full = graph_full_result?.ok_or_else(|| -> Box<dyn std::error::Error> {
+        "GEMM dispatch returned Ok but end_capture produced no graph — \
+         cuBLAS likely poisoned the capture stream silently"
+            .into()
+    })?;
+
+    // Replay REPLAYS×; reset BOTH buf and gemm_c before each launch so a
+    // missing/dropped GEMM node cannot pass by re-reading stale baseline state.
+    // (The original spike only reset buf and got false-positives from the
+    // Stage A baseline lingering in gemm_c.)
+    for _ in 0..REPLAYS {
+        stream.memcpy_htod(&zeros_host, &mut buf)?;
+        stream.memcpy_htod(&host_zero_gemm, &mut gemm_c)?;
+        graph_full.launch()?;
+    }
     stream.synchronize()?;
-    let rgemm: Vec<f32> = stream.memcpy_dtov(&gemm_c)?;
-    let gemm_replay_match = rgemm
+    let final_buf: Vec<f32> = stream.memcpy_dtov(&buf)?;
+    let final_gemm: Vec<f32> = stream.memcpy_dtov(&gemm_c)?;
+
+    let buf_match = final_buf
+        .iter()
+        .all(|v| (v - EXPECTED_BUF).abs() < 1e-5);
+    let gemm_vs_baseline = final_gemm
         .iter()
         .zip(&baseline_gemm)
         .all(|(r, b)| (r - b).abs() < 1e-5);
-    if !gemm_replay_match {
+    let gemm_vs_ground_truth = final_gemm
+        .iter()
+        .zip(expected_gemm.iter())
+        .all(|(r, b)| (r - b).abs() < 1e-5);
+    if !buf_match {
         return yellow(
-            "GEMM captured ok but the replayed output differs from the \
-             uncaptured baseline — investigate before trusting in production",
+            "Stage D combined-capture: kernel side diverged from EXPECTED_BUF \
+             on at least one element — capture may have reordered or dropped \
+             a kernel node",
         );
     }
-    println!("[D capture+G] cuBLAS GEMM captured & replayed ok");
+    if !gemm_vs_baseline || !gemm_vs_ground_truth {
+        return yellow(
+            "Stage D combined-capture: GEMM did not produce the expected \
+             arange — either capture dropped the gemm node (would leave \
+             gemm_c at zeros), or layout/config drift exists",
+        );
+    }
+    println!(
+        "[D capture+G×{:>3}] buf[0..2]={:?}  gemm[0..4]={:?}",
+        REPLAYS, &final_buf[0..2], &final_gemm[0..GEMM_DIM],
+    );
     println!();
     println!("✅ Task 1 decision gate = GREEN — all stages pass, proceed to Task 2.");
     Ok(())
