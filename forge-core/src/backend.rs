@@ -23,6 +23,84 @@ pub trait Backend: Send + Sync + 'static {
     // Core ops
     fn matmul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn add(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Matrix multiply, writing into a caller-provided output buffer.
+    ///
+    /// `a`: `[m, k]`, `b`: `[k, n]`, `out`: `[m, n]`; out dtype must match
+    /// a/b dtype.
+    ///
+    /// Used by the engine's persistent-buffer + CUDA-Graph capture path
+    /// (Task 5+) where the captured kernel's output arg must point at a
+    /// stable device address. CUDA backends override to gemm directly into
+    /// `out`'s underlying device slice; the default impl just allocates +
+    /// reassigns `*out`, which is correct numerically but does NOT preserve
+    /// the tensor's underlying device pointer — fine for non-CUDA backends
+    /// (they don't capture graphs).
+    fn matmul_into(
+        &self,
+        out: &mut Self::Tensor,
+        a: &Self::Tensor,
+        b: &Self::Tensor,
+    ) -> Result<()> {
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "matmul_into: requires 2D tensors".into(),
+            ));
+        }
+        let m = a_shape[0];
+        let n = b_shape[1];
+        let out_shape = out.shape();
+        if out_shape != [m, n] {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![m, n],
+                got: out_shape.to_vec(),
+            });
+        }
+        if out.dtype() != a.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "matmul_into: out dtype {:?} != a dtype {:?}",
+                out.dtype(),
+                a.dtype()
+            )));
+        }
+        *out = self.matmul(a, b)?;
+        Ok(())
+    }
+
+    /// Element-wise add, writing into a caller-provided output buffer.
+    /// Out shape + dtype must match both inputs.
+    /// See [`Self::matmul_into`] for the capture-stability contract.
+    fn add_into(
+        &self,
+        out: &mut Self::Tensor,
+        a: &Self::Tensor,
+        b: &Self::Tensor,
+    ) -> Result<()> {
+        if a.shape() != b.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: a.shape().to_vec(),
+                got: b.shape().to_vec(),
+            });
+        }
+        if out.shape() != a.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: a.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != a.dtype() || a.dtype() != b.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "add_into: dtype mismatch out={:?} a={:?} b={:?}",
+                out.dtype(),
+                a.dtype(),
+                b.dtype()
+            )));
+        }
+        *out = self.add(a, b)?;
+        Ok(())
+    }
     fn mul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn mul_scalar(&self, a: &Self::Tensor, scalar: f32) -> Result<Self::Tensor>;
     fn silu(&self, a: &Self::Tensor) -> Result<Self::Tensor>;

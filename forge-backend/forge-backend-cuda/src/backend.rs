@@ -693,6 +693,40 @@ impl Backend for CudaBackend {
             ));
         }
         let m = a_shape[0];
+        let n = b_shape[1];
+        if a.dtype() != b.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul dtype mismatch: {:?} vs {:?}",
+                a.dtype(),
+                b.dtype()
+            )));
+        }
+        // Allocate output, then delegate to matmul_into (which does the full
+        // gemm logic). Keeps a single source of truth for the kernel.
+        let mut out = self.allocate_zeros(&[m, n], a.dtype())?;
+        self.matmul_into(&mut out, a, b)?;
+        Ok(out)
+    }
+
+    /// In-place matmul into a caller-provided buffer.
+    ///
+    /// Same gemm logic as `matmul`, just doesn't allocate the output.
+    /// Used by the engine's persistent-buffer / CUDA-Graph capture path
+    /// so the captured kernel's output pointer is stable across replays.
+    fn matmul_into(
+        &self,
+        out: &mut CudaTensor,
+        a: &CudaTensor,
+        b: &CudaTensor,
+    ) -> Result<()> {
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "matmul_into: requires 2D tensors".into(),
+            ));
+        }
+        let m = a_shape[0];
         let k = a_shape[1];
         let n = b_shape[1];
         if b_shape[0] != k {
@@ -701,22 +735,33 @@ impl Backend for CudaBackend {
                 got: b_shape.to_vec(),
             });
         }
-
         if a.dtype() != b.dtype() {
             return Err(ForgeError::InvalidArgument(format!(
-                "matmul dtype mismatch: {:?} vs {:?}",
+                "matmul_into: a/b dtype mismatch ({:?} vs {:?})",
                 a.dtype(),
                 b.dtype()
+            )));
+        }
+        let expected_out = vec![m, n];
+        if out.shape() != expected_out.as_slice() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: expected_out,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != a.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_into: out dtype {:?} != a dtype {:?}",
+                out.dtype(),
+                a.dtype()
             )));
         }
 
         match a.dtype() {
             DType::F32 => {
-                let mut c = self
-                    .stream
-                    .alloc_zeros::<f32>(m * n)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let a_slice = a.f32_slice()?;
+                let b_slice = b.f32_slice()?;
+                let c_slice = out.f32_slice_mut()?;
                 unsafe {
                     self.blas
                         .gemm(
@@ -732,22 +777,18 @@ impl Backend for CudaBackend {
                                 beta: 0.0f32,
                                 ldc: n as i32,
                             },
-                            b.f32_slice()?,
-                            a.f32_slice()?,
-                            &mut c,
+                            b_slice,
+                            a_slice,
+                            c_slice,
                         )
                         .map_err(|e| ForgeError::Cuda(format!("gemm f32: {e}")))?;
                 }
-
-                Ok(CudaTensor::f32_data(c, vec![m, n]))
+                Ok(())
             }
             DType::F16 => {
-                let mut c = self
-                    .stream
-                    .alloc_zeros::<half::f16>(m * n)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
-                // cudarc safe Gemm<half::f16> uses cublasGemmEx with F32 accumulation
+                let a_slice = a.f16_slice()?;
+                let b_slice = b.f16_slice()?;
+                let c_slice = out.f16_slice_mut()?;
                 unsafe {
                     self.blas
                         .gemm(
@@ -763,14 +804,13 @@ impl Backend for CudaBackend {
                                 beta: half::f16::from_f32(0.0),
                                 ldc: n as i32,
                             },
-                            b.f16_slice()?,
-                            a.f16_slice()?,
-                            &mut c,
+                            b_slice,
+                            a_slice,
+                            c_slice,
                         )
                         .map_err(|e| ForgeError::Cuda(format!("gemm f16: {e}")))?;
                 }
-
-                Ok(CudaTensor::f16_data(c, vec![m, n]))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
@@ -778,46 +818,66 @@ impl Backend for CudaBackend {
 
     fn add(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
         validate_same_shape(a, b)?;
+        let mut out = self.allocate_zeros(&a.shape, a.dtype())?;
+        self.add_into(&mut out, a, b)?;
+        Ok(out)
+    }
+
+    /// In-place add into a caller-provided buffer. See `matmul_into`.
+    fn add_into(
+        &self,
+        out: &mut CudaTensor,
+        a: &CudaTensor,
+        b: &CudaTensor,
+    ) -> Result<()> {
+        validate_same_shape(a, b)?;
+        if out.shape() != a.shape() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: a.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != a.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "add_into: out dtype {:?} != a dtype {:?}",
+                out.dtype(),
+                a.dtype()
+            )));
+        }
         let n = a.len() as u32;
 
         match a.dtype() {
             DType::F16 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(n as usize)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let a_slice = a.f16_slice()?;
+                let b_slice = b.f16_slice()?;
+                let out_slice = out.f16_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.add_f16);
-                builder.arg(&mut out);
-                builder.arg(a.f16_slice()?);
-                builder.arg(b.f16_slice()?);
+                builder.arg(out_slice);
+                builder.arg(a_slice);
+                builder.arg(b_slice);
                 builder.arg(&n);
                 unsafe {
                     builder
                         .launch(LaunchConfig::for_num_elems(n))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f16_data(out, a.shape.clone()))
+                Ok(())
             }
             DType::F32 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(n as usize)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let a_slice = a.f32_slice()?;
+                let b_slice = b.f32_slice()?;
+                let out_slice = out.f32_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.add_f32);
-                builder.arg(&mut out);
-                builder.arg(a.f32_slice()?);
-                builder.arg(b.f32_slice()?);
+                builder.arg(out_slice);
+                builder.arg(a_slice);
+                builder.arg(b_slice);
                 builder.arg(&n);
                 unsafe {
                     builder
                         .launch(LaunchConfig::for_num_elems(n))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f32_data(out, a.shape.clone()))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
