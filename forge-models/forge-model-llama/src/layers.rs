@@ -351,15 +351,10 @@ impl<B: Backend> LlamaAttention<B> {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Paged attention — required for capture path. We can't easily call
-        // `paged_attention_into` (a CudaBackend inherent method) from this
-        // generic-over-Backend context — but the trait method
-        // `paged_attention` is what we have. For now use it; the CUDA path
-        // ends up at `paged_attention_into` internally via the alloc-then-
-        // delegate refactor in Task 5a/5b.
-        //
-        // The output is captured by the engine's persistent allocator below
-        // (we copy it into buffers.attn_out via reshape_into for stability).
+        // Paged attention — required for the persistent-buffer path. We
+        // route through `paged_attention_into` (Task 5c.5 promoted from
+        // CudaBackend inherent to Backend trait) so the captured kernel's
+        // output arg points at `buffers.attn_out`'s stable device address.
         let inputs = kv_cache
             .paged_attention_inputs(layer_idx, seq_ids)?
             .ok_or_else(|| {
@@ -369,11 +364,8 @@ impl<B: Backend> LlamaAttention<B> {
                         .into(),
                 )
             })?;
-        // backend.paged_attention internally calls paged_attention_into in
-        // CudaBackend with a fresh-alloc output — we copy that into our
-        // persistent buffers.attn_out via reshape_into to anchor the
-        // device pointer.
-        let attn_out_alloc = backend.paged_attention(
+        backend.paged_attention_into(
+            &mut buffers.attn_out,
             &buffers.q_rotated_2d,
             inputs.k_pool,
             inputs.v_pool,
@@ -384,11 +376,6 @@ impl<B: Backend> LlamaAttention<B> {
             self.num_kv_heads,
             self.head_dim,
             scale,
-        )?;
-        backend.reshape_into(
-            &mut buffers.attn_out,
-            &attn_out_alloc,
-            &[n, self.num_heads * self.head_dim],
         )?;
 
         // Cast attn_out to wo's weight dtype (no-op memcpy if dtypes match).

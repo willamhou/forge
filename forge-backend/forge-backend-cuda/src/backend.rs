@@ -364,16 +364,12 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Paged attention decode kernel — caller-provided output buffer.
-    ///
-    /// Writes results into `out` (shape `[batch, num_heads * head_dim]`,
-    /// dtype matching `q`). For CUDA-Graph capture, the engine pre-allocates
-    /// `out` once and reuses it across capture + replay so the captured
-    /// graph references a stable device pointer.
-    ///
-    /// All validation (shape / dtype / range) happens here; the convenience
-    /// `Backend::paged_attention` wrapper just allocates `out` and delegates.
-    pub fn paged_attention_into(
+    /// Inherent implementation of paged_attention_into. The `Backend` trait
+    /// method `paged_attention_into` (in `impl Backend for CudaBackend`)
+    /// delegates here. Keeping the implementation inherent lets unit tests
+    /// call it directly with the CudaTensor concrete type.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_attention_into_impl(
         &self,
         out: &mut CudaTensor,
         q: &CudaTensor,
@@ -2293,6 +2289,39 @@ impl Backend for CudaBackend {
             scale,
         )?;
         Ok(out)
+    }
+
+    /// Trait override — delegates to the inherent `paged_attention_into_impl`
+    /// which holds the real body. Splitting this way lets the trait method
+    /// (callable via generic `B: Backend`) share an implementation with
+    /// any direct CudaBackend-typed callers (e.g. unit tests).
+    fn paged_attention_into(
+        &self,
+        out: &mut CudaTensor,
+        q: &CudaTensor,
+        k_pool: &CudaTensor,
+        v_pool: &CudaTensor,
+        block_tables: &[i32],
+        kv_lens: &[i32],
+        max_blocks_per_seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        self.paged_attention_into_impl(
+            out,
+            q,
+            k_pool,
+            v_pool,
+            block_tables,
+            kv_lens,
+            max_blocks_per_seq,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
     }
 
     fn split_qkv(

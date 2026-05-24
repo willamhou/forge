@@ -809,6 +809,65 @@ pub trait Backend: Send + Sync + 'static {
         )
     }
 
+    /// Decode attention against a paged K/V pool, writing into a caller-
+    /// provided output buffer.
+    ///
+    /// Same algorithm as [`Self::paged_attention`] but `out` is supplied by
+    /// the caller — required for CUDA Graph capture (the captured kernel
+    /// arg's device pointer must be stable across replays).
+    ///
+    /// `out` shape: `[batch, num_heads * head_dim]`; dtype matches `q`.
+    ///
+    /// Default impl: calls `paged_attention` to allocate the result, then
+    /// copies via `reshape_into` into `out` (non-zero-cost on CUDA today;
+    /// future iteration can override with an in-place kernel that skips
+    /// the intermediate alloc). The CUDA backend overrides directly.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_attention_into(
+        &self,
+        out: &mut Self::Tensor,
+        q: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_tables: &[i32],
+        kv_lens: &[i32],
+        max_blocks_per_seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let batch = kv_lens.len();
+        let expected = vec![batch, num_heads * head_dim];
+        if out.shape() != expected.as_slice() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != q.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention_into: out dtype {:?} != q dtype {:?}",
+                out.dtype(),
+                q.dtype()
+            )));
+        }
+        let result = self.paged_attention(
+            q,
+            k_pool,
+            v_pool,
+            block_tables,
+            kv_lens,
+            max_blocks_per_seq,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )?;
+        let expected_again = vec![batch, num_heads * head_dim];
+        self.reshape_into(out, &result, &expected_again)
+    }
+
     /// Gather `total_tokens` tokens from the given block IDs into a contiguous tensor.
     ///
     /// `pool` shape: `[num_blocks, block_size, kv_dim]`
