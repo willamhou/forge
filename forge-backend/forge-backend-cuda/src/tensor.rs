@@ -54,6 +54,16 @@ impl CudaTensor {
         }
     }
 
+    pub(crate) fn f32_slice_mut(&mut self) -> Result<&mut CudaSlice<f32>> {
+        match &mut self.data {
+            TensorData::F32(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected f32 tensor, got {:?}",
+                self.dtype
+            ))),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn f16_slice(&self) -> Result<&CudaSlice<half::f16>> {
         match &self.data {

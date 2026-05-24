@@ -1,91 +1,79 @@
 //! Paged KV cache: block-organized KV storage using BlockManager.
 //!
-//! Stores K/V data in fixed-size blocks managed by BlockManager.
-//! Data is stored as CPU-side f32 (same as NaiveKvCache) but block-organized
-//! for memory efficiency and future PagedAttention integration.
+//! Stores K/V data in fixed-size blocks of a backend-allocated pool tensor.
+//! Each pool has shape `[num_blocks, block_size, kv_dim]`; one (K, V) pair per layer.
 //!
-//! Each block holds `block_size` tokens worth of K/V data per layer.
 //! The block table maps sequences to their blocks, enabling:
 //! - Fine-grained memory management (no per-sequence max length)
 //! - Block table export for PagedAttention kernels
 //! - Future prefix caching via block sharing
+//!
+//! The pool is backend-managed via `Backend::paged_write_kv` / `paged_gather_kv`.
+//! The default (host-fallback) trait impl is correct but slow; CUDA overrides
+//! with device-to-device memcpy so pool addresses stay stable for CUDA Graph
+//! capture.
 
 use std::collections::HashMap;
 
-use forge_core::{Backend, CacheUsage, ForgeError, KvCache, Result, Tensor};
+use forge_core::{Backend, CacheUsage, DType, ForgeError, KvCache, Result, Tensor};
 
-/// Per-block K/V storage for a single layer.
-struct BlockData {
-    /// Key data: [block_size * kv_dim] flattened
-    key: Vec<f32>,
-    /// Value data: [block_size * kv_dim] flattened
-    value: Vec<f32>,
-}
-
-/// Block pool: pre-allocated storage indexed by (layer, block_id).
-struct BlockPool {
-    /// blocks[layer][block_id] -> BlockData
-    blocks: Vec<Vec<BlockData>>,
+/// Block pool: backend-allocated K/V tensors, one (K, V) pair per layer.
+struct BlockPool<B: Backend> {
+    /// `layers[layer] = (k_pool, v_pool)`; each pool shape `[num_blocks, block_size, kv_dim]`.
+    layers: Vec<(B::Tensor, B::Tensor)>,
     block_size: usize,
     kv_dim: usize,
 }
 
-impl BlockPool {
-    fn new(num_layers: usize, total_blocks: usize, block_size: usize, kv_dim: usize) -> Self {
-        let block_capacity = block_size * kv_dim;
-        let blocks = (0..num_layers)
-            .map(|_| {
-                (0..total_blocks)
-                    .map(|_| BlockData {
-                        key: vec![0.0f32; block_capacity],
-                        value: vec![0.0f32; block_capacity],
-                    })
-                    .collect()
-            })
-            .collect();
-        Self {
-            blocks,
+impl<B: Backend> BlockPool<B> {
+    fn new(
+        backend: &B,
+        num_layers: usize,
+        total_blocks: usize,
+        block_size: usize,
+        kv_dim: usize,
+    ) -> Result<Self> {
+        let shape = [total_blocks, block_size, kv_dim];
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let k = backend.allocate_zeros(&shape, DType::F32)?;
+            let v = backend.allocate_zeros(&shape, DType::F32)?;
+            layers.push((k, v));
+        }
+        Ok(Self {
+            layers,
             block_size,
             kv_dim,
-        }
+        })
     }
 
-    /// Write a row of K/V data into a specific block slot.
-    fn write_token(
+    /// Write K/V rows for a layer at the given slot positions.
+    fn write_tokens(
         &mut self,
+        backend: &B,
         layer: usize,
-        block_id: usize,
-        slot: usize,
-        key_row: &[f32],
-        value_row: &[f32],
-    ) {
-        let offset = slot * self.kv_dim;
-        let block = &mut self.blocks[layer][block_id];
-        block.key[offset..offset + self.kv_dim].copy_from_slice(key_row);
-        block.value[offset..offset + self.kv_dim].copy_from_slice(value_row);
+        key: &B::Tensor,
+        value: &B::Tensor,
+        slot_mapping: &[i32],
+    ) -> Result<()> {
+        let (k_pool, v_pool) = &mut self.layers[layer];
+        backend.paged_write_kv(k_pool, key, slot_mapping)?;
+        backend.paged_write_kv(v_pool, value, slot_mapping)?;
+        Ok(())
     }
 
     /// Read filled tokens from a sequence's blocks for a given layer.
     fn read_seq(
         &self,
+        backend: &B,
         layer: usize,
         block_ids: &[usize],
         total_tokens: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let mut key_data = Vec::with_capacity(total_tokens * self.kv_dim);
-        let mut value_data = Vec::with_capacity(total_tokens * self.kv_dim);
-        let mut remaining = total_tokens;
-
-        for &block_id in block_ids {
-            let fill = remaining.min(self.block_size);
-            let block = &self.blocks[layer][block_id];
-            let bytes = fill * self.kv_dim;
-            key_data.extend_from_slice(&block.key[..bytes]);
-            value_data.extend_from_slice(&block.value[..bytes]);
-            remaining -= fill;
-        }
-
-        (key_data, value_data)
+    ) -> Result<(B::Tensor, B::Tensor)> {
+        let (k_pool, v_pool) = &self.layers[layer];
+        let key = backend.paged_gather_kv(k_pool, block_ids, total_tokens)?;
+        let value = backend.paged_gather_kv(v_pool, block_ids, total_tokens)?;
+        Ok((key, value))
     }
 }
 
@@ -103,14 +91,13 @@ struct SeqInfo {
 /// list of blocks, and tokens fill blocks sequentially. When a block
 /// is full, a new one is allocated.
 ///
-/// Currently stores data on CPU as f32 (like NaiveKvCache) but with
-/// block-granular allocation. This enables:
-/// - Bounded memory usage via block limits
-/// - Block table export for PagedAttention kernels
-/// - Future prefix caching via block sharing
+/// Storage lives in backend-allocated pool tensors, written via
+/// `Backend::paged_write_kv` and read via `Backend::paged_gather_kv`.
+/// CUDA backends override those ops to keep the pool device-resident
+/// with stable addresses (required for CUDA Graph capture).
 pub struct PagedKvCache<B: Backend> {
     backend: B,
-    pool: BlockPool,
+    pool: BlockPool<B>,
     num_layers: usize,
     block_size: usize,
     total_blocks: usize,
@@ -135,17 +122,18 @@ impl<B: Backend> PagedKvCache<B> {
         num_layers: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let kv_dim = num_kv_heads * head_dim;
-        Self {
+        let pool = BlockPool::new(&backend, num_layers, total_blocks, block_size, kv_dim)?;
+        Ok(Self {
             backend,
-            pool: BlockPool::new(num_layers, total_blocks, block_size, kv_dim),
+            pool,
             num_layers,
             block_size,
             total_blocks,
             free_blocks: (0..total_blocks).rev().collect(),
             sequences: HashMap::new(),
-        }
+        })
     }
 
     /// Allocate `n` blocks from the free list.
@@ -160,7 +148,7 @@ impl<B: Backend> PagedKvCache<B> {
     }
 
     /// Return blocks to the free list.
-    fn free_blocks(&mut self, blocks: &[usize]) {
+    fn release_blocks(&mut self, blocks: &[usize]) {
         self.free_blocks.extend(blocks);
     }
 }
@@ -171,15 +159,18 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
     fn allocate(&mut self, seq_id: u64, initial_len: usize) -> Result<()> {
         // Free existing allocation if present
         if let Some(old) = self.sequences.remove(&seq_id) {
-            self.free_blocks(&old.block_ids);
+            self.release_blocks(&old.block_ids);
         }
 
         let num_blocks = ((initial_len + self.block_size - 1) / self.block_size).max(1);
         let block_ids = self.alloc_blocks(num_blocks)?;
-        self.sequences.insert(seq_id, SeqInfo {
-            block_ids,
-            num_tokens: 0, // filled by append()
-        });
+        self.sequences.insert(
+            seq_id,
+            SeqInfo {
+                block_ids,
+                num_tokens: 0, // filled by append()
+            },
+        );
         Ok(())
     }
 
@@ -208,13 +199,12 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             )));
         }
 
-        let key_f32 = self.backend.copy_to_host_f32(key)?;
-        let val_f32 = self.backend.copy_to_host_f32(value)?;
-
         // Determine write start position.
         // Layer 0 writes at current num_tokens and then advances the count.
         // Layers > 0 write at the same positions (count was already advanced by layer 0).
-        let seq = self.sequences.get(&seq_id)
+        let seq = self
+            .sequences
+            .get(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
         let write_start = if layer == 0 {
             seq.num_tokens
@@ -222,25 +212,31 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             seq.num_tokens - new_tokens
         };
 
+        // Build slot_mapping: absolute slot = block_id * block_size + slot_in_block.
+        // Grow block list during prefill / decode if needed (layer 0 only — later
+        // layers reuse the blocks allocated for layer 0 at the same token positions).
+        let block_size = self.block_size;
+        let mut slot_mapping = Vec::with_capacity(new_tokens);
         for t in 0..new_tokens {
             let token_pos = write_start + t;
-            let block_idx = token_pos / self.block_size;
-            let slot = token_pos % self.block_size;
+            let block_idx = token_pos / block_size;
+            let slot = token_pos % block_size;
 
-            // Ensure we have enough blocks (may need to grow during decode)
             if block_idx >= self.sequences.get(&seq_id).unwrap().block_ids.len() {
                 let new_block = self.alloc_blocks(1)?;
-                self.sequences.get_mut(&seq_id).unwrap().block_ids.extend(new_block);
+                self.sequences
+                    .get_mut(&seq_id)
+                    .unwrap()
+                    .block_ids
+                    .extend(new_block);
             }
 
             let block_id = self.sequences.get(&seq_id).unwrap().block_ids[block_idx];
-
-            let row_start = t * kv_dim;
-            let key_row = &key_f32[row_start..row_start + kv_dim];
-            let val_row = &val_f32[row_start..row_start + kv_dim];
-
-            self.pool.write_token(layer, block_id, slot, key_row, val_row);
+            slot_mapping.push((block_id * block_size + slot) as i32);
         }
+
+        self.pool
+            .write_tokens(&self.backend, layer, key, value, &slot_mapping)?;
 
         // Only update token count on layer 0
         if layer == 0 {
@@ -258,7 +254,9 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             )));
         }
 
-        let seq = self.sequences.get(&seq_id)
+        let seq = self
+            .sequences
+            .get(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
 
         if seq.num_tokens == 0 {
@@ -267,30 +265,32 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             )));
         }
 
-        let (key_data, value_data) = self.pool.read_seq(layer, &seq.block_ids, seq.num_tokens);
-
-        let shape = &[seq.num_tokens, self.pool.kv_dim];
-        let key = self.backend.copy_from_host_f32(&key_data, shape)?;
-        let value = self.backend.copy_from_host_f32(&value_data, shape)?;
-        Ok((key, value))
+        self.pool
+            .read_seq(&self.backend, layer, &seq.block_ids, seq.num_tokens)
     }
 
     fn get_block_table(&self, seq_id: u64) -> Result<Vec<usize>> {
-        let seq = self.sequences.get(&seq_id)
+        let seq = self
+            .sequences
+            .get(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
         Ok(seq.block_ids.clone())
     }
 
     fn get_seq_len(&self, seq_id: u64) -> Result<usize> {
-        let seq = self.sequences.get(&seq_id)
+        let seq = self
+            .sequences
+            .get(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
         Ok(seq.num_tokens)
     }
 
     fn free(&mut self, seq_id: u64) -> Result<()> {
-        let seq = self.sequences.remove(&seq_id)
+        let seq = self
+            .sequences
+            .remove(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
-        self.free_blocks(&seq.block_ids);
+        self.release_blocks(&seq.block_ids);
         Ok(())
     }
 
@@ -334,11 +334,18 @@ mod tests {
     impl Backend for TestBackend {
         type Tensor = TestTensor;
 
-        fn name(&self) -> &str { "test" }
-        fn device_count(&self) -> usize { 1 }
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn device_count(&self) -> usize {
+            1
+        }
 
         fn copy_from_host_f32(&self, data: &[f32], shape: &[usize]) -> Result<TestTensor> {
-            Ok(TestTensor { data: data.to_vec(), shape: shape.to_vec() })
+            Ok(TestTensor {
+                data: data.to_vec(),
+                shape: shape.to_vec(),
+            })
         }
         fn copy_from_host_f16(&self, _: &[half::f16], _: &[usize]) -> Result<TestTensor> {
             unimplemented!()
@@ -351,43 +358,78 @@ mod tests {
         }
         fn allocate(&self, shape: &[usize], _: DType) -> Result<TestTensor> {
             let n: usize = shape.iter().product();
-            Ok(TestTensor { data: vec![0.0; n], shape: shape.to_vec() })
+            Ok(TestTensor {
+                data: vec![0.0; n],
+                shape: shape.to_vec(),
+            })
         }
         fn allocate_zeros(&self, shape: &[usize], dtype: DType) -> Result<TestTensor> {
             self.allocate(shape, dtype)
         }
         fn reshape(&self, t: &TestTensor, shape: &[usize]) -> Result<TestTensor> {
-            Ok(TestTensor { data: t.data.clone(), shape: shape.to_vec() })
+            Ok(TestTensor {
+                data: t.data.clone(),
+                shape: shape.to_vec(),
+            })
         }
-        fn add(&self, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> { unimplemented!() }
-        fn mul(&self, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> { unimplemented!() }
-        fn mul_scalar(&self, _: &TestTensor, _: f32) -> Result<TestTensor> { unimplemented!() }
-        fn silu(&self, _: &TestTensor) -> Result<TestTensor> { unimplemented!() }
-        fn rms_norm(&self, _: &TestTensor, _: &TestTensor, _: f32) -> Result<TestTensor> { unimplemented!() }
-        fn softmax(&self, _: &TestTensor, _: i32) -> Result<TestTensor> { unimplemented!() }
-        fn matmul(&self, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> { unimplemented!() }
-        fn embedding(&self, _: &TestTensor, _: &[u32]) -> Result<TestTensor> { unimplemented!() }
-        fn rope(&self, _: &TestTensor, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> { unimplemented!() }
-        fn transpose(&self, _: &TestTensor, _: usize, _: usize) -> Result<TestTensor> { unimplemented!() }
-        fn cat(&self, _: &[&TestTensor], _: usize) -> Result<TestTensor> { unimplemented!() }
-        fn synchronize(&self) -> Result<()> { Ok(()) }
+        fn add(&self, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn mul(&self, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn mul_scalar(&self, _: &TestTensor, _: f32) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn silu(&self, _: &TestTensor) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn rms_norm(&self, _: &TestTensor, _: &TestTensor, _: f32) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn softmax(&self, _: &TestTensor, _: i32) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn matmul(&self, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn embedding(&self, _: &TestTensor, _: &[u32]) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn rope(&self, _: &TestTensor, _: &TestTensor, _: &TestTensor) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn transpose(&self, _: &TestTensor, _: usize, _: usize) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn cat(&self, _: &[&TestTensor], _: usize) -> Result<TestTensor> {
+            unimplemented!()
+        }
+        fn synchronize(&self) -> Result<()> {
+            Ok(())
+        }
         fn cast(&self, t: &TestTensor, _: DType) -> Result<TestTensor> {
             Ok(t.clone())
         }
     }
 
     impl Clone for TestBackend {
-        fn clone(&self) -> Self { TestBackend }
+        fn clone(&self) -> Self {
+            TestBackend
+        }
     }
 
     fn make_tensor(data: &[f32], shape: &[usize]) -> TestTensor {
-        TestTensor { data: data.to_vec(), shape: shape.to_vec() }
+        TestTensor {
+            data: data.to_vec(),
+            shape: shape.to_vec(),
+        }
     }
 
     #[test]
     fn test_allocate_and_free() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 2, 4);
+        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 2, 4).unwrap();
         // kv_dim = 2 * 4 = 8
 
         cache.allocate(1, 3).unwrap();
@@ -401,14 +443,17 @@ mod tests {
     #[test]
     fn test_append_and_get_kv() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 1, 4);
+        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 1, 4).unwrap();
         // kv_dim = 1 * 4 = 4, block_size = 4
 
         cache.allocate(1, 2).unwrap();
 
         // Append 2 tokens, layer 0
         let k = make_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
-        let v = make_tensor(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], &[2, 4]);
+        let v = make_tensor(
+            &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+            &[2, 4],
+        );
         cache.append(1, 0, &k, &v).unwrap();
 
         // Append 2 tokens, layer 1
@@ -422,7 +467,10 @@ mod tests {
         let (key0, val0) = cache.get_kv(1, 0).unwrap();
         assert_eq!(key0.shape(), &[2, 4]);
         assert_eq!(key0.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(val0.data, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
+        assert_eq!(
+            val0.data,
+            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        );
 
         // Retrieve layer 1
         let (key1, val1) = cache.get_kv(1, 1).unwrap();
@@ -433,7 +481,7 @@ mod tests {
     #[test]
     fn test_append_incremental_decode() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2);
+        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2).unwrap();
         // kv_dim = 2, block_size = 2
 
         cache.allocate(1, 3).unwrap();
@@ -454,13 +502,16 @@ mod tests {
         let (key, val) = cache.get_kv(1, 0).unwrap();
         assert_eq!(key.shape(), &[4, 2]);
         assert_eq!(key.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(val.data, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
+        assert_eq!(
+            val.data,
+            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        );
     }
 
     #[test]
     fn test_block_boundary_crossing() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2);
+        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2).unwrap();
         // kv_dim = 2, block_size = 2 → each block holds 2 tokens
 
         cache.allocate(1, 1).unwrap(); // allocate 1 block
@@ -490,7 +541,7 @@ mod tests {
     #[test]
     fn test_out_of_memory() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 1, 2, 1, 1, 2);
+        let mut cache = PagedKvCache::new(backend, 1, 2, 1, 1, 2).unwrap();
         // Only 1 block, 2 tokens capacity
 
         cache.allocate(1, 2).unwrap();
@@ -508,7 +559,7 @@ mod tests {
     #[test]
     fn test_usage_tracking() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 4, 2, 1, 1, 2);
+        let mut cache = PagedKvCache::new(backend, 4, 2, 1, 1, 2).unwrap();
 
         assert_eq!(cache.usage().used_blocks, 0);
         assert!(cache.can_allocate(4));
@@ -525,7 +576,7 @@ mod tests {
     #[test]
     fn test_multiple_sequences() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2);
+        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2).unwrap();
 
         cache.allocate(1, 2).unwrap();
         cache.allocate(2, 2).unwrap();

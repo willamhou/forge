@@ -1295,6 +1295,146 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// Device-to-device write into the paged pool.
+    ///
+    /// Coalesces consecutive slot mappings into a single `memcpy_dtod` per run.
+    /// For decode (q_len=1) this is one call per layer; for contiguous prefill
+    /// (slot_mapping = [base, base+1, ...]) it collapses to one call regardless
+    /// of token count.
+    ///
+    /// The pool tensor is mutated in place — its device pointer does not change.
+    /// This is the property CUDA Graph capture relies on.
+    fn paged_write_kv(
+        &self,
+        pool: &mut CudaTensor,
+        src: &CudaTensor,
+        slot_mapping: &[i32],
+    ) -> Result<()> {
+        if slot_mapping.is_empty() {
+            return Ok(());
+        }
+        if pool.dtype() != src.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_write_kv: pool/src dtype mismatch ({:?} vs {:?})",
+                pool.dtype(),
+                src.dtype()
+            )));
+        }
+        let pool_shape = pool.shape().to_vec();
+        if pool_shape.len() != 3 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_write_kv: pool must be rank-3 [num_blocks, block_size, kv_dim], got {pool_shape:?}"
+            )));
+        }
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let total_capacity_slots = pool_shape[0] * block_size;
+
+        for &slot in slot_mapping {
+            if slot < 0 || (slot as usize) >= total_capacity_slots {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "paged_write_kv: slot {slot} out of bounds (capacity {total_capacity_slots})"
+                )));
+            }
+        }
+
+        let src_rows = src.shape().first().copied().unwrap_or(0);
+        if src_rows < slot_mapping.len() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_write_kv: src has {src_rows} rows but slot_mapping has {} entries",
+                slot_mapping.len()
+            )));
+        }
+
+        match pool.dtype() {
+            DType::F32 => {
+                let src_slice = src.f32_slice()?;
+                let pool_slice = pool.f32_slice_mut()?;
+                let mut run_start = 0usize;
+                while run_start < slot_mapping.len() {
+                    let mut run_end = run_start + 1;
+                    while run_end < slot_mapping.len()
+                        && slot_mapping[run_end] == slot_mapping[run_end - 1] + 1
+                    {
+                        run_end += 1;
+                    }
+                    let run_len = run_end - run_start;
+                    let dst_off = (slot_mapping[run_start] as usize) * kv_dim;
+                    let src_off = run_start * kv_dim;
+                    let elems = run_len * kv_dim;
+                    self.stream
+                        .memcpy_dtod(
+                            &src_slice.slice(src_off..src_off + elems),
+                            &mut pool_slice.slice_mut(dst_off..dst_off + elems),
+                        )
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    run_start = run_end;
+                }
+            }
+            other => {
+                return Err(ForgeError::UnsupportedDtype(other));
+            }
+        }
+        Ok(())
+    }
+
+    /// Device-to-device gather from the paged pool.
+    ///
+    /// One `memcpy_dtod` per (possibly partial) block. Output tensor is freshly
+    /// allocated; the pool tensor is read-only.
+    fn paged_gather_kv(
+        &self,
+        pool: &CudaTensor,
+        block_ids: &[usize],
+        total_tokens: usize,
+    ) -> Result<CudaTensor> {
+        let pool_shape = pool.shape();
+        if pool_shape.len() != 3 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_gather_kv: pool must be rank-3, got {pool_shape:?}"
+            )));
+        }
+        let num_blocks = pool_shape[0];
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let out_shape = vec![total_tokens, kv_dim];
+
+        match pool.dtype() {
+            DType::F32 => {
+                let pool_slice = pool.f32_slice()?;
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>(total_tokens * kv_dim)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let mut remaining = total_tokens;
+                let mut out_off = 0usize;
+                for &block_id in block_ids {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if block_id >= num_blocks {
+                        return Err(ForgeError::InvalidArgument(format!(
+                            "paged_gather_kv: block_id {block_id} out of bounds ({num_blocks})"
+                        )));
+                    }
+                    let fill = remaining.min(block_size);
+                    let src_off = block_id * block_size * kv_dim;
+                    let elems = fill * kv_dim;
+                    self.stream
+                        .memcpy_dtod(
+                            &pool_slice.slice(src_off..src_off + elems),
+                            &mut out.slice_mut(out_off..out_off + elems),
+                        )
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    out_off += elems;
+                    remaining -= fill;
+                }
+                Ok(CudaTensor::f32_data(out, out_shape))
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
     fn split_qkv(
         &self,
         qkv: &CudaTensor,

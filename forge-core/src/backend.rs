@@ -211,6 +211,80 @@ pub trait Backend: Send + Sync + 'static {
     /// Cast a tensor to a different dtype. Returns the input unchanged if already the target dtype.
     fn cast(&self, x: &Self::Tensor, dtype: DType) -> Result<Self::Tensor>;
 
+    // ── Paged KV pool primitives ────────────────────────────────
+    // Used by PagedKvCache. CUDA backend overrides with device-to-device memcpy
+    // so the pool's device address stays stable across writes (prereq for
+    // CUDA Graph capture — see docs/plans/2026-05-22-cuda-graphs-plan.md).
+
+    /// Write rows from `src` into the paged pool at the given slot positions.
+    ///
+    /// `pool` shape: `[num_blocks, block_size, kv_dim]`
+    /// `src`  shape: `[num_tokens, kv_dim]`
+    /// `slot_mapping[t]` = `block_id_t * block_size + slot_in_block_t` (absolute slot index).
+    ///
+    /// The pool is updated in place. The default impl round-trips through the
+    /// host (correct, but allocates a fresh tensor — defeats the "stable address"
+    /// goal); GPU backends override with device-to-device memcpy.
+    fn paged_write_kv(
+        &self,
+        pool: &mut Self::Tensor,
+        src: &Self::Tensor,
+        slot_mapping: &[i32],
+    ) -> Result<()> {
+        let pool_shape = pool.shape().to_vec();
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let pool_capacity_slots = pool_shape[0] * block_size;
+        let mut pool_data = self.copy_to_host_f32(pool)?;
+        let src_data = self.copy_to_host_f32(src)?;
+        for (t, &slot) in slot_mapping.iter().enumerate() {
+            let slot_u = slot as usize;
+            if slot_u >= pool_capacity_slots {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "paged_write_kv: slot {slot_u} out of bounds (capacity {pool_capacity_slots})"
+                )));
+            }
+            let dst_off = slot_u * kv_dim;
+            let src_off = t * kv_dim;
+            pool_data[dst_off..dst_off + kv_dim]
+                .copy_from_slice(&src_data[src_off..src_off + kv_dim]);
+        }
+        *pool = self.copy_from_host_f32(&pool_data, &pool_shape)?;
+        Ok(())
+    }
+
+    /// Gather `total_tokens` tokens from the given block IDs into a contiguous tensor.
+    ///
+    /// `pool` shape: `[num_blocks, block_size, kv_dim]`
+    /// Returns shape: `[total_tokens, kv_dim]`
+    ///
+    /// Tokens are read in order from `block_ids[0]` (up to `block_size` tokens), then
+    /// `block_ids[1]`, etc., stopping when `total_tokens` have been collected.
+    fn paged_gather_kv(
+        &self,
+        pool: &Self::Tensor,
+        block_ids: &[usize],
+        total_tokens: usize,
+    ) -> Result<Self::Tensor> {
+        let pool_shape = pool.shape();
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let pool_data = self.copy_to_host_f32(pool)?;
+        let mut out = Vec::with_capacity(total_tokens * kv_dim);
+        let mut remaining = total_tokens;
+        for &block_id in block_ids {
+            if remaining == 0 {
+                break;
+            }
+            let fill = remaining.min(block_size);
+            let block_off = block_id * block_size * kv_dim;
+            let bytes = fill * kv_dim;
+            out.extend_from_slice(&pool_data[block_off..block_off + bytes]);
+            remaining -= fill;
+        }
+        self.copy_from_host_f32(&out, &[total_tokens, kv_dim])
+    }
+
     // ── Attention helpers ───────────────────────────────────────
     // Default impls go through host; CudaBackend overrides with GPU kernels.
 
