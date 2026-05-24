@@ -54,6 +54,13 @@ The plan's original sub-steps were sized assuming PagedKvCache was already devic
 
 This is the riskiest sub-step because it touches every consumer of `PagedKvCache::get_kv()`. Run full E2E (`scripts/test_server.sh`) before commit.
 
+**Status update (2026-05-24):** Done in commits `e1c8c28` (2.0a host-fallback ops + 2.0b CUDA device-to-device override) and the next commit (2.0c metadata accessors). Two notable departures from the original spec:
+
+1. The trait was widened — not the cache type — via new `Backend::paged_write_kv` / `paged_gather_kv` ops with host-fallback default impls (so non-CUDA backends keep working through the same path). CUDA overrides with coalesced `cudaMemcpyDtoD`. The pool tensor is mutated in place: device address invariance is structural, not behavioral. `BlockPool` now holds `Vec<(B::Tensor, B::Tensor)>` per layer; two separate pools, as recommended.
+2. Block tables are **not** mirrored as per-seq device tensors. Reasoning: assembling a batch `[batch, max_blocks]` view from per-seq scattered device tensors would need a gather kernel anyway, while host-side metadata + a single H2D memcpy per scheduler step costs O(KB), well under the per-step kernel floor. 2.0c exposes `PagedKvCache::batch_block_tables(seq_ids) -> (Vec<i32>, Vec<i32>, max_blocks)` and `k_pool(layer) / v_pool(layer)` accessors. The engine uploads to a persistent scratch tensor at paged_attention-call time (Task 2.2 introduces `Backend::copy_from_host_i32`). Persistent scratch keeps capture-stable addresses without coupling cache lifetime to batch shape.
+
+F16 / BF16 pool variants stay deferred — current pool is F32 only; FP16/BF16 land alongside the kernel in 2.2.
+
 ### 2.1 — Add `Backend::paged_attention` trait method (~1h)
 
 ```rust

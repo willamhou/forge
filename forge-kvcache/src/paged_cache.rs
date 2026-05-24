@@ -136,6 +136,84 @@ impl<B: Backend> PagedKvCache<B> {
         })
     }
 
+    /// Borrow the K pool tensor for a layer (shape `[num_blocks, block_size, kv_dim]`).
+    ///
+    /// The returned reference's device address is stable across `append` calls
+    /// — the property the future paged_attention kernel + CUDA Graph capture
+    /// rely on. Callers must not invalidate this stability (e.g. by replacing
+    /// the cache or reallocating layers).
+    pub fn k_pool(&self, layer: usize) -> Result<&B::Tensor> {
+        self.pool
+            .layers
+            .get(layer)
+            .map(|(k, _)| k)
+            .ok_or_else(|| {
+                ForgeError::InvalidArgument(format!(
+                    "k_pool: layer {layer} out of bounds ({} layers)",
+                    self.num_layers
+                ))
+            })
+    }
+
+    /// Borrow the V pool tensor for a layer. See [`Self::k_pool`].
+    pub fn v_pool(&self, layer: usize) -> Result<&B::Tensor> {
+        self.pool
+            .layers
+            .get(layer)
+            .map(|(_, v)| v)
+            .ok_or_else(|| {
+                ForgeError::InvalidArgument(format!(
+                    "v_pool: layer {layer} out of bounds ({} layers)",
+                    self.num_layers
+                ))
+            })
+    }
+
+    /// Assemble batch-shaped i32 metadata for the given sequences.
+    ///
+    /// Returns `(block_tables_flat, kv_lens, max_blocks_per_seq)`:
+    /// - `block_tables_flat`: row-major `[batch, max_blocks_per_seq]`, padding = `-1`
+    /// - `kv_lens`: `[batch]` — current KV length per sequence
+    /// - `max_blocks_per_seq`: stride of `block_tables_flat`
+    ///
+    /// Host-side on purpose. The engine uploads this to a persistent device
+    /// scratch tensor on each scheduler step (one H2D memcpy of ~kilobytes,
+    /// dwarfed by per-step kernel work). The pool tensors retrieved via
+    /// [`Self::k_pool`] / [`Self::v_pool`] stay device-resident — only the
+    /// per-step indirection metadata moves.
+    pub fn batch_block_tables(
+        &self,
+        seq_ids: &[u64],
+    ) -> Result<(Vec<i32>, Vec<i32>, usize)> {
+        let mut kv_lens = Vec::with_capacity(seq_ids.len());
+        let mut max_blocks = 0usize;
+        for id in seq_ids {
+            let seq = self
+                .sequences
+                .get(id)
+                .ok_or(ForgeError::SeqNotFound(*id))?;
+            kv_lens.push(seq.num_tokens as i32);
+            if seq.block_ids.len() > max_blocks {
+                max_blocks = seq.block_ids.len();
+            }
+        }
+
+        let mut block_tables = vec![-1i32; seq_ids.len() * max_blocks];
+        for (i, id) in seq_ids.iter().enumerate() {
+            let seq = &self.sequences[id];
+            for (j, &b) in seq.block_ids.iter().enumerate() {
+                if b > i32::MAX as usize {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "block_id {b} does not fit in i32"
+                    )));
+                }
+                block_tables[i * max_blocks + j] = b as i32;
+            }
+        }
+
+        Ok((block_tables, kv_lens, max_blocks))
+    }
+
     /// Allocate `n` blocks from the free list.
     fn alloc_blocks(&mut self, n: usize) -> Result<Vec<usize>> {
         if self.free_blocks.len() < n {
@@ -596,5 +674,88 @@ mod tests {
         cache.free(1).unwrap();
         let (key2, _) = cache.get_kv(2, 0).unwrap();
         assert_eq!(key2.data, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_pool_accessors() {
+        let backend = TestBackend;
+        // 4 blocks x 3 tokens/block, kv_dim = 2*4 = 8, 2 layers
+        let cache = PagedKvCache::new(backend, 4, 3, 2, 2, 4).unwrap();
+
+        // Each layer's pool tensor has shape [num_blocks, block_size, kv_dim]
+        let k0 = cache.k_pool(0).unwrap();
+        let v0 = cache.v_pool(0).unwrap();
+        let k1 = cache.k_pool(1).unwrap();
+        assert_eq!(k0.shape(), &[4, 3, 8]);
+        assert_eq!(v0.shape(), &[4, 3, 8]);
+        assert_eq!(k1.shape(), &[4, 3, 8]);
+
+        // Out-of-bounds layer rejected
+        assert!(cache.k_pool(2).is_err());
+        assert!(cache.v_pool(99).is_err());
+    }
+
+    #[test]
+    fn test_batch_block_tables() {
+        let backend = TestBackend;
+        // 16 blocks, 2 tokens/block, 1 layer, kv_dim = 1*2 = 2
+        let mut cache = PagedKvCache::new(backend, 16, 2, 1, 1, 2).unwrap();
+
+        // seq 1: 5 tokens → 3 blocks (ceil(5/2))
+        cache.allocate(1, 5).unwrap();
+        let k = make_tensor(&[1.0; 10], &[5, 2]);
+        let v = make_tensor(&[2.0; 10], &[5, 2]);
+        cache.append(1, 0, &k, &v).unwrap();
+
+        // seq 2: 3 tokens → 2 blocks
+        cache.allocate(2, 3).unwrap();
+        let k = make_tensor(&[3.0; 6], &[3, 2]);
+        let v = make_tensor(&[4.0; 6], &[3, 2]);
+        cache.append(2, 0, &k, &v).unwrap();
+
+        // seq 3: 1 token → 1 block
+        cache.allocate(3, 1).unwrap();
+        let k = make_tensor(&[5.0, 5.0], &[1, 2]);
+        let v = make_tensor(&[6.0, 6.0], &[1, 2]);
+        cache.append(3, 0, &k, &v).unwrap();
+
+        // Batch query [1, 2, 3]: max_blocks = 3
+        let (block_tables, kv_lens, max_blocks) =
+            cache.batch_block_tables(&[1, 2, 3]).unwrap();
+        assert_eq!(max_blocks, 3);
+        assert_eq!(kv_lens, vec![5, 3, 1]);
+        assert_eq!(block_tables.len(), 9);
+
+        // seq 1's row uses all 3 slots
+        assert!(block_tables[0..3].iter().all(|&b| b >= 0));
+        // seq 2's row uses first 2 slots, last is padding
+        assert!(block_tables[3..5].iter().all(|&b| b >= 0));
+        assert_eq!(block_tables[5], -1);
+        // seq 3's row uses 1 slot, rest is padding
+        assert!(block_tables[6] >= 0);
+        assert_eq!(&block_tables[7..9], &[-1, -1]);
+
+        // Block IDs must be distinct across all rows (no aliasing)
+        let mut used: Vec<i32> = block_tables.iter().copied().filter(|&b| b >= 0).collect();
+        used.sort();
+        let unique_count = used.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+        assert_eq!(unique_count, used.len(), "block IDs aliased: {used:?}");
+
+        // Batch with one seq → max_blocks reflects just that seq
+        let (bt1, lens1, max1) = cache.batch_block_tables(&[3]).unwrap();
+        assert_eq!(max1, 1);
+        assert_eq!(lens1, vec![1]);
+        assert_eq!(bt1.len(), 1);
+        assert!(bt1[0] >= 0);
+
+        // Empty batch returns empty vecs
+        let (bt_empty, lens_empty, max_empty) =
+            cache.batch_block_tables(&[]).unwrap();
+        assert_eq!(bt_empty, Vec::<i32>::new());
+        assert_eq!(lens_empty, Vec::<i32>::new());
+        assert_eq!(max_empty, 0);
+
+        // Unknown seq_id surfaces as SeqNotFound
+        assert!(cache.batch_block_tables(&[1, 999]).is_err());
     }
 }
