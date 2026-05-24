@@ -1,6 +1,9 @@
-use forge_core::{Backend, ForgeError, KvCache, Model, ModelConfig, ModelInput, ModelOutput, Result};
+use forge_core::{
+    Backend, ForgeError, KvCache, Model, ModelConfig, ModelInput, ModelOutput, Result, Tensor,
+};
 
 use crate::layers::{LlamaDecoderLayer, RMSNorm};
+use crate::persistent_buffers::LlamaPersistentBuffers;
 use crate::rope::RopeFreqs;
 
 pub struct LlamaModel<B: Backend> {
@@ -104,6 +107,94 @@ impl<B: Backend + Clone> LlamaModel<B> {
         let logits = self.backend.matmul(&hidden, &self.lm_head)?;
 
         Ok(ModelOutput { logits })
+    }
+
+    /// Persistent-buffer batched-decode forward.
+    ///
+    /// All intermediates and the final logits land in `buffers`. The caller
+    /// constructs `buffers` once per batch shape (see [`LlamaPersistentBuffers::new`])
+    /// and reuses it across calls. After this returns, `buffers.logits`
+    /// holds `[batch, vocab_size]` and is the model's output.
+    ///
+    /// **Requirements**:
+    /// - All sequences in `input` must be decode (1 token each), not prefill.
+    /// - `input` must contain exactly `buffers.batch_size` sequences.
+    /// - `kv_cache` must be a paged cache (PagedKvCache); naive caches are
+    ///   rejected by `LlamaAttention::forward_batch_into` upfront.
+    ///
+    /// Returns `Ok(())` on success; callers read `buffers.logits` to consume.
+    pub fn forward_into(
+        &self,
+        input: &ModelInput,
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        buffers: &mut LlamaPersistentBuffers<B>,
+    ) -> Result<()> {
+        let n = input.seq_metadata.len();
+        if n != buffers.batch_size {
+            return Err(ForgeError::InvalidArgument(format!(
+                "forward_into: input has {n} seqs but buffers.batch_size = {}",
+                buffers.batch_size
+            )));
+        }
+        // Decode-only validation (mirrors forward()).
+        for (i, meta) in input.seq_metadata.iter().enumerate() {
+            if meta.is_prefill {
+                return Err(ForgeError::InvalidArgument(
+                    "forward_into does not support prefill sequences".into(),
+                ));
+            }
+            if input.token_ids[i].len() != 1 {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "forward_into expects 1 token per sequence, seq {} has {}",
+                    meta.seq_id,
+                    input.token_ids[i].len()
+                )));
+            }
+        }
+
+        let all_tokens: Vec<u32> = input.token_ids.iter().flatten().copied().collect();
+        let all_positions: Vec<u32> = input.positions.iter().flatten().copied().collect();
+        let seq_ids: Vec<u64> = input.seq_metadata.iter().map(|m| m.seq_id).collect();
+
+        // Embedding lookup → buffers.embeddings → seeds buffers.hidden.
+        self.backend.embedding_into(
+            &mut buffers.embeddings,
+            &self.embed_tokens,
+            &all_tokens,
+        )?;
+        // hidden := embeddings (memcpy via reshape_into with same shape).
+        self.backend.reshape_into(
+            &mut buffers.hidden,
+            &buffers.embeddings,
+            buffers.embeddings.shape().to_vec().as_slice(),
+        )?;
+
+        // Per-layer decoder pass — each layer reads + writes buffers.hidden.
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_batch_into(
+                &self.rope_freqs,
+                &all_positions,
+                &seq_ids,
+                kv_cache,
+                i,
+                buffers,
+                &self.backend,
+            )?;
+        }
+
+        // Final norm + lm_head: hidden → final_normed → logits.
+        self.backend.rms_norm_into(
+            &mut buffers.final_normed,
+            &buffers.hidden,
+            &self.norm.weight,
+            self.norm.eps,
+        )?;
+        self.backend.matmul_into(
+            &mut buffers.logits,
+            &buffers.final_normed,
+            &self.lm_head,
+        )?;
+        Ok(())
     }
 }
 

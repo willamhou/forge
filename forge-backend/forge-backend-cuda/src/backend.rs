@@ -1813,6 +1813,9 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// Note: cudarc 0.17.8's `CudaSlice::clone` is a device-to-device
+    /// copy, so this reshape allocates + copies (NOT a zero-copy view).
+    /// For capture-stable persistent buffers, use `reshape_into` instead.
     fn reshape(&self, x: &CudaTensor, shape: &[usize]) -> Result<CudaTensor> {
         let numel: usize = shape.iter().product();
         if numel != x.len() {
@@ -1826,6 +1829,54 @@ impl Backend for CudaBackend {
             shape: shape.to_vec(),
             dtype: x.dtype,
         })
+    }
+
+    /// In-place reshape via `memcpy_dtod` into the caller-provided buffer.
+    /// Output device pointer is stable across calls — capture-safe.
+    fn reshape_into(
+        &self,
+        out: &mut CudaTensor,
+        x: &CudaTensor,
+        shape: &[usize],
+    ) -> Result<()> {
+        let want_numel: usize = shape.iter().product();
+        if want_numel != x.len() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: x.shape.clone(),
+            });
+        }
+        if out.shape() != shape {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "reshape_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        match x.dtype() {
+            DType::F32 => {
+                let src = x.f32_slice()?;
+                let dst = out.f32_slice_mut()?;
+                self.stream
+                    .memcpy_dtod(src, dst)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+            }
+            DType::F16 => {
+                let src = x.f16_slice()?;
+                let dst = out.f16_slice_mut()?;
+                self.stream
+                    .memcpy_dtod(src, dst)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+        Ok(())
     }
 
     fn transpose(&self, x: &CudaTensor, dim0: usize, dim1: usize) -> Result<CudaTensor> {

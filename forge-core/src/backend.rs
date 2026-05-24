@@ -598,6 +598,49 @@ pub trait Backend: Send + Sync + 'static {
     fn softmax(&self, x: &Self::Tensor, dim: i32) -> Result<Self::Tensor>;
     fn embedding(&self, weight: &Self::Tensor, indices: &[u32]) -> Result<Self::Tensor>;
     fn reshape(&self, x: &Self::Tensor, shape: &[usize]) -> Result<Self::Tensor>;
+
+    /// In-place reshape — copy `x`'s contents into `out` (whose shape acts
+    /// as the target shape; numel must match). On CUDA backends today this
+    /// is a `memcpy_dtod` into `out`'s existing device buffer, so the
+    /// output pointer stays stable across calls (capture-safe).
+    ///
+    /// **Why not zero-copy?** CudaTensor wraps an owned CudaSlice, and
+    /// cudarc 0.17.8's `CudaSlice::clone` is a device-to-device copy, not
+    /// an Arc-share — see `rope_with_host_freqs_into` in CudaBackend for
+    /// the same finding. Properly view-based reshape would need
+    /// CudaTensor to hold either an `Arc<CudaSlice>` or a `CudaView`
+    /// variant, both larger refactors. The memcpy is a per-call cost but
+    /// dominated by surrounding matmul/norm work; profile shows it's
+    /// noise. The capture-stability benefit dominates.
+    fn reshape_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        shape: &[usize],
+    ) -> Result<()> {
+        let want_numel: usize = shape.iter().product();
+        if want_numel != x.shape().iter().product::<usize>() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: x.shape().to_vec(),
+            });
+        }
+        if out.shape() != shape {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "reshape_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        *out = self.reshape(x, shape)?;
+        Ok(())
+    }
     fn transpose(&self, x: &Self::Tensor, dim0: usize, dim1: usize) -> Result<Self::Tensor>;
     fn cat(&self, tensors: &[&Self::Tensor], dim: usize) -> Result<Self::Tensor>;
 
