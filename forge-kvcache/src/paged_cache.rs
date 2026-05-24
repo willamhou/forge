@@ -15,7 +15,9 @@
 
 use std::collections::HashMap;
 
-use forge_core::{Backend, CacheUsage, DType, ForgeError, KvCache, Result, Tensor};
+use forge_core::{
+    Backend, CacheUsage, DType, ForgeError, KvCache, PagedAttentionInputs, Result, Tensor,
+};
 
 /// Block pool: backend-allocated K/V tensors, one (K, V) pair per layer.
 struct BlockPool<B: Backend> {
@@ -378,6 +380,33 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
     fn can_allocate(&self, num_tokens: usize) -> bool {
         let blocks_needed = ((num_tokens + self.block_size - 1) / self.block_size).max(1);
         self.free_blocks.len() >= blocks_needed
+    }
+
+    fn paged_attention_inputs<'a>(
+        &'a self,
+        layer: usize,
+        seq_ids: &[u64],
+    ) -> Option<Result<PagedAttentionInputs<'a, Self::T>>> {
+        let pool_pair = match self.pool.layers.get(layer) {
+            Some(p) => p,
+            None => {
+                return Some(Err(ForgeError::InvalidArgument(format!(
+                    "paged_attention_inputs: layer {layer} out of bounds ({} layers)",
+                    self.num_layers
+                ))));
+            }
+        };
+        let meta = match self.batch_block_tables(seq_ids) {
+            Ok(m) => m,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(PagedAttentionInputs {
+            k_pool: &pool_pair.0,
+            v_pool: &pool_pair.1,
+            block_tables: meta.0,
+            kv_lens: meta.1,
+            max_blocks_per_seq: meta.2,
+        }))
     }
 }
 

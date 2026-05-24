@@ -186,7 +186,31 @@ impl<B: Backend> LlamaAttention<B> {
             kv_cache.append(seq_ids[i], layer_idx, &k_row, &v_row)?;
         }
 
-        // Retrieve full KV caches for all sequences
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+        // Paged attention fast path (PagedKvCache only). Single fused kernel
+        // launch reading K/V from the device-resident pool through block tables
+        // — no per-seq gather + multi_head_attention dance, capture-friendly.
+        if let Some(inputs_result) = kv_cache.paged_attention_inputs(layer_idx, seq_ids) {
+            let inputs = inputs_result?;
+            let attn_out = backend.paged_attention(
+                &q,
+                inputs.k_pool,
+                inputs.v_pool,
+                &inputs.block_tables,
+                &inputs.kv_lens,
+                inputs.max_blocks_per_seq,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                scale,
+            )?;
+            let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
+            return backend.matmul(&attn_out, &self.wo);
+        }
+
+        // Fallback for non-paged caches (e.g. NaiveKvCache): retrieve full KV
+        // per seq and dispatch to batched_decode_attention.
         let mut k_caches = Vec::with_capacity(n);
         let mut v_caches = Vec::with_capacity(n);
         for i in 0..n {
@@ -195,7 +219,6 @@ impl<B: Backend> LlamaAttention<B> {
             v_caches.push(v_full);
         }
 
-        // Batched decode attention -- single kernel for all sequences
         let attn_out = backend.batched_decode_attention(
             &q,
             &k_caches,
@@ -203,7 +226,7 @@ impl<B: Backend> LlamaAttention<B> {
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            1.0 / (self.head_dim as f32).sqrt(),
+            scale,
         )?;
 
         // Cast + output projection
