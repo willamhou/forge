@@ -122,3 +122,109 @@ extern "C" __global__ void paged_attention_f32(
         out_ptr[d] = s_out[d] * inv_sum;
 }
 "#;
+
+/// F16 variant. Same algorithm; accumulation stays in f32 for numerical
+/// stability (softmax exponents underflow fast at f16). Pool / q / out are
+/// `__half`; intermediate scores, accumulator, and softmax denominator are
+/// all f32 in shared memory and registers — `__half2float` on read,
+/// `__float2half` on write.
+pub const F16_SRC: &str = r#"
+extern "C" __global__ void paged_attention_f16(
+    __half* out,
+    const __half* q,
+    const __half* k_pool,
+    const __half* v_pool,
+    const int* block_tables,
+    const int* kv_lens,
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq
+) {
+    int seq_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int tid = threadIdx.x;
+    int kv_len = kv_lens[seq_idx];
+    int heads_per_group = num_heads / num_kv_heads;
+    int kv_head = head_idx / heads_per_group;
+    int kv_dim = num_kv_heads * head_dim;
+
+    const __half* q_ptr = q + seq_idx * num_heads * head_dim + head_idx * head_dim;
+    const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    extern __shared__ float smem[];
+    float* scratch = smem;
+    float* s_out = smem + blockDim.x;
+
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_out[d] = 0.0f;
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        int block_idx = t / block_size;
+        int slot      = t - block_idx * block_size;
+        int block_id  = my_block_table[block_idx];
+        const __half* k_t = k_pool
+            + block_id * block_size * kv_dim
+            + slot * kv_dim
+            + kv_head * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            score += __half2float(q_ptr[d]) * __half2float(k_t[d]);
+        score *= scale;
+        if (score > local_max) local_max = score;
+    }
+
+    scratch[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && scratch[tid + s] > scratch[tid])
+            scratch[tid] = scratch[tid + s];
+        __syncthreads();
+    }
+    float global_max = scratch[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        int block_idx = t / block_size;
+        int slot      = t - block_idx * block_size;
+        int block_id  = my_block_table[block_idx];
+        const __half* k_t = k_pool
+            + block_id * block_size * kv_dim
+            + slot * kv_dim
+            + kv_head * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            score += __half2float(q_ptr[d]) * __half2float(k_t[d]);
+        score *= scale;
+        float w = expf(score - global_max);
+        local_sum += w;
+
+        const __half* v_t = v_pool
+            + block_id * block_size * kv_dim
+            + slot * kv_dim
+            + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d++)
+            atomicAdd(&s_out[d], w * __half2float(v_t[d]));
+    }
+    __syncthreads();
+
+    scratch[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] += scratch[tid + s];
+        __syncthreads();
+    }
+    float total_sum = scratch[0];
+    __syncthreads();
+
+    float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
+    __half* out_ptr = out + seq_idx * num_heads * head_dim + head_idx * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        out_ptr[d] = __float2half(s_out[d] * inv_sum);
+}
+"#;

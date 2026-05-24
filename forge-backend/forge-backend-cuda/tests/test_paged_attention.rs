@@ -194,16 +194,17 @@ fn paged_attention_cuda_matches_default_impl() {
         )
         .expect_err("q shape mismatch should fail");
 
-    // Allocate F16 pool to check dtype rejection.
-    let pool_f16 = backend
-        .allocate_zeros(&[total_blocks, block_size, kv_dim], DType::F16)
-        .unwrap();
+    // ── F16 path: same shape, cast all inputs to F16, run kernel,
+    //    compare against F32 reference within 5e-3 ────────────────
+    let k_pool_f16 = backend.cast(&k_pool, DType::F16).unwrap();
+    let v_pool_f16 = backend.cast(&v_pool, DType::F16).unwrap();
     let q_f16 = backend.cast(&q, DType::F16).unwrap();
-    let _ = backend
+
+    let out_f16 = backend
         .paged_attention(
             &q_f16,
-            &pool_f16,
-            &pool_f16,
+            &k_pool_f16,
+            &v_pool_f16,
             &block_tables,
             &kv_lens,
             max_blocks,
@@ -212,5 +213,41 @@ fn paged_attention_cuda_matches_default_impl() {
             head_dim,
             scale,
         )
-        .expect_err("F16 pool not yet supported");
+        .unwrap();
+    backend.synchronize().unwrap();
+    assert_eq!(out_f16.shape(), &[batch_size, num_heads * head_dim]);
+    assert_eq!(out_f16.dtype(), DType::F16);
+
+    // Cast F16 output back to F32 for comparison.
+    let out_f16_as_f32 = backend.cast(&out_f16, DType::F32).unwrap();
+    let h_f16 = backend.copy_to_host_f32(&out_f16_as_f32).unwrap();
+
+    let max_abs_diff_f16 = h_f16
+        .iter()
+        .zip(&out_ref_host)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    let tol_f16 = 5e-3_f32.max(max_abs_val * 5e-3);
+    assert!(
+        max_abs_diff_f16 < tol_f16,
+        "F16 vs F32 reference max abs diff {max_abs_diff_f16} > tol {tol_f16}\n  f16[0..8] = {:?}\n  ref[0..8] = {:?}",
+        &h_f16[..h_f16.len().min(8)],
+        &out_ref_host[..out_ref_host.len().min(8)],
+    );
+
+    // ── Mixed-dtype rejection: F16 q against F32 pool should fail upfront ─
+    let _ = backend
+        .paged_attention(
+            &q_f16,
+            &k_pool, // F32
+            &v_pool, // F32
+            &block_tables,
+            &kv_lens,
+            max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect_err("mixed F16 q + F32 pool should be rejected");
 }
