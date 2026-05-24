@@ -315,6 +315,9 @@ pub trait Backend: Send + Sync + 'static {
             )));
         }
 
+        let num_blocks = pool_shape[0];
+        let block_size = pool_shape[1];
+
         let mut k_caches = Vec::with_capacity(batch_size);
         let mut v_caches = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
@@ -325,13 +328,25 @@ pub trait Backend: Send + Sync + 'static {
                 )));
             }
             let kv_len = kv_len as usize;
+            // Per-seq: must have enough block-table entries to cover kv_len.
+            let blocks_needed = kv_len.div_ceil(block_size);
+            if blocks_needed > max_blocks_per_seq {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "paged_attention: seq[{b}] kv_len={kv_len} needs {blocks_needed} blocks but max_blocks_per_seq={max_blocks_per_seq}"
+                )));
+            }
             let row_start = b * max_blocks_per_seq;
             let row = &block_tables[row_start..row_start + max_blocks_per_seq];
-            let block_ids: Vec<usize> = row
-                .iter()
-                .take_while(|&&id| id >= 0)
-                .map(|&id| id as usize)
-                .collect();
+            // Per-seq: the first blocks_needed entries must be valid (no -1, in pool range).
+            for (j, &id) in row.iter().take(blocks_needed).enumerate() {
+                if id < 0 || (id as usize) >= num_blocks {
+                    return Err(crate::ForgeError::InvalidArgument(format!(
+                        "paged_attention: seq[{b}] block_tables[{j}]={id} invalid (num_blocks={num_blocks})"
+                    )));
+                }
+            }
+            let block_ids: Vec<usize> =
+                row.iter().take(blocks_needed).map(|&id| id as usize).collect();
             k_caches.push(self.paged_gather_kv(k_pool, &block_ids, kv_len)?);
             v_caches.push(self.paged_gather_kv(v_pool, &block_ids, kv_len)?);
         }

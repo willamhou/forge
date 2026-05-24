@@ -70,19 +70,21 @@ pub trait KvCache: Send + Sync {
 
     /// Assemble inputs for the fused paged-attention kernel.
     ///
-    /// Default returns `None` — the caller falls back to the `get_kv` +
-    /// `multi_head_attention` path. Paged caches override to return
-    /// `Some(Ok(...))` so the decode hot path can use a fused single-kernel
-    /// launch.
+    /// - `Ok(None)`: this cache doesn't support paged attention — the caller
+    ///   falls back to the `get_kv` + `multi_head_attention` path.
+    /// - `Ok(Some(inputs))`: paged inputs assembled; caller can dispatch the
+    ///   fused single-kernel paged_attention launch.
+    /// - `Err(_)`: paged inputs were requested but could not be assembled
+    ///   (e.g. unknown seq_id, layer out of bounds).
     ///
-    /// Returning `Some(Err(_))` signals that paged inputs were requested but
-    /// could not be assembled (e.g. a seq id is missing) — distinct from "this
-    /// cache type doesn't support paged attention" (`None`).
+    /// `Result<Option<_>>` rather than `Option<Result<_>>` so the call site
+    /// can use `?` to propagate errors and then match on the `Option` for
+    /// the dispatch decision.
     fn paged_attention_inputs<'a>(
         &'a self,
         _layer: usize,
         _seq_ids: &[u64],
-    ) -> Option<Result<PagedAttentionInputs<'a, Self::T>>> {
-        None
+    ) -> Result<Option<PagedAttentionInputs<'a, Self::T>>> {
+        Ok(None)
     }
 }

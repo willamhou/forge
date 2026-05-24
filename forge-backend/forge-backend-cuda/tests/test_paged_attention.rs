@@ -448,4 +448,80 @@ fn paged_attention_cuda_matches_default_impl() {
             scale,
         )
         .expect_err("wrong out dtype should fail");
+
+    // ── Host-side bounds checks: seq needing more blocks than max_blocks_per_seq ─
+    //
+    // block_size = 4. Seq with kv_len=10 needs ceil(10/4) = 3 blocks. With
+    // max_blocks_per_seq = 2, this must be rejected before launch.
+    let oob_kv_lens: Vec<i32> = vec![10, 5];
+    let oob_max_blocks = 2; // not enough for kv_len=10
+    let oob_block_tables: Vec<i32> = vec![0, 1, 3, 4]; // 2 * 2
+    let mut oob_out = backend
+        .allocate_zeros(&[2, num_heads * head_dim], DType::F32)
+        .unwrap();
+    let _ = backend
+        .paged_attention_into(
+            &mut oob_out,
+            &q,
+            &k_pool,
+            &v_pool,
+            &oob_block_tables,
+            &oob_kv_lens,
+            oob_max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect_err("kv_len needing more blocks than max_blocks_per_seq must fail");
+
+    // ── Host-side bounds: -1 padding within blocks_needed range ─────
+    //
+    // block_size = 4, kv_len = 5 → blocks_needed = 2. With block_tables row =
+    // [0, -1, ...], the second entry is needed but is padding → error.
+    let pad_kv_lens: Vec<i32> = vec![5];
+    let pad_max_blocks = 3;
+    let pad_block_tables: Vec<i32> = vec![0, -1, -1];
+    let mut pad_out = backend
+        .allocate_zeros(&[1, num_heads * head_dim], DType::F32)
+        .unwrap();
+    let _ = backend
+        .paged_attention_into(
+            &mut pad_out,
+            &q_f16, // any q with batch=1, num_heads*head_dim — actually no, batch must be 1
+            &k_pool,
+            &v_pool,
+            &pad_block_tables,
+            &pad_kv_lens,
+            pad_max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect_err("padding in active block-table range must fail (or upstream dtype check)");
+
+    // ── Host-side bounds: block_id beyond pool's num_blocks ─────────
+    //
+    // pool has total_blocks=8. Use block_id=999 → must reject.
+    let huge_block_tables: Vec<i32> = vec![0, 1, 999, 3, 4, -1];
+    let huge_kv_lens: Vec<i32> = vec![9, 5]; // seq 0 needs 3 blocks; 3rd entry is 999
+    let mut huge_out = backend
+        .allocate_zeros(&[2, num_heads * head_dim], DType::F32)
+        .unwrap();
+    let _ = backend
+        .paged_attention_into(
+            &mut huge_out,
+            &q,
+            &k_pool,
+            &v_pool,
+            &huge_block_tables,
+            &huge_kv_lens,
+            3,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect_err("block_id beyond pool size must fail");
 }

@@ -24,6 +24,7 @@ struct BlockPool<B: Backend> {
     /// `layers[layer] = (k_pool, v_pool)`; each pool shape `[num_blocks, block_size, kv_dim]`.
     layers: Vec<(B::Tensor, B::Tensor)>,
     kv_dim: usize,
+    dtype: DType,
 }
 
 impl<B: Backend> BlockPool<B> {
@@ -33,15 +34,20 @@ impl<B: Backend> BlockPool<B> {
         total_blocks: usize,
         block_size: usize,
         kv_dim: usize,
+        dtype: DType,
     ) -> Result<Self> {
         let shape = [total_blocks, block_size, kv_dim];
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            let k = backend.allocate_zeros(&shape, DType::F32)?;
-            let v = backend.allocate_zeros(&shape, DType::F32)?;
+            let k = backend.allocate_zeros(&shape, dtype)?;
+            let v = backend.allocate_zeros(&shape, dtype)?;
             layers.push((k, v));
         }
-        Ok(Self { layers, kv_dim })
+        Ok(Self {
+            layers,
+            kv_dim,
+            dtype,
+        })
     }
 
     /// Write K/V rows for a layer at the given slot positions.
@@ -80,6 +86,11 @@ struct SeqInfo {
     block_ids: Vec<usize>,
     /// Total number of tokens stored across all blocks.
     num_tokens: usize,
+    /// Layer index the next `append` must use. Cycles 0 → 1 → ... → num_layers-1 → 0.
+    /// Prevents silent state corruption from out-of-order layer appends (the
+    /// `seq.num_tokens - new_tokens` arithmetic in the layer > 0 branch
+    /// assumes layer 0 already advanced num_tokens by the same new_tokens).
+    next_expected_layer: usize,
 }
 
 /// Paged KV cache with block-based memory management.
@@ -112,6 +123,9 @@ impl<B: Backend> PagedKvCache<B> {
     /// - `num_layers`: number of transformer layers
     /// - `num_kv_heads`: number of KV attention heads
     /// - `head_dim`: dimension per attention head
+    /// - `dtype`: pool element dtype. Must match the dtype of K/V tensors
+    ///   passed to `append` and the dtype the paged_attention kernel expects
+    ///   — typically the model's activation dtype (F16/BF16 in production).
     pub fn new(
         backend: B,
         total_blocks: usize,
@@ -119,9 +133,17 @@ impl<B: Backend> PagedKvCache<B> {
         num_layers: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        dtype: DType,
     ) -> Result<Self> {
         let kv_dim = num_kv_heads * head_dim;
-        let pool = BlockPool::new(&backend, num_layers, total_blocks, block_size, kv_dim)?;
+        let pool = BlockPool::new(
+            &backend,
+            num_layers,
+            total_blocks,
+            block_size,
+            kv_dim,
+            dtype,
+        )?;
         Ok(Self {
             backend,
             pool,
@@ -131,6 +153,11 @@ impl<B: Backend> PagedKvCache<B> {
             free_blocks: (0..total_blocks).rev().collect(),
             sequences: HashMap::new(),
         })
+    }
+
+    /// Pool element dtype.
+    pub fn dtype(&self) -> DType {
+        self.pool.dtype
     }
 
     /// Borrow the K pool tensor for a layer (shape `[num_blocks, block_size, kv_dim]`).
@@ -244,6 +271,7 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             SeqInfo {
                 block_ids,
                 num_tokens: 0, // filled by append()
+                next_expected_layer: 0,
             },
         );
         Ok(())
@@ -277,13 +305,33 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
         // Determine write start position.
         // Layer 0 writes at current num_tokens and then advances the count.
         // Layers > 0 write at the same positions (count was already advanced by layer 0).
+        //
+        // Enforces strict round-robin layer ordering per token batch — see
+        // `SeqInfo::next_expected_layer`. Out-of-order calls would either
+        // silently corrupt slot positions (layer 0 called twice in a row
+        // double-counts num_tokens) or underflow (layer N before layer 0).
         let seq = self
             .sequences
             .get(&seq_id)
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
+        if layer != seq.next_expected_layer {
+            return Err(ForgeError::InvalidArgument(format!(
+                "append: seq {seq_id} expected layer {} next, got {layer}",
+                seq.next_expected_layer
+            )));
+        }
         let write_start = if layer == 0 {
             seq.num_tokens
         } else {
+            // Defense in depth: layer ordering guarantees this is non-negative,
+            // but we still guard the subtract so a corrupted invariant produces
+            // an error rather than a silent wrap-around.
+            if seq.num_tokens < new_tokens {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "append: seq {seq_id} layer {layer} new_tokens={new_tokens} > num_tokens={} (layer 0 wrote a different count)",
+                    seq.num_tokens
+                )));
+            }
             seq.num_tokens - new_tokens
         };
 
@@ -314,9 +362,11 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             .write_tokens(&self.backend, layer, key, value, &slot_mapping)?;
 
         // Only update token count on layer 0
+        let seq_mut = self.sequences.get_mut(&seq_id).unwrap();
         if layer == 0 {
-            self.sequences.get_mut(&seq_id).unwrap().num_tokens += new_tokens;
+            seq_mut.num_tokens += new_tokens;
         }
+        seq_mut.next_expected_layer = (layer + 1) % self.num_layers;
 
         Ok(())
     }
@@ -386,26 +436,21 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
         &'a self,
         layer: usize,
         seq_ids: &[u64],
-    ) -> Option<Result<PagedAttentionInputs<'a, Self::T>>> {
-        let pool_pair = match self.pool.layers.get(layer) {
-            Some(p) => p,
-            None => {
-                return Some(Err(ForgeError::InvalidArgument(format!(
-                    "paged_attention_inputs: layer {layer} out of bounds ({} layers)",
-                    self.num_layers
-                ))));
-            }
-        };
-        let meta = match self.batch_block_tables(seq_ids) {
-            Ok(m) => m,
-            Err(e) => return Some(Err(e)),
-        };
-        Some(Ok(PagedAttentionInputs {
+    ) -> Result<Option<PagedAttentionInputs<'a, Self::T>>> {
+        let pool_pair = self.pool.layers.get(layer).ok_or_else(|| {
+            ForgeError::InvalidArgument(format!(
+                "paged_attention_inputs: layer {layer} out of bounds ({} layers)",
+                self.num_layers
+            ))
+        })?;
+        let (block_tables, kv_lens, max_blocks_per_seq) =
+            self.batch_block_tables(seq_ids)?;
+        Ok(Some(PagedAttentionInputs {
             k_pool: &pool_pair.0,
             v_pool: &pool_pair.1,
-            block_tables: meta.0,
-            kv_lens: meta.1,
-            max_blocks_per_seq: meta.2,
+            block_tables,
+            kv_lens,
+            max_blocks_per_seq,
         }))
     }
 }
@@ -531,7 +576,7 @@ mod tests {
     #[test]
     fn test_allocate_and_free() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 2, 4).unwrap();
+        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 2, 4, DType::F32).unwrap();
         // kv_dim = 2 * 4 = 8
 
         cache.allocate(1, 3).unwrap();
@@ -545,7 +590,7 @@ mod tests {
     #[test]
     fn test_append_and_get_kv() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 1, 4).unwrap();
+        let mut cache = PagedKvCache::new(backend, 8, 4, 2, 1, 4, DType::F32).unwrap();
         // kv_dim = 1 * 4 = 4, block_size = 4
 
         cache.allocate(1, 2).unwrap();
@@ -583,7 +628,7 @@ mod tests {
     #[test]
     fn test_append_incremental_decode() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2).unwrap();
+        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2, DType::F32).unwrap();
         // kv_dim = 2, block_size = 2
 
         cache.allocate(1, 3).unwrap();
@@ -613,7 +658,7 @@ mod tests {
     #[test]
     fn test_block_boundary_crossing() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2).unwrap();
+        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2, DType::F32).unwrap();
         // kv_dim = 2, block_size = 2 → each block holds 2 tokens
 
         cache.allocate(1, 1).unwrap(); // allocate 1 block
@@ -643,7 +688,7 @@ mod tests {
     #[test]
     fn test_out_of_memory() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 1, 2, 1, 1, 2).unwrap();
+        let mut cache = PagedKvCache::new(backend, 1, 2, 1, 1, 2, DType::F32).unwrap();
         // Only 1 block, 2 tokens capacity
 
         cache.allocate(1, 2).unwrap();
@@ -661,7 +706,7 @@ mod tests {
     #[test]
     fn test_usage_tracking() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 4, 2, 1, 1, 2).unwrap();
+        let mut cache = PagedKvCache::new(backend, 4, 2, 1, 1, 2, DType::F32).unwrap();
 
         assert_eq!(cache.usage().used_blocks, 0);
         assert!(cache.can_allocate(4));
@@ -678,7 +723,7 @@ mod tests {
     #[test]
     fn test_multiple_sequences() {
         let backend = TestBackend;
-        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2).unwrap();
+        let mut cache = PagedKvCache::new(backend, 8, 2, 1, 1, 2, DType::F32).unwrap();
 
         cache.allocate(1, 2).unwrap();
         cache.allocate(2, 2).unwrap();
@@ -704,7 +749,7 @@ mod tests {
     fn test_pool_accessors() {
         let backend = TestBackend;
         // 4 blocks x 3 tokens/block, kv_dim = 2*4 = 8, 2 layers
-        let cache = PagedKvCache::new(backend, 4, 3, 2, 2, 4).unwrap();
+        let cache = PagedKvCache::new(backend, 4, 3, 2, 2, 4, DType::F32).unwrap();
 
         // Each layer's pool tensor has shape [num_blocks, block_size, kv_dim]
         let k0 = cache.k_pool(0).unwrap();
@@ -720,10 +765,65 @@ mod tests {
     }
 
     #[test]
+    fn test_layer_ordering_enforced() {
+        let backend = TestBackend;
+        // 3 layers, kv_dim = 1*2 = 2, block_size = 2
+        let mut cache = PagedKvCache::new(backend, 4, 2, 3, 1, 2, DType::F32).unwrap();
+        cache.allocate(1, 2).unwrap();
+
+        let k = make_tensor(&[1.0, 2.0], &[1, 2]);
+        let v = make_tensor(&[10.0, 20.0], &[1, 2]);
+
+        // Layer 1 before layer 0 → rejected.
+        assert!(
+            cache.append(1, 1, &k, &v).is_err(),
+            "layer 1 before layer 0 must error"
+        );
+        // Layer 2 before layer 0 → rejected.
+        assert!(cache.append(1, 2, &k, &v).is_err());
+
+        // Layer 0 succeeds.
+        cache.append(1, 0, &k, &v).unwrap();
+
+        // Layer 0 again (skipping 1, 2) → rejected.
+        assert!(
+            cache.append(1, 0, &k, &v).is_err(),
+            "layer 0 again before layer 1 must error"
+        );
+        // Layer 2 (skipping 1) → rejected.
+        assert!(cache.append(1, 2, &k, &v).is_err());
+
+        // Layer 1 succeeds.
+        cache.append(1, 1, &k, &v).unwrap();
+        // Layer 2 succeeds.
+        cache.append(1, 2, &k, &v).unwrap();
+
+        // Wraps back to layer 0 for next token batch.
+        cache.append(1, 0, &k, &v).unwrap();
+        assert_eq!(cache.get_seq_len(1).unwrap(), 2);
+
+        // Mismatched new_tokens for layer 1 (give 2 tokens, but layer 0 gave 1) →
+        // the underflow guard catches this. (1 - 2 < 0 = error.)
+        let k_big = make_tensor(&[3.0, 4.0, 5.0, 6.0], &[2, 2]);
+        let v_big = make_tensor(&[30.0, 40.0, 50.0, 60.0], &[2, 2]);
+        // After the layer-0 write above, num_tokens=2 and next_expected_layer=1.
+        // Layer 1 with 2 tokens would compute write_start = 2 - 2 = 0 — but
+        // layer 0 wrote at position 1, so layer 1 should write at position 1.
+        // (The strict check is hard without per-layer counts; the underflow
+        // guard at least catches new_tokens > num_tokens.)
+        let k_huge = make_tensor(&[1.0; 8], &[4, 2]);
+        let v_huge = make_tensor(&[2.0; 8], &[4, 2]);
+        assert!(
+            cache.append(1, 1, &k_huge, &v_huge).is_err(),
+            "layer 1 with new_tokens > num_tokens must error"
+        );
+    }
+
+    #[test]
     fn test_batch_block_tables() {
         let backend = TestBackend;
         // 16 blocks, 2 tokens/block, 1 layer, kv_dim = 1*2 = 2
-        let mut cache = PagedKvCache::new(backend, 16, 2, 1, 1, 2).unwrap();
+        let mut cache = PagedKvCache::new(backend, 16, 2, 1, 1, 2, DType::F32).unwrap();
 
         // seq 1: 5 tokens → 3 blocks (ceil(5/2))
         cache.allocate(1, 5).unwrap();

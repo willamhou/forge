@@ -39,6 +39,7 @@ fn paged_attention_matches_gather_then_attend_gqa() {
         num_layers,
         num_kv_heads,
         head_dim,
+        DType::F32,
     )
     .unwrap();
 

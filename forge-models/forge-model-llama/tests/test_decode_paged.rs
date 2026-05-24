@@ -158,6 +158,7 @@ fn batched_decode_paged_matches_naive() {
         config.num_hidden_layers,
         config.num_key_value_heads,
         config.head_dim,
+        /* dtype */ DType::F32,
     )
     .unwrap();
     prefill(&model, &mut kv_paged, 1, &[0, 1, 2]);

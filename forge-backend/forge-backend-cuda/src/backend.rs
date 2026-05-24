@@ -342,10 +342,40 @@ impl CudaBackend {
             )));
         }
 
+        let num_blocks = pool_shape[0];
         let block_size = pool_shape[1];
+
+        // Per-seq bounds: enough block-table entries for kv_len, and every
+        // entry the kernel will dereference (the first blocks_needed of each
+        // row) must be a valid block id. Padding entries past blocks_needed
+        // are not touched by the kernel.
+        for (b, &kv_len_i32) in kv_lens.iter().enumerate() {
+            let kv_len = kv_len_i32 as usize;
+            let blocks_needed = kv_len.div_ceil(block_size);
+            if blocks_needed > max_blocks_per_seq {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "paged_attention_into: seq[{b}] kv_len={kv_len} needs {blocks_needed} blocks but max_blocks_per_seq={max_blocks_per_seq}"
+                )));
+            }
+            let row_start = b * max_blocks_per_seq;
+            for j in 0..blocks_needed {
+                let id = block_tables[row_start + j];
+                if id < 0 || (id as usize) >= num_blocks {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "paged_attention_into: seq[{b}] block_tables[{j}]={id} invalid (num_blocks={num_blocks})"
+                    )));
+                }
+            }
+        }
 
         // Upload i32 metadata into persistent device scratch (stable address,
         // version bumps on grow — see `paged_scratch_versions`).
+        //
+        // Both scratch mutexes are held through the kernel launch below.
+        // Safe today because CudaBackend's contract (`see struct doc`) is
+        // single-threaded engine access — no recursion, no contention. Lock
+        // order is stable (block_tables → kv_lens) so even if that contract
+        // changes there's no deadlock risk between paged_attention calls.
         let mut bt_scratch = self
             .paged_block_tables
             .lock()
@@ -1616,10 +1646,12 @@ impl Backend for CudaBackend {
             )));
         }
 
-        match pool.dtype() {
-            DType::F32 => {
-                let src_slice = src.f32_slice()?;
-                let pool_slice = pool.f32_slice_mut()?;
+        // Coalesce consecutive slots into a single memcpy per run. Shared by
+        // F32 and F16 paths — only the slice accessor and element type differ.
+        macro_rules! run_dtod {
+            ($get_src:ident, $get_dst:ident) => {{
+                let src_slice = src.$get_src()?;
+                let pool_slice = pool.$get_dst()?;
                 let mut run_start = 0usize;
                 while run_start < slot_mapping.len() {
                     let mut run_end = run_start + 1;
@@ -1640,7 +1672,12 @@ impl Backend for CudaBackend {
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                     run_start = run_end;
                 }
-            }
+            }};
+        }
+
+        match pool.dtype() {
+            DType::F32 => run_dtod!(f32_slice, f32_slice_mut),
+            DType::F16 => run_dtod!(f16_slice, f16_slice_mut),
             other => {
                 return Err(ForgeError::UnsupportedDtype(other));
             }
@@ -1669,23 +1706,27 @@ impl Backend for CudaBackend {
         let kv_dim = pool_shape[2];
         let out_shape = vec![total_tokens, kv_dim];
 
-        match pool.dtype() {
-            DType::F32 => {
-                let pool_slice = pool.f32_slice()?;
+        // Bounds-check all block_ids first, regardless of dtype.
+        for &block_id in block_ids {
+            if block_id >= num_blocks {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "paged_gather_kv: block_id {block_id} out of bounds ({num_blocks})"
+                )));
+            }
+        }
+
+        macro_rules! gather_dtod {
+            ($T:ty, $get_pool:ident, $ctor:ident) => {{
+                let pool_slice = pool.$get_pool()?;
                 let mut out = self
                     .stream
-                    .alloc_zeros::<f32>(total_tokens * kv_dim)
+                    .alloc_zeros::<$T>(total_tokens * kv_dim)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 let mut remaining = total_tokens;
                 let mut out_off = 0usize;
                 for &block_id in block_ids {
                     if remaining == 0 {
                         break;
-                    }
-                    if block_id >= num_blocks {
-                        return Err(ForgeError::InvalidArgument(format!(
-                            "paged_gather_kv: block_id {block_id} out of bounds ({num_blocks})"
-                        )));
                     }
                     let fill = remaining.min(block_size);
                     let src_off = block_id * block_size * kv_dim;
@@ -1699,8 +1740,13 @@ impl Backend for CudaBackend {
                     out_off += elems;
                     remaining -= fill;
                 }
-                Ok(CudaTensor::f32_data(out, out_shape))
-            }
+                Ok(CudaTensor::$ctor(out, out_shape))
+            }};
+        }
+
+        match pool.dtype() {
+            DType::F32 => gather_dtod!(f32, f32_slice, f32_data),
+            DType::F16 => gather_dtod!(half::f16, f16_slice, f16_data),
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }

@@ -191,8 +191,13 @@ impl<B: Backend> LlamaAttention<B> {
         // Paged attention fast path (PagedKvCache only). Single fused kernel
         // launch reading K/V from the device-resident pool through block tables
         // — no per-seq gather + multi_head_attention dance, capture-friendly.
-        if let Some(inputs_result) = kv_cache.paged_attention_inputs(layer_idx, seq_ids) {
-            let inputs = inputs_result?;
+        //
+        // TODO(task-3 capture): this calls the allocating variant, which
+        // produces a fresh output CudaTensor every step. For CUDA Graph
+        // capture, the engine must thread a persistent output buffer through
+        // here and call `CudaBackend::paged_attention_into` instead so the
+        // captured kernel's output arg points at a stable device address.
+        if let Some(inputs) = kv_cache.paged_attention_inputs(layer_idx, seq_ids)? {
             let attn_out = backend.paged_attention(
                 &q,
                 inputs.k_pool,

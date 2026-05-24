@@ -118,4 +118,53 @@ fn paged_pool_device_roundtrip() {
         .paged_write_kv(&mut pool, &src_a_t, &[100]) // capacity is 8 slots
         .expect_err("oob slot should fail");
     let _ = bad; // any error variant is fine
+
+    // ── Test 8: F16 pool round-trip ───────────────────────────────────
+    //
+    // Same logical layout as the F32 case (4 blocks, 2 tokens/block, kv_dim=3),
+    // but allocated as F16. Verifies the F16 dtype dispatch in paged_write_kv
+    // and paged_gather_kv. F16 has limited precision so we just check that
+    // each value's F16-cast round-trip matches.
+    let mut pool_f16 = backend
+        .allocate_zeros(&[4, 2, 3], DType::F16)
+        .expect("F16 pool alloc");
+
+    // Build an F16 source: 4 tokens of kv_dim=3.
+    let src_f16_data: Vec<half::f16> =
+        (0..12).map(|i| half::f16::from_f32(i as f32 * 0.25)).collect();
+    let src_f16 = backend
+        .copy_from_host_f16(&src_f16_data, &[4, 3])
+        .expect("F16 src upload");
+
+    // Write into slots [0, 1, 2, 3] (first two blocks).
+    backend
+        .paged_write_kv(&mut pool_f16, &src_f16, &[0, 1, 2, 3])
+        .expect("paged_write_kv F16");
+    backend.synchronize().unwrap();
+
+    // Gather blocks [0, 1] for 4 tokens — should match src_f16.
+    let gathered_f16 = backend
+        .paged_gather_kv(&pool_f16, &[0, 1], 4)
+        .expect("paged_gather_kv F16");
+    assert_eq!(gathered_f16.shape(), &[4, 3]);
+    assert_eq!(gathered_f16.dtype(), DType::F16);
+    // Cast back to F32 for value comparison.
+    let gathered_as_f32 = backend.cast(&gathered_f16, DType::F32).unwrap();
+    let g_f32 = backend.copy_to_host_f32(&gathered_as_f32).unwrap();
+    let expected_f32: Vec<f32> =
+        src_f16_data.iter().map(|h| h.to_f32()).collect();
+    for (i, (got, want)) in g_f32.iter().zip(&expected_f32).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "F16 round-trip mismatch at [{i}]: got {got} want {want}"
+        );
+    }
+
+    // Mixed dtype rejected (F32 src into F16 pool).
+    let src_wrong_dtype = backend
+        .copy_from_host_f32(&[0.0; 12], &[4, 3])
+        .unwrap();
+    let _ = backend
+        .paged_write_kv(&mut pool_f16, &src_wrong_dtype, &[0, 1, 2, 3])
+        .expect_err("F32 src into F16 pool should fail");
 }
