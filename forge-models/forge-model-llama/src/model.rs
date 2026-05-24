@@ -123,6 +123,28 @@ impl<B: Backend + Clone> LlamaModel<B> {
     ///   rejected by `LlamaAttention::forward_batch_into` upfront.
     ///
     /// Returns `Ok(())` on success; callers read `buffers.logits` to consume.
+    ///
+    /// ## ⚠️ CUDA-Graph capture not yet safe
+    ///
+    /// `forward_into` is structurally compatible with capture (every
+    /// kernel arg's device pointer is stable), but two host-side gaps
+    /// remain that would cause silent corruption on replay:
+    ///
+    /// 1. `PagedKvCache::append` builds a fresh `Vec<i32>` slot_mapping
+    ///    per call and passes a borrowed slice to `paged_write_kv`. The
+    ///    captured `memcpy_htod` node bakes the Vec's host pointer; on
+    ///    replay that pointer is stale (Vec dropped).
+    /// 2. `forward_into` itself builds fresh `all_tokens` / `all_positions`
+    ///    / `seq_ids` Vecs (and `RopeFreqs::apply_with_positions_into`
+    ///    builds fresh `cos_data`/`sin_data`). Same captured-memcpy_htod
+    ///    issue.
+    ///
+    /// Until the engine wires persistent host buffers for all of these,
+    /// **do NOT wrap `forward_into` in `CudaGraphCache::run_or_capture`
+    /// directly** — replays produce wrong KV / wrong token / wrong RoPE
+    /// state. Use the alloc-variant `forward()` for eager runs in the
+    /// meantime; `forward_into` is currently a foundation for the
+    /// upcoming engine integration, not a drop-in user-facing API.
     pub fn forward_into(
         &self,
         input: &ModelInput,
@@ -182,16 +204,22 @@ impl<B: Backend + Clone> LlamaModel<B> {
             )?;
         }
 
-        // Final norm + lm_head: hidden → final_normed → logits.
+        // Final norm + lm_head:
+        //   hidden → rms_norm → final_normed (activation dtype)
+        //   → cast → final_normed_cast (lm_head dtype)
+        //   → matmul(lm_head) → logits (lm_head dtype)
+        // The cast is a no-op memcpy when dtypes match.
         self.backend.rms_norm_into(
             &mut buffers.final_normed,
             &buffers.hidden,
             &self.norm.weight,
             self.norm.eps,
         )?;
+        self.backend
+            .cast_into(&mut buffers.final_normed_cast, &buffers.final_normed)?;
         self.backend.matmul_into(
             &mut buffers.logits,
-            &buffers.final_normed,
+            &buffers.final_normed_cast,
             &self.lm_head,
         )?;
         Ok(())

@@ -21,7 +21,7 @@
 //!
 //! For batch=8 Llama-7B that's roughly 2 MiB total — negligible.
 
-use forge_core::{Backend, ModelConfig, Result};
+use forge_core::{Backend, DType, ModelConfig, Result};
 
 /// Per-batch persistent buffers for [`LlamaModel::forward_into`].
 ///
@@ -72,13 +72,16 @@ pub struct LlamaPersistentBuffers<B: Backend> {
     pub v_rows: Vec<B::Tensor>,
 
     /// Output of paged_attention. `[N, q_size]`. Dtype is the model's
-    /// activation dtype (matches q_rotated_2d).
+    /// activation dtype (`config.dtype`).
     pub attn_out: B::Tensor,
-    /// `attn_out` cast to `wo`'s weight dtype (may equal `attn_out` if
-    /// model is uniform dtype). Separate buffer so capture sees a
-    /// stable in-place cast destination.
+    /// `attn_out` cast to `wo`'s weight dtype (may equal `attn_out`'s
+    /// dtype if model is uniform-dtype). Allocated with `wo_dtype` passed
+    /// to `new`; the subsequent `matmul_into(attn_proj, attn_out_cast, wo)`
+    /// requires all three to share dtype. Mismatching activation + weight
+    /// dtypes would fail before this fix.
     pub attn_out_cast: B::Tensor,
-    /// Output of `wo` (o_proj) matmul. `[N, hidden]`.
+    /// Output of `wo` (o_proj) matmul. `[N, hidden]`. Dtype = `wo_dtype`
+    /// (matches `attn_out_cast` and `self.wo`).
     pub attn_proj: B::Tensor,
 
     /// `residual` output of `fused_residual_rms_norm`. Holds `hidden_prev
@@ -95,11 +98,14 @@ pub struct LlamaPersistentBuffers<B: Backend> {
     /// MLP down_proj output. `[N, hidden]`.
     pub mlp_out: B::Tensor,
 
-    /// Output of the final `norm.forward`. `[N, hidden]`.
+    /// Output of the final `norm.forward`. `[N, hidden]`. Dtype = activation dtype.
     pub final_normed: B::Tensor,
-    /// Output of the lm_head matmul. `[N, vocab_size]`. The model's
-    /// returned logits tensor — the consumer reads this after
-    /// `forward_into` returns.
+    /// `final_normed` cast to `lm_head`'s weight dtype, when they differ.
+    /// `matmul_into(logits, final_normed_cast, lm_head)` requires uniform
+    /// dtype across inputs + output.
+    pub final_normed_cast: B::Tensor,
+    /// Output of the lm_head matmul. `[N, vocab_size]`. Dtype = `lm_head_dtype`
+    /// (matches `final_normed_cast` and `self.lm_head`).
     pub logits: B::Tensor,
 
     /// Sanity field — used to validate that `forward_into` is called with
@@ -108,9 +114,30 @@ pub struct LlamaPersistentBuffers<B: Backend> {
 }
 
 impl<B: Backend> LlamaPersistentBuffers<B> {
-    /// Allocate all per-batch buffers for a fixed `batch_size`. Dtype is
-    /// taken from `config.dtype` (model's activation dtype).
-    pub fn new(backend: &B, config: &ModelConfig, batch_size: usize) -> Result<Self> {
+    /// Allocate all per-batch buffers for a fixed `batch_size`.
+    ///
+    /// - **Activation dtype** is taken from `config.dtype` and used for the
+    ///   residual stream, embeddings, norms, paged_attention output, and
+    ///   MLP intermediates.
+    /// - **`wo_dtype`** is the dtype of the attention output projection
+    ///   weight (`self_attn.wo`); used for `attn_out_cast` + `attn_proj`.
+    ///   Allocate-time selection of these buffer dtypes ensures the
+    ///   `cast_into(attn_out_cast, attn_out)` + `matmul_into(attn_proj,
+    ///   attn_out_cast, wo)` chain agrees on dtypes regardless of whether
+    ///   activation and weight dtypes match.
+    /// - **`lm_head_dtype`** is the dtype of `self.lm_head`; used for
+    ///   `final_normed_cast` + `logits`.
+    ///
+    /// For uniform-dtype models (Llama F16 weights + F16 activations),
+    /// pass `config.dtype` for both. For mixed-dtype loads, pull from the
+    /// loaded weights directly.
+    pub fn new(
+        backend: &B,
+        config: &ModelConfig,
+        batch_size: usize,
+        wo_dtype: DType,
+        lm_head_dtype: DType,
+    ) -> Result<Self> {
         let n = batch_size;
         let h = config.hidden_size;
         let inter = config.intermediate_size;
@@ -155,16 +182,34 @@ impl<B: Backend> LlamaPersistentBuffers<B> {
             k_rows,
             v_rows,
             attn_out: backend.allocate_zeros(&[n, q_size], dt)?,
-            attn_out_cast: backend.allocate_zeros(&[n, q_size], dt)?,
-            attn_proj: backend.allocate_zeros(&[n, h], dt)?,
+            // attn_out_cast + attn_proj live in wo's dtype so the cast+matmul
+            // chain agrees regardless of activation/weight dtype mismatch.
+            attn_out_cast: backend.allocate_zeros(&[n, q_size], wo_dtype)?,
+            attn_proj: backend.allocate_zeros(&[n, h], wo_dtype)?,
             residual_after_attn: backend.allocate_zeros(&[n, h], dt)?,
             gate: backend.allocate_zeros(&[n, inter], dt)?,
             up: backend.allocate_zeros(&[n, inter], dt)?,
             silu_mul: backend.allocate_zeros(&[n, inter], dt)?,
             mlp_out: backend.allocate_zeros(&[n, h], dt)?,
             final_normed: backend.allocate_zeros(&[n, h], dt)?,
-            logits: backend.allocate_zeros(&[n, vocab], dt)?,
+            // Same dtype-coherence story as attn_out_cast / attn_proj.
+            final_normed_cast: backend.allocate_zeros(&[n, h], lm_head_dtype)?,
+            logits: backend.allocate_zeros(&[n, vocab], lm_head_dtype)?,
             batch_size: n,
         })
+    }
+
+    /// Convenience constructor for the uniform-dtype case: all
+    /// activations + weights share `config.dtype`. The standard Llama
+    /// load path produces this (F16 weights + F16 activations is the
+    /// production norm).
+    ///
+    /// Equivalent to [`Self::new`] with `wo_dtype = lm_head_dtype = config.dtype`.
+    pub fn new_uniform(
+        backend: &B,
+        config: &ModelConfig,
+        batch_size: usize,
+    ) -> Result<Self> {
+        Self::new(backend, config, batch_size, config.dtype, config.dtype)
     }
 }

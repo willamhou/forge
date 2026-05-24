@@ -1754,6 +1754,10 @@ impl Backend for CudaBackend {
         // Upload indices into the persistent scratch — stable device pointer
         // across calls (until the scratch grows; see embedding_scratch_version).
         // Replaces the previous per-call `memcpy_stod` (fresh alloc).
+        //
+        // The MutexGuard is held through the kernel launch below — same
+        // pattern as paged_attention_into (see CudaBackend struct doc for
+        // the single-threaded-engine contract that makes this safe).
         let mut indices_scratch = self
             .embedding_indices
             .lock()
@@ -1866,6 +1870,13 @@ impl Backend for CudaBackend {
             DType::F16 => {
                 let src = x.f16_slice()?;
                 let dst = out.f16_slice_mut()?;
+                self.stream
+                    .memcpy_dtod(src, dst)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+            }
+            DType::BF16 => {
+                let src = x.bf16_slice()?;
+                let dst = out.bf16_slice_mut()?;
                 self.stream
                     .memcpy_dtod(src, dst)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
@@ -2175,6 +2186,7 @@ impl Backend for CudaBackend {
         match pool.dtype() {
             DType::F32 => run_dtod!(f32_slice, f32_slice_mut),
             DType::F16 => run_dtod!(f16_slice, f16_slice_mut),
+            DType::BF16 => run_dtod!(bf16_slice, bf16_slice_mut),
             other => {
                 return Err(ForgeError::UnsupportedDtype(other));
             }
@@ -2244,6 +2256,7 @@ impl Backend for CudaBackend {
         match pool.dtype() {
             DType::F32 => gather_dtod!(f32, f32_slice, f32_data),
             DType::F16 => gather_dtod!(half::f16, f16_slice, f16_data),
+            DType::BF16 => gather_dtod!(half::bf16, bf16_slice, bf16_data),
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
@@ -2517,6 +2530,14 @@ impl Backend for CudaBackend {
             DType::F16 => {
                 let src = tensor.f16_slice()?;
                 let dst = out.f16_slice_mut()?;
+                self.stream
+                    .memcpy_dtod(&src.slice(offset..offset + len), dst)
+                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                Ok(())
+            }
+            DType::BF16 => {
+                let src = tensor.bf16_slice()?;
+                let dst = out.bf16_slice_mut()?;
                 self.stream
                     .memcpy_dtod(&src.slice(offset..offset + len), dst)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;

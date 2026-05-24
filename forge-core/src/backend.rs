@@ -36,6 +36,14 @@ pub trait Backend: Send + Sync + 'static {
     /// reassigns `*out`, which is correct numerically but does NOT preserve
     /// the tensor's underlying device pointer — fine for non-CUDA backends
     /// (they don't capture graphs).
+    ///
+    /// **Capture-safety contract**: backends that participate in CUDA Graph
+    /// capture (or any equivalent "record kernel arg pointers, replay
+    /// later" mechanism) MUST override this method to write in place.
+    /// The default impl's `*out = ...` reassignment changes the tensor's
+    /// underlying storage on every call and would invalidate any captured
+    /// graph that baked the previous pointer. The same contract applies
+    /// to every other `_into` method on this trait.
     fn matmul_into(
         &self,
         out: &mut Self::Tensor,

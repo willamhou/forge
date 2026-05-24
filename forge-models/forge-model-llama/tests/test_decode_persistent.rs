@@ -171,7 +171,7 @@ fn forward_into_matches_forward() {
 
     let batch_size = decode_input.seq_metadata.len();
     let mut buffers =
-        LlamaPersistentBuffers::new(&backend, &config, batch_size).unwrap();
+        LlamaPersistentBuffers::new_uniform(&backend, &config, batch_size).unwrap();
     model
         .forward_into(&decode_input, &mut kv_persistent, &mut buffers)
         .unwrap();
@@ -248,7 +248,7 @@ fn forward_into_rejects_wrong_batch_size() {
     let decode_input = build_decode_input(); // batch = 2
 
     // Buffers sized for batch=4, input has batch=2 → reject.
-    let mut wrong_buffers = LlamaPersistentBuffers::new(&backend, &config, 4).unwrap();
+    let mut wrong_buffers = LlamaPersistentBuffers::new_uniform(&backend, &config, 4).unwrap();
     let _ = model
         .forward_into(&decode_input, &mut kv, &mut wrong_buffers)
         .expect_err("batch_size mismatch must error");
@@ -270,7 +270,7 @@ fn forward_into_rejects_prefill() {
     )
     .unwrap();
     kv.allocate(1, 2).unwrap();
-    let mut buffers = LlamaPersistentBuffers::new(&backend, &config, 1).unwrap();
+    let mut buffers = LlamaPersistentBuffers::new_uniform(&backend, &config, 1).unwrap();
     let prefill_input = ModelInput {
         token_ids: vec![vec![0, 1]],
         positions: vec![vec![0, 1]],
