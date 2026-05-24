@@ -113,13 +113,11 @@ impl<B: Backend> RopeFreqs<B> {
     /// In-place per-token RoPE — writes the rotated tensor into a
     /// caller-provided `out` buffer instead of allocating.
     ///
-    /// Used by the CUDA-Graph capture path so the captured kernel arg
-    /// pointers stay stable across replays.
-    ///
-    /// Note: the cos/sin freq tensors uploaded each call are still
-    /// transient (allocated fresh from the cached host tables). Wiring
-    /// them through persistent device scratches is Task 5c.3 (along with
-    /// embedding's indices scratch).
+    /// Used by the CUDA-Graph capture path: cos/sin freq data is gathered
+    /// from the cached host tables and passed to
+    /// [`Backend::rope_with_host_freqs_into`], which on CUDA stages the
+    /// data through a persistent device scratch (stable kernel arg
+    /// pointer across replays — Task 5c.3).
     pub fn apply_with_positions_into(
         &self,
         out: &mut B::Tensor,
@@ -154,12 +152,7 @@ impl<B: Backend> RopeFreqs<B> {
             sin_data.extend_from_slice(&self.sin_host[start..end]);
         }
 
-        let cos_tensor =
-            backend.copy_from_host_f32(&cos_data, &[seq_len, self.half_dim])?;
-        let sin_tensor =
-            backend.copy_from_host_f32(&sin_data, &[seq_len, self.half_dim])?;
-
-        backend.rope_into(out, x, &cos_tensor, &sin_tensor)
+        backend.rope_with_host_freqs_into(out, x, &cos_data, &sin_data)
     }
 }
 

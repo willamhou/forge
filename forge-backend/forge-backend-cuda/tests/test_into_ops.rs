@@ -383,4 +383,95 @@ fn into_variants_match_alloc_variants() {
     let _ = backend
         .rope_into(&mut rope_wrong, &x_rope, &cos_t, &sin_t)
         .expect_err("rope_into wrong out shape rejected");
+
+    // ── rope_with_host_freqs_into — persistent rope_cos/rope_sin scratch ─
+    let mut rope_via_host = backend
+        .allocate_zeros(&[batch, rseq, heads, dim], DType::F32)
+        .unwrap();
+    backend
+        .rope_with_host_freqs_into(&mut rope_via_host, &x_rope, &rope_cos, &rope_sin)
+        .unwrap();
+    backend.synchronize().unwrap();
+    assert_eq!(
+        backend.copy_to_host_f32(&rope_via_host).unwrap(),
+        rope_alloc_host,
+        "rope_with_host_freqs_into result differs from rope_into"
+    );
+
+    // Versions baseline; small inputs should fit initial scratch cap (16 elems each).
+    let (v_cos0, v_sin0) = backend.rope_scratch_versions();
+    for _ in 0..3 {
+        backend
+            .rope_with_host_freqs_into(&mut rope_via_host, &x_rope, &rope_cos, &rope_sin)
+            .unwrap();
+    }
+    backend.synchronize().unwrap();
+    let (v_cos1, v_sin1) = backend.rope_scratch_versions();
+    assert_eq!((v_cos0, v_sin0), (v_cos1, v_sin1), "no grow expected");
+
+    // Force grow: 20-elem cos/sin → exceeds initial 16-element scratch.
+    let big_seq = 5; // 5 * (4/2) = 10 — still under 16, hm
+    let big_dim = 8; // 5 * (8/2) = 20 > 16 → grow
+    let big_x: Vec<f32> = vec![0.0; batch * big_seq * heads * big_dim];
+    let big_cos: Vec<f32> = vec![0.0; big_seq * (big_dim / 2)];
+    let big_sin: Vec<f32> = vec![0.0; big_seq * (big_dim / 2)];
+    let bx = backend
+        .copy_from_host_f32(&big_x, &[batch, big_seq, heads, big_dim])
+        .unwrap();
+    let mut big_out = backend
+        .allocate_zeros(&[batch, big_seq, heads, big_dim], DType::F32)
+        .unwrap();
+    backend
+        .rope_with_host_freqs_into(&mut big_out, &bx, &big_cos, &big_sin)
+        .unwrap();
+    backend.synchronize().unwrap();
+    let (v_cos2, v_sin2) = backend.rope_scratch_versions();
+    assert!(
+        v_cos2 > v_cos1 && v_sin2 > v_sin1,
+        "rope scratch should have grown for big call (cos {v_cos1}→{v_cos2}, sin {v_sin1}→{v_sin2})"
+    );
+
+    // ── embedding indices scratch ─────────────────────────────────
+    let emb_indices2: Vec<u32> = vec![0, 5, 12, 3];
+    let v_idx0 = backend.embedding_scratch_version();
+
+    // initial scratch cap = 16, 4 indices fits — no grow
+    let mut emb_out2 = backend
+        .allocate_zeros(&[emb_indices2.len(), embed_dim], DType::F32)
+        .unwrap();
+    backend
+        .embedding_into(&mut emb_out2, &emb_weight, &emb_indices2)
+        .unwrap();
+    backend.synchronize().unwrap();
+    let v_idx1 = backend.embedding_scratch_version();
+    assert_eq!(v_idx0, v_idx1, "no embedding scratch grow for 4 indices");
+
+    // Force grow: 20-index call.
+    let big_indices: Vec<u32> = (0..20).map(|i| (i % (vocab as u32)) as u32).collect();
+    let mut big_emb_out = backend
+        .allocate_zeros(&[big_indices.len(), embed_dim], DType::F32)
+        .unwrap();
+    backend
+        .embedding_into(&mut big_emb_out, &emb_weight, &big_indices)
+        .unwrap();
+    backend.synchronize().unwrap();
+    let v_idx2 = backend.embedding_scratch_version();
+    assert!(
+        v_idx2 > v_idx1,
+        "embedding scratch should have grown (was {v_idx1}, now {v_idx2})"
+    );
+
+    // Verify embedding_into still produces correct output after grow.
+    let big_emb_host = backend.copy_to_host_f32(&big_emb_out).unwrap();
+    for (i, &idx) in big_indices.iter().enumerate() {
+        let start = (idx as usize) * embed_dim;
+        for d in 0..embed_dim {
+            let want = emb_weight_data[start + d];
+            let got = big_emb_host[i * embed_dim + d];
+            assert!(
+                (got - want).abs() < 1e-6,
+                "embedding output diverges at [{i}][{d}]: got {got} want {want}"
+            );
+        }
+    }
 }

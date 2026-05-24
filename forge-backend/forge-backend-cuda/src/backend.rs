@@ -74,6 +74,15 @@ pub struct CudaBackend {
     paged_block_tables: Arc<Mutex<I32Scratch>>,
     /// Persistent device scratch for paged_attention's i32 kv_lens. See above.
     paged_kv_lens: Arc<Mutex<I32Scratch>>,
+    /// Persistent device scratch for embedding's u32 indices. Replaces the
+    /// per-call `memcpy_stod(indices)` (fresh alloc) with `memcpy_htod`
+    /// into a stable buffer — Task 5c.3.
+    embedding_indices: Arc<Mutex<U32Scratch>>,
+    /// Persistent device scratch for RoPE's f32 cos table (per-call upload
+    /// from cached host gather, into stable device pointer).
+    rope_cos: Arc<Mutex<F32Scratch>>,
+    /// Persistent device scratch for RoPE's f32 sin table. See `rope_cos`.
+    rope_sin: Arc<Mutex<F32Scratch>>,
 }
 
 /// Monotonically-growing i32 device buffer. `version` increments on every
@@ -81,6 +90,20 @@ pub struct CudaBackend {
 /// the underlying device pointer has changed.
 struct I32Scratch {
     buf: CudaSlice<i32>,
+    version: u64,
+}
+
+/// u32 sibling of `I32Scratch` — for kernels that read indices as u32
+/// (embedding's `indices` array, etc.).
+struct U32Scratch {
+    buf: CudaSlice<u32>,
+    version: u64,
+}
+
+/// f32 sibling of `I32Scratch` — for kernels that need a small per-call
+/// f32 staging buffer (RoPE cos/sin tables gathered from host indices).
+struct F32Scratch {
+    buf: CudaSlice<f32>,
     version: u64,
 }
 
@@ -210,6 +233,15 @@ impl CudaBackend {
         let kv_lens = stream
             .alloc_zeros::<i32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc paged_kv_lens: {e}")))?;
+        let emb_indices = stream
+            .alloc_zeros::<u32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc embedding_indices: {e}")))?;
+        let rope_cos_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc rope_cos: {e}")))?;
+        let rope_sin_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc rope_sin: {e}")))?;
 
         Ok(Self {
             ctx,
@@ -224,6 +256,18 @@ impl CudaBackend {
             })),
             paged_kv_lens: Arc::new(Mutex::new(I32Scratch {
                 buf: kv_lens,
+                version: 0,
+            })),
+            embedding_indices: Arc::new(Mutex::new(U32Scratch {
+                buf: emb_indices,
+                version: 0,
+            })),
+            rope_cos: Arc::new(Mutex::new(F32Scratch {
+                buf: rope_cos_buf,
+                version: 0,
+            })),
+            rope_sin: Arc::new(Mutex::new(F32Scratch {
+                buf: rope_sin_buf,
                 version: 0,
             })),
         })
@@ -266,6 +310,19 @@ impl CudaBackend {
         (bt, kv)
     }
 
+    /// Version of the embedding indices scratch (bumps on grow). See
+    /// `paged_scratch_versions` for the consumer semantics.
+    pub fn embedding_scratch_version(&self) -> u64 {
+        self.embedding_indices.lock().map(|g| g.version).unwrap_or(0)
+    }
+
+    /// `(rope_cos_version, rope_sin_version)`.
+    pub fn rope_scratch_versions(&self) -> (u64, u64) {
+        let c = self.rope_cos.lock().map(|g| g.version).unwrap_or(0);
+        let s = self.rope_sin.lock().map(|g| g.version).unwrap_or(0);
+        (c, s)
+    }
+
     /// Grow `scratch` if its capacity is below `needed`. Bumps `version` on
     /// every grow so CUDA Graph capture caches can detect pointer changes.
     fn ensure_i32_scratch(&self, scratch: &mut I32Scratch, needed: usize) -> Result<()> {
@@ -276,6 +333,32 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<i32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow i32 scratch: {e}")))?;
+            scratch.version = scratch.version.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// u32 sibling of `ensure_i32_scratch`.
+    fn ensure_u32_scratch(&self, scratch: &mut U32Scratch, needed: usize) -> Result<()> {
+        if scratch.buf.len() < needed {
+            let new_cap = (needed.max(scratch.buf.len() * 3 / 2)).max(16);
+            scratch.buf = self
+                .stream
+                .alloc_zeros::<u32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow u32 scratch: {e}")))?;
+            scratch.version = scratch.version.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// f32 sibling of `ensure_i32_scratch`.
+    fn ensure_f32_scratch(&self, scratch: &mut F32Scratch, needed: usize) -> Result<()> {
+        if scratch.buf.len() < needed {
+            let new_cap = (needed.max(scratch.buf.len() * 3 / 2)).max(16);
+            scratch.buf = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow f32 scratch: {e}")))?;
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
@@ -1318,6 +1401,136 @@ impl Backend for CudaBackend {
         Ok(out)
     }
 
+    /// In-place RoPE with host cos/sin — overrides the default trait impl
+    /// to upload through the persistent `rope_cos`/`rope_sin` scratches
+    /// (stable device pointers across replays). See `paged_attention_into`'s
+    /// `paged_block_tables` scratch for the same pattern.
+    ///
+    /// Both scratch locks are held through the kernel launch. Safe under
+    /// the single-threaded engine contract (see CudaBackend struct doc);
+    /// lock order is stable (cos → sin → kernel) so even if the contract
+    /// loosens there's no deadlock between rope_with_host_freqs_into calls.
+    fn rope_with_host_freqs_into(
+        &self,
+        out: &mut CudaTensor,
+        x: &CudaTensor,
+        cos_host: &[f32],
+        sin_host: &[f32],
+    ) -> Result<()> {
+        // Reuse rope_into's full validation by computing the expected shapes here.
+        let shape = x.shape();
+        if shape.len() != 4 {
+            return Err(ForgeError::InvalidArgument(
+                "rope_with_host_freqs_into: x must be rank-4".into(),
+            ));
+        }
+        let seq_len = shape[1];
+        let head_dim = shape[3];
+        if head_dim % 2 != 0 {
+            return Err(ForgeError::InvalidArgument(
+                "rope_with_host_freqs_into: head_dim must be even".into(),
+            ));
+        }
+        let half = head_dim / 2;
+        let expected = seq_len * half;
+        if cos_host.len() != expected || sin_host.len() != expected {
+            return Err(ForgeError::InvalidArgument(format!(
+                "rope_with_host_freqs_into: cos/sin host slices must be {expected} elements (got cos={}, sin={})",
+                cos_host.len(),
+                sin_host.len()
+            )));
+        }
+
+        // Cross-check output buffer matches x. (rope_into would do this too,
+        // but we bypass it to keep the scratch borrows live across the
+        // kernel launch — CudaSlice::clone is device-to-device copy in
+        // cudarc 0.17.8, NOT Arc-share, so wrapping the scratch in a fresh
+        // CudaTensor would defeat the whole persistent-scratch point.)
+        if out.shape() != shape {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "rope_with_host_freqs_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+
+        // Stage cos/sin into persistent scratch.
+        let mut cos_scratch = self
+            .rope_cos
+            .lock()
+            .map_err(|_| ForgeError::Cuda("rope_cos mutex poisoned".into()))?;
+        self.ensure_f32_scratch(&mut cos_scratch, expected)?;
+        self.stream
+            .memcpy_htod(cos_host, &mut cos_scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let mut sin_scratch = self
+            .rope_sin
+            .lock()
+            .map_err(|_| ForgeError::Cuda("rope_sin mutex poisoned".into()))?;
+        self.ensure_f32_scratch(&mut sin_scratch, expected)?;
+        self.stream
+            .memcpy_htod(sin_host, &mut sin_scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let cos_dev = &cos_scratch.buf;
+        let sin_dev = &sin_scratch.buf;
+
+        let batch = shape[0] as u32;
+        let seq_len_u = shape[1] as u32;
+        let num_heads = shape[2] as u32;
+        let head_dim_u = shape[3] as u32;
+        let total = batch * seq_len_u * num_heads * (head_dim_u / 2);
+
+        match x.dtype() {
+            DType::F16 => {
+                let x_s = x.f16_slice()?;
+                let o = out.f16_slice_mut()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.rope_f16);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(cos_dev);
+                builder.arg(sin_dev);
+                builder.arg(&batch);
+                builder.arg(&seq_len_u);
+                builder.arg(&num_heads);
+                builder.arg(&head_dim_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(total))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+                Ok(())
+            }
+            DType::F32 => {
+                let x_s = x.f32_slice()?;
+                let o = out.f32_slice_mut()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.rope_f32);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(cos_dev);
+                builder.arg(sin_dev);
+                builder.arg(&batch);
+                builder.arg(&seq_len_u);
+                builder.arg(&num_heads);
+                builder.arg(&head_dim_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(total))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+                Ok(())
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
+    }
+
     /// In-place RoPE kernel. See `matmul_into` for the capture-stability
     /// contract.
     fn rope_into(
@@ -1542,10 +1755,18 @@ impl Backend for CudaBackend {
         let embedding_dim_u32 = embedding_dim as u32;
         let vocab_size_u32 = vocab_size as u32;
 
-        let indices_dev = self
-            .stream
-            .memcpy_stod(indices)
+        // Upload indices into the persistent scratch — stable device pointer
+        // across calls (until the scratch grows; see embedding_scratch_version).
+        // Replaces the previous per-call `memcpy_stod` (fresh alloc).
+        let mut indices_scratch = self
+            .embedding_indices
+            .lock()
+            .map_err(|_| ForgeError::Cuda("embedding_indices mutex poisoned".into()))?;
+        self.ensure_u32_scratch(&mut indices_scratch, num_indices)?;
+        self.stream
+            .memcpy_htod(indices, &mut indices_scratch.buf)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let indices_dev = &indices_scratch.buf;
 
         let launch_cfg = LaunchConfig {
             grid_dim: (num_indices as u32, 1, 1),
@@ -1560,7 +1781,7 @@ impl Backend for CudaBackend {
                 let mut builder = self.stream.launch_builder(&self.kernels.embedding_f16);
                 builder.arg(o);
                 builder.arg(w);
-                builder.arg(&indices_dev);
+                builder.arg(indices_dev);
                 builder.arg(&num_indices_u32);
                 builder.arg(&embedding_dim_u32);
                 builder.arg(&vocab_size_u32);
@@ -1577,7 +1798,7 @@ impl Backend for CudaBackend {
                 let mut builder = self.stream.launch_builder(&self.kernels.embedding_f32);
                 builder.arg(o);
                 builder.arg(w);
-                builder.arg(&indices_dev);
+                builder.arg(indices_dev);
                 builder.arg(&num_indices_u32);
                 builder.arg(&embedding_dim_u32);
                 builder.arg(&vocab_size_u32);

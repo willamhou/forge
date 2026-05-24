@@ -524,6 +524,50 @@ pub trait Backend: Send + Sync + 'static {
         freqs_sin: &Self::Tensor,
     ) -> Result<Self::Tensor>;
 
+    /// In-place RoPE driven by host-side cos/sin slices.
+    ///
+    /// The caller passes the F32 cos/sin freq data as host slices; backends
+    /// upload them internally. CUDA backends route the upload through a
+    /// persistent device scratch so the kernel arg pointers are stable for
+    /// CUDA-Graph capture even though the cos/sin values themselves change
+    /// per call (positions differ per decode step).
+    ///
+    /// `cos_host` / `sin_host` are expected length `[seq_len * head_dim/2]`.
+    fn rope_with_host_freqs_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        cos_host: &[f32],
+        sin_host: &[f32],
+    ) -> Result<()> {
+        let shape = x.shape();
+        if shape.len() != 4 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "rope_with_host_freqs_into: x must be rank-4".into(),
+            ));
+        }
+        let seq_len = shape[1];
+        let head_dim = shape[3];
+        if head_dim % 2 != 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "rope_with_host_freqs_into: head_dim must be even".into(),
+            ));
+        }
+        let half = head_dim / 2;
+        let expected = seq_len * half;
+        if cos_host.len() != expected || sin_host.len() != expected {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "rope_with_host_freqs_into: cos/sin host slices must be {expected} elements (got cos={}, sin={})",
+                cos_host.len(),
+                sin_host.len()
+            )));
+        }
+        // Default impl: transient upload. CUDA override uses persistent scratch.
+        let cos = self.copy_from_host_f32(cos_host, &[seq_len, half])?;
+        let sin = self.copy_from_host_f32(sin_host, &[seq_len, half])?;
+        self.rope_into(out, x, &cos, &sin)
+    }
+
     /// In-place RoPE. `out` shape + dtype must match `x` (which is rank-4
     /// `[batch, seq_len, num_heads, head_dim]`). cos/sin are F32 freq tables
     /// of length `[seq_len, head_dim/2]`. See [`Self::matmul_into`] for
