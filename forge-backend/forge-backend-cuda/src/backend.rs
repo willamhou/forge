@@ -2014,6 +2014,30 @@ impl Backend for CudaBackend {
             ));
         }
         let rows = shape[0];
+        let mut q_out = self.allocate_zeros(&[rows, q_size], qkv.dtype())?;
+        let mut k_out = self.allocate_zeros(&[rows, kv_size], qkv.dtype())?;
+        let mut v_out = self.allocate_zeros(&[rows, kv_size], qkv.dtype())?;
+        self.split_qkv_into(&mut q_out, &mut k_out, &mut v_out, qkv, q_size, kv_size)?;
+        Ok((q_out, k_out, v_out))
+    }
+
+    /// In-place QKV split. See `matmul_into` for the capture-stability contract.
+    fn split_qkv_into(
+        &self,
+        q_out: &mut CudaTensor,
+        k_out: &mut CudaTensor,
+        v_out: &mut CudaTensor,
+        qkv: &CudaTensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<()> {
+        let shape = qkv.shape();
+        if shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "split_qkv_into: qkv must be 2D".into(),
+            ));
+        }
+        let rows = shape[0];
         let total_cols = q_size + 2 * kv_size;
         if shape[1] != total_cols {
             return Err(ForgeError::ShapeMismatch {
@@ -2021,88 +2045,82 @@ impl Backend for CudaBackend {
                 got: shape.to_vec(),
             });
         }
+        for (out, want) in [
+            (q_out.shape(), q_size),
+            (k_out.shape(), kv_size),
+            (v_out.shape(), kv_size),
+        ] {
+            if out != [rows, want] {
+                return Err(ForgeError::ShapeMismatch {
+                    expected: vec![rows, want],
+                    got: out.to_vec(),
+                });
+            }
+        }
+        if q_out.dtype() != qkv.dtype()
+            || k_out.dtype() != qkv.dtype()
+            || v_out.dtype() != qkv.dtype()
+        {
+            return Err(ForgeError::InvalidArgument(format!(
+                "split_qkv_into: out dtypes ({:?}, {:?}, {:?}) != qkv dtype {:?}",
+                q_out.dtype(),
+                k_out.dtype(),
+                v_out.dtype(),
+                qkv.dtype()
+            )));
+        }
 
         let rows_u32 = rows as u32;
         let q_cols_u32 = q_size as u32;
         let kv_cols_u32 = kv_size as u32;
         let block_dim = next_power_of_2((256u32).min(q_size.max(kv_size) as u32));
 
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
         match qkv.dtype() {
             DType::F16 => {
-                let mut q_out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(rows * q_size)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                let mut k_out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(rows * kv_size)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                let mut v_out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(rows * kv_size)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let qkv_s = qkv.f16_slice()?;
+                let q_s = q_out.f16_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.split_qkv_f16);
-                builder.arg(&mut q_out);
-                builder.arg(&mut k_out);
-                builder.arg(&mut v_out);
-                builder.arg(qkv.f16_slice()?);
+                builder.arg(q_s);
+                let k_s = k_out.f16_slice_mut()?;
+                builder.arg(k_s);
+                let v_s = v_out.f16_slice_mut()?;
+                builder.arg(v_s);
+                builder.arg(qkv_s);
                 builder.arg(&rows_u32);
                 builder.arg(&q_cols_u32);
                 builder.arg(&kv_cols_u32);
                 unsafe {
                     builder
-                        .launch(LaunchConfig {
-                            grid_dim: (rows as u32, 1, 1),
-                            block_dim: (block_dim, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
+                        .launch(launch_cfg)
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok((
-                    CudaTensor::f16_data(q_out, vec![rows, q_size]),
-                    CudaTensor::f16_data(k_out, vec![rows, kv_size]),
-                    CudaTensor::f16_data(v_out, vec![rows, kv_size]),
-                ))
+                Ok(())
             }
             DType::F32 => {
-                let mut q_out = self
-                    .stream
-                    .alloc_zeros::<f32>(rows * q_size)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                let mut k_out = self
-                    .stream
-                    .alloc_zeros::<f32>(rows * kv_size)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                let mut v_out = self
-                    .stream
-                    .alloc_zeros::<f32>(rows * kv_size)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let qkv_s = qkv.f32_slice()?;
+                let q_s = q_out.f32_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.split_qkv_f32);
-                builder.arg(&mut q_out);
-                builder.arg(&mut k_out);
-                builder.arg(&mut v_out);
-                builder.arg(qkv.f32_slice()?);
+                builder.arg(q_s);
+                let k_s = k_out.f32_slice_mut()?;
+                builder.arg(k_s);
+                let v_s = v_out.f32_slice_mut()?;
+                builder.arg(v_s);
+                builder.arg(qkv_s);
                 builder.arg(&rows_u32);
                 builder.arg(&q_cols_u32);
                 builder.arg(&kv_cols_u32);
                 unsafe {
                     builder
-                        .launch(LaunchConfig {
-                            grid_dim: (rows as u32, 1, 1),
-                            block_dim: (block_dim, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
+                        .launch(launch_cfg)
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok((
-                    CudaTensor::f32_data(q_out, vec![rows, q_size]),
-                    CudaTensor::f32_data(k_out, vec![rows, kv_size]),
-                    CudaTensor::f32_data(v_out, vec![rows, kv_size]),
-                ))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
@@ -2114,39 +2132,72 @@ impl Backend for CudaBackend {
         start_row: usize,
         num_rows: usize,
     ) -> Result<CudaTensor> {
+        let mut out_shape = tensor.shape().to_vec();
+        out_shape[0] = num_rows;
+        let mut out = self.allocate_zeros(&out_shape, tensor.dtype())?;
+        self.slice_rows_into(&mut out, tensor, start_row, num_rows)?;
+        Ok(out)
+    }
+
+    /// In-place row slice via device-to-device memcpy. See `matmul_into`.
+    fn slice_rows_into(
+        &self,
+        out: &mut CudaTensor,
+        tensor: &CudaTensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<()> {
         let shape = tensor.shape();
+        if shape.is_empty() {
+            return Err(ForgeError::InvalidArgument(
+                "slice_rows_into: input must be non-empty".into(),
+            ));
+        }
+        if start_row + num_rows > shape[0] {
+            return Err(ForgeError::InvalidArgument(format!(
+                "slice_rows_into: start_row {start_row} + num_rows {num_rows} > tensor rows {}",
+                shape[0]
+            )));
+        }
         let cols: usize = if shape.len() > 1 {
             shape[1..].iter().product()
         } else {
             1
         };
+        let mut expected = shape.to_vec();
+        expected[0] = num_rows;
+        if out.shape() != expected.as_slice() {
+            return Err(ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != tensor.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "slice_rows_into: out dtype {:?} != tensor dtype {:?}",
+                out.dtype(),
+                tensor.dtype()
+            )));
+        }
         let offset = start_row * cols;
         let len = num_rows * cols;
-        let mut out_shape = shape.to_vec();
-        out_shape[0] = num_rows;
 
         match tensor.dtype() {
             DType::F32 => {
                 let src = tensor.f32_slice()?;
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(len)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let dst = out.f32_slice_mut()?;
                 self.stream
-                    .memcpy_dtod(&src.slice(offset..offset + len), &mut out)
+                    .memcpy_dtod(&src.slice(offset..offset + len), dst)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                Ok(CudaTensor::f32_data(out, out_shape))
+                Ok(())
             }
             DType::F16 => {
                 let src = tensor.f16_slice()?;
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(len)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                let dst = out.f16_slice_mut()?;
                 self.stream
-                    .memcpy_dtod(&src.slice(offset..offset + len), &mut out)
+                    .memcpy_dtod(&src.slice(offset..offset + len), dst)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                Ok(CudaTensor::f16_data(out, out_shape))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }

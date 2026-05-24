@@ -282,4 +282,64 @@ fn into_variants_match_alloc_variants() {
     let _ = backend
         .embedding_into(&mut emb_wrong, &emb_weight, &indices)
         .expect_err("embedding_into wrong shape rejected");
+
+    // ── split_qkv_into vs split_qkv ──────────────────────────────
+    let split_rows = 4;
+    let q_size = 8;
+    let kv_size = 4;
+    let total_cols = q_size + 2 * kv_size; // 16
+    let qkv_data: Vec<f32> = (0..split_rows * total_cols)
+        .map(|i| (i as f32) * 0.05 - 0.3)
+        .collect();
+    let qkv = backend
+        .copy_from_host_f32(&qkv_data, &[split_rows, total_cols])
+        .unwrap();
+
+    let (q_a, k_a, v_a) = backend.split_qkv(&qkv, q_size, kv_size).unwrap();
+    backend.synchronize().unwrap();
+    let q_alloc = backend.copy_to_host_f32(&q_a).unwrap();
+    let k_alloc = backend.copy_to_host_f32(&k_a).unwrap();
+    let v_alloc = backend.copy_to_host_f32(&v_a).unwrap();
+
+    let mut q_into = backend.allocate_zeros(&[split_rows, q_size], DType::F32).unwrap();
+    let mut k_into = backend.allocate_zeros(&[split_rows, kv_size], DType::F32).unwrap();
+    let mut v_into = backend.allocate_zeros(&[split_rows, kv_size], DType::F32).unwrap();
+    backend
+        .split_qkv_into(&mut q_into, &mut k_into, &mut v_into, &qkv, q_size, kv_size)
+        .unwrap();
+    backend.synchronize().unwrap();
+    assert_eq!(backend.copy_to_host_f32(&q_into).unwrap(), q_alloc);
+    assert_eq!(backend.copy_to_host_f32(&k_into).unwrap(), k_alloc);
+    assert_eq!(backend.copy_to_host_f32(&v_into).unwrap(), v_alloc);
+
+    // Wrong q_out shape rejected
+    let mut q_wrong = backend.allocate_zeros(&[split_rows, q_size + 1], DType::F32).unwrap();
+    let _ = backend
+        .split_qkv_into(&mut q_wrong, &mut k_into, &mut v_into, &qkv, q_size, kv_size)
+        .expect_err("split_qkv_into wrong q shape rejected");
+
+    // ── slice_rows_into vs slice_rows ────────────────────────────
+    let row_src_data: Vec<f32> = (0..20 * 5).map(|i| i as f32 * 0.1).collect();
+    let row_src = backend.copy_from_host_f32(&row_src_data, &[20, 5]).unwrap();
+    let row_alloc = backend.slice_rows(&row_src, 5, 7).unwrap();
+    backend.synchronize().unwrap();
+    let row_alloc_host = backend.copy_to_host_f32(&row_alloc).unwrap();
+
+    let mut row_into = backend.allocate_zeros(&[7, 5], DType::F32).unwrap();
+    backend.slice_rows_into(&mut row_into, &row_src, 5, 7).unwrap();
+    backend.synchronize().unwrap();
+    assert_eq!(backend.copy_to_host_f32(&row_into).unwrap(), row_alloc_host);
+
+    // Reuse same buffer: subsequent slices overwrite (and second slice
+    // should be different data, proving the buffer reuses cleanly).
+    backend.slice_rows_into(&mut row_into, &row_src, 0, 7).unwrap();
+    backend.synchronize().unwrap();
+    let row_into_host2 = backend.copy_to_host_f32(&row_into).unwrap();
+    assert_eq!(row_into_host2, row_src_data[0..35]);
+
+    // Out-of-bounds start_row + num_rows rejected
+    let mut row_bad = backend.allocate_zeros(&[5, 5], DType::F32).unwrap();
+    let _ = backend
+        .slice_rows_into(&mut row_bad, &row_src, 18, 5)
+        .expect_err("slice_rows_into oob rejected");
 }

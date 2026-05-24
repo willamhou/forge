@@ -238,6 +238,98 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// In-place QKV split. All three outputs share `qkv`'s dtype; their
+    /// shapes are `[rows, q_size]`, `[rows, kv_size]`, `[rows, kv_size]`.
+    /// See [`Self::matmul_into`] for the capture-stability contract.
+    fn split_qkv_into(
+        &self,
+        q_out: &mut Self::Tensor,
+        k_out: &mut Self::Tensor,
+        v_out: &mut Self::Tensor,
+        qkv: &Self::Tensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<()> {
+        let shape = qkv.shape();
+        if shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "split_qkv_into: qkv must be 2D".into(),
+            ));
+        }
+        let rows = shape[0];
+        let total_cols = q_size + 2 * kv_size;
+        if shape[1] != total_cols {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![rows, total_cols],
+                got: shape.to_vec(),
+            });
+        }
+        for (out, want_cols, label) in [
+            (&*q_out, q_size, "q_out"),
+            (&*k_out, kv_size, "k_out"),
+            (&*v_out, kv_size, "v_out"),
+        ] {
+            if out.shape() != [rows, want_cols] {
+                return Err(crate::ForgeError::ShapeMismatch {
+                    expected: vec![rows, want_cols],
+                    got: out.shape().to_vec(),
+                });
+            }
+            if out.dtype() != qkv.dtype() {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "split_qkv_into: {label} dtype {:?} != qkv dtype {:?}",
+                    out.dtype(),
+                    qkv.dtype()
+                )));
+            }
+        }
+        let (q, k, v) = self.split_qkv(qkv, q_size, kv_size)?;
+        *q_out = q;
+        *k_out = k;
+        *v_out = v;
+        Ok(())
+    }
+
+    /// In-place row-slice. `out` shape `[num_rows, cols..]` must match the
+    /// corresponding slice of `tensor`. See [`Self::matmul_into`].
+    fn slice_rows_into(
+        &self,
+        out: &mut Self::Tensor,
+        tensor: &Self::Tensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<()> {
+        let in_shape = tensor.shape();
+        if in_shape.is_empty() {
+            return Err(crate::ForgeError::InvalidArgument(
+                "slice_rows_into: input tensor must be non-empty".into(),
+            ));
+        }
+        if start_row + num_rows > in_shape[0] {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "slice_rows_into: start_row {start_row} + num_rows {num_rows} > tensor rows {}",
+                in_shape[0]
+            )));
+        }
+        let mut expected = in_shape.to_vec();
+        expected[0] = num_rows;
+        if out.shape() != expected.as_slice() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != tensor.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "slice_rows_into: out dtype {:?} != tensor dtype {:?}",
+                out.dtype(),
+                tensor.dtype()
+            )));
+        }
+        *out = self.slice_rows(tensor, start_row, num_rows)?;
+        Ok(())
+    }
+
     /// Dtype cast, writing into a caller-provided output buffer.
     /// `out` shape must match `x`; cast direction implied by `x.dtype()` →
     /// `out.dtype()`. If `out.dtype() == x.dtype()`, this is a copy (no
