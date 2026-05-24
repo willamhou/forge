@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use forge_core::{Backend, DType, ForgeError, Result, Tensor};
@@ -65,6 +66,22 @@ pub struct CudaBackend {
     kernels: Arc<KernelFunctions>,
     _module_f32: Arc<CudaModule>,
     _module_f16: Arc<CudaModule>,
+    /// Persistent device scratch for paged_attention's i32 block_tables.
+    /// Grows monotonically. Replaying a captured CUDA Graph requires the
+    /// scratch's device pointer to be stable across calls; a `grow` event
+    /// invalidates any captured graph that baked the previous pointer
+    /// (Task 3's capture cache will react to the version bump).
+    paged_block_tables: Arc<Mutex<I32Scratch>>,
+    /// Persistent device scratch for paged_attention's i32 kv_lens. See above.
+    paged_kv_lens: Arc<Mutex<I32Scratch>>,
+}
+
+/// Monotonically-growing i32 device buffer. `version` increments on every
+/// reallocation so callers (e.g. CUDA Graph capture cache) can detect when
+/// the underlying device pointer has changed.
+struct I32Scratch {
+    buf: CudaSlice<i32>,
+    version: u64,
 }
 
 impl CudaBackend {
@@ -171,6 +188,15 @@ impl CudaBackend {
             paged_attention_f16: load_f16("paged_attention_f16")?,
         };
 
+        // Initial scratch capacity. Grown on demand.
+        let initial_scratch_cap = 16;
+        let block_tables = stream
+            .alloc_zeros::<i32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_block_tables: {e}")))?;
+        let kv_lens = stream
+            .alloc_zeros::<i32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_kv_lens: {e}")))?;
+
         Ok(Self {
             ctx,
             stream,
@@ -178,7 +204,50 @@ impl CudaBackend {
             kernels: Arc::new(kernels),
             _module_f32: module_f32,
             _module_f16: module_f16,
+            paged_block_tables: Arc::new(Mutex::new(I32Scratch {
+                buf: block_tables,
+                version: 0,
+            })),
+            paged_kv_lens: Arc::new(Mutex::new(I32Scratch {
+                buf: kv_lens,
+                version: 0,
+            })),
         })
+    }
+
+    /// Current `(block_tables_version, kv_lens_version)` for the paged
+    /// attention scratch buffers. Each value bumps every time the
+    /// corresponding scratch reallocates (and its device pointer changes).
+    ///
+    /// CUDA Graph capture caches use this to detect when a captured graph
+    /// referencing an old scratch pointer becomes invalid.
+    pub fn paged_scratch_versions(&self) -> (u64, u64) {
+        let bt = self
+            .paged_block_tables
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0);
+        let kv = self
+            .paged_kv_lens
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0);
+        (bt, kv)
+    }
+
+    /// Grow `scratch` if its capacity is below `needed`. Bumps `version` on
+    /// every grow so CUDA Graph capture caches can detect pointer changes.
+    fn ensure_i32_scratch(&self, scratch: &mut I32Scratch, needed: usize) -> Result<()> {
+        if scratch.buf.len() < needed {
+            // Geometric growth (1.5×) with a floor so we don't churn on small bumps.
+            let new_cap = (needed.max(scratch.buf.len() * 3 / 2)).max(16);
+            scratch.buf = self
+                .stream
+                .alloc_zeros::<i32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow i32 scratch: {e}")))?;
+            scratch.version = scratch.version.wrapping_add(1);
+        }
+        Ok(())
     }
 
     /// Locate the CUDA toolkit include directory containing `cuda_fp16.h`.
@@ -1523,16 +1592,33 @@ impl Backend for CudaBackend {
 
         let block_size = pool_shape[1];
 
-        // Per-call upload of i32 metadata. Task 2.5 will switch this to a
-        // persistent scratch buffer for graph-capture stability.
-        let block_tables_dev = self
-            .stream
-            .memcpy_stod(block_tables)
+        // Upload i32 metadata into persistent device scratch. The scratch's
+        // device pointer is stable across calls unless growth is required
+        // (see `ensure_i32_scratch` — bumps version on grow). CUDA Graph
+        // capture relies on this stability.
+        let mut bt_scratch = self
+            .paged_block_tables
+            .lock()
+            .map_err(|_| ForgeError::Cuda("paged_block_tables mutex poisoned".into()))?;
+        self.ensure_i32_scratch(&mut bt_scratch, block_tables.len())?;
+        self.stream
+            .memcpy_htod(block_tables, &mut bt_scratch.buf)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-        let kv_lens_dev = self
-            .stream
-            .memcpy_stod(kv_lens)
+
+        let mut kv_scratch = self
+            .paged_kv_lens
+            .lock()
+            .map_err(|_| ForgeError::Cuda("paged_kv_lens mutex poisoned".into()))?;
+        self.ensure_i32_scratch(&mut kv_scratch, kv_lens.len())?;
+        self.stream
+            .memcpy_htod(kv_lens, &mut kv_scratch.buf)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        // The kernel only reads block_tables.len() / kv_lens.len() entries
+        // (bounded by max_blocks_per_seq and batch_size); pass the full
+        // scratch slice — extra trailing capacity is harmless.
+        let block_tables_dev = &bt_scratch.buf;
+        let kv_lens_dev = &kv_scratch.buf;
 
         let block_dim = next_power_of_2(128u32.min(head_dim as u32));
         // Shared mem: reduction scratch (block_dim floats) + output accumulator
@@ -1565,8 +1651,8 @@ impl Backend for CudaBackend {
                 builder.arg(q.f32_slice()?);
                 builder.arg(k_pool.f32_slice()?);
                 builder.arg(v_pool.f32_slice()?);
-                builder.arg(&block_tables_dev);
-                builder.arg(&kv_lens_dev);
+                builder.arg(block_tables_dev);
+                builder.arg(kv_lens_dev);
                 builder.arg(&scale);
                 builder.arg(&num_heads_i32);
                 builder.arg(&num_kv_heads_i32);
@@ -1597,8 +1683,8 @@ impl Backend for CudaBackend {
                 builder.arg(q.f16_slice()?);
                 builder.arg(k_pool.f16_slice()?);
                 builder.arg(v_pool.f16_slice()?);
-                builder.arg(&block_tables_dev);
-                builder.arg(&kv_lens_dev);
+                builder.arg(block_tables_dev);
+                builder.arg(kv_lens_dev);
                 builder.arg(&scale);
                 builder.arg(&num_heads_i32);
                 builder.arg(&num_kv_heads_i32);

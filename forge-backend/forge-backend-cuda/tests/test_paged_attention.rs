@@ -250,4 +250,92 @@ fn paged_attention_cuda_matches_default_impl() {
             scale,
         )
         .expect_err("mixed F16 q + F32 pool should be rejected");
+
+    // ── Persistent scratch: pointer should stay stable across small calls,
+    //    bump version on grow ─────────────────────────────────────
+    let (v_bt_pre, v_kv_pre) = backend.paged_scratch_versions();
+
+    // Several small calls within initial capacity (16 i32 each) — no grow.
+    for _ in 0..4 {
+        let _ = backend
+            .paged_attention(
+                &q,
+                &k_pool,
+                &v_pool,
+                &block_tables,
+                &kv_lens,
+                max_blocks,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+            )
+            .unwrap();
+    }
+    let (v_bt_small, v_kv_small) = backend.paged_scratch_versions();
+    assert_eq!(
+        (v_bt_pre, v_kv_pre),
+        (v_bt_small, v_kv_small),
+        "no grow expected for small repeated calls"
+    );
+
+    // Force grow: assemble a batch with > 16 i32 block_table entries.
+    let big_batch = 6_usize;
+    let big_max_blocks = 4_usize; // 6 * 4 = 24 > initial scratch cap of 16
+    let big_block_tables: Vec<i32> = (0..big_batch as i32 * big_max_blocks as i32)
+        .map(|i| i % total_blocks as i32) // valid block ids, possibly repeated
+        .collect();
+    let big_kv_lens: Vec<i32> = vec![4; big_batch]; // 4 tokens per seq, < block_size * big_max_blocks
+    let big_q_data: Vec<f32> = (0..big_batch * num_heads * head_dim)
+        .map(|_| rng_lcg(&mut seed))
+        .collect();
+    let big_q = backend
+        .copy_from_host_f32(&big_q_data, &[big_batch, num_heads * head_dim])
+        .unwrap();
+
+    let _ = backend
+        .paged_attention(
+            &big_q,
+            &k_pool,
+            &v_pool,
+            &big_block_tables,
+            &big_kv_lens,
+            big_max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+    let (v_bt_post, v_kv_post) = backend.paged_scratch_versions();
+    assert!(
+        v_bt_post > v_bt_small,
+        "block_tables scratch should have grown (version {v_bt_small} → {v_bt_post})"
+    );
+    // kv_lens has 6 i32 — fits in initial 16. Should NOT bump.
+    assert_eq!(
+        v_kv_post, v_kv_small,
+        "kv_lens scratch should NOT have grown for 6 i32"
+    );
+
+    // Re-run the grown call — version must stay (no further grow).
+    let _ = backend
+        .paged_attention(
+            &big_q,
+            &k_pool,
+            &v_pool,
+            &big_block_tables,
+            &big_kv_lens,
+            big_max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+    let (v_bt_post2, _) = backend.paged_scratch_versions();
+    assert_eq!(
+        v_bt_post2, v_bt_post,
+        "no further grow on second identical call"
+    );
 }
