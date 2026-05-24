@@ -108,6 +108,150 @@ pub trait Backend: Send + Sync + 'static {
         *out = self.add(a, b)?;
         Ok(())
     }
+
+    /// RMS normalization, writing into a caller-provided output buffer.
+    /// `out` shape + dtype must match `x`. See [`Self::matmul_into`] for the
+    /// capture-stability contract.
+    fn rms_norm_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        weight: &Self::Tensor,
+        eps: f32,
+    ) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "rms_norm_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        *out = self.rms_norm(x, weight, eps)?;
+        Ok(())
+    }
+
+    /// Fused residual-add + RMS normalization, writing into caller-provided
+    /// buffers. Both outputs share `x`'s shape + dtype.
+    fn fused_residual_rms_norm_into(
+        &self,
+        normed_out: &mut Self::Tensor,
+        residual_out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        residual: &Self::Tensor,
+        weight: &Self::Tensor,
+        eps: f32,
+    ) -> Result<()> {
+        if x.shape() != residual.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: residual.shape().to_vec(),
+            });
+        }
+        if normed_out.shape() != x.shape() || residual_out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: normed_out.shape().to_vec(),
+            });
+        }
+        if normed_out.dtype() != x.dtype() || residual_out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "fused_residual_rms_norm_into: out dtypes (norm={:?}, residual={:?}) != x dtype {:?}",
+                normed_out.dtype(),
+                residual_out.dtype(),
+                x.dtype()
+            )));
+        }
+        let (n, r) = self.fused_residual_rms_norm(x, residual, weight, eps)?;
+        *normed_out = n;
+        *residual_out = r;
+        Ok(())
+    }
+
+    /// Fused SiLU(gate) * up, writing into a caller-provided output buffer.
+    /// All three tensors share shape + dtype.
+    fn fused_silu_mul_into(
+        &self,
+        out: &mut Self::Tensor,
+        gate: &Self::Tensor,
+        up: &Self::Tensor,
+    ) -> Result<()> {
+        if gate.shape() != up.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: gate.shape().to_vec(),
+                got: up.shape().to_vec(),
+            });
+        }
+        if out.shape() != gate.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: gate.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != gate.dtype() || gate.dtype() != up.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "fused_silu_mul_into: dtype mismatch out={:?} gate={:?} up={:?}",
+                out.dtype(),
+                gate.dtype(),
+                up.dtype()
+            )));
+        }
+        *out = self.fused_silu_mul(gate, up)?;
+        Ok(())
+    }
+
+    /// Embedding lookup, writing into a caller-provided output buffer.
+    /// `out` shape: `[indices.len(), embedding_dim]`; `out` dtype = `weight` dtype.
+    fn embedding_into(
+        &self,
+        out: &mut Self::Tensor,
+        weight: &Self::Tensor,
+        indices: &[u32],
+    ) -> Result<()> {
+        let weight_shape = weight.shape();
+        if weight_shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "embedding_into: weight must be 2D [vocab, embed_dim]".into(),
+            ));
+        }
+        let embedding_dim = weight_shape[1];
+        let expected = vec![indices.len(), embedding_dim];
+        if out.shape() != expected.as_slice() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != weight.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "embedding_into: out dtype {:?} != weight dtype {:?}",
+                out.dtype(),
+                weight.dtype()
+            )));
+        }
+        *out = self.embedding(weight, indices)?;
+        Ok(())
+    }
+
+    /// Dtype cast, writing into a caller-provided output buffer.
+    /// `out` shape must match `x`; cast direction implied by `x.dtype()` →
+    /// `out.dtype()`. If `out.dtype() == x.dtype()`, this is a copy (no
+    /// kernel launch on optimized backends).
+    fn cast_into(&self, out: &mut Self::Tensor, x: &Self::Tensor) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        *out = self.cast(x, out.dtype())?;
+        Ok(())
+    }
     fn mul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn mul_scalar(&self, a: &Self::Tensor, scalar: f32) -> Result<Self::Tensor>;
     fn silu(&self, a: &Self::Tensor) -> Result<Self::Tensor>;

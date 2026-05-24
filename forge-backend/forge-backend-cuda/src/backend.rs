@@ -1027,56 +1027,90 @@ impl Backend for CudaBackend {
 
     fn fused_silu_mul(&self, gate: &CudaTensor, up: &CudaTensor) -> Result<CudaTensor> {
         validate_same_shape(gate, up)?;
-        let n = gate.len() as u32;
+        let mut out = self.allocate_zeros(&gate.shape, gate.dtype())?;
+        self.fused_silu_mul_into(&mut out, gate, up)?;
+        Ok(out)
+    }
 
+    /// In-place fused SiLU(gate)*up. See `matmul_into` for the
+    /// capture-stability contract.
+    fn fused_silu_mul_into(
+        &self,
+        out: &mut CudaTensor,
+        gate: &CudaTensor,
+        up: &CudaTensor,
+    ) -> Result<()> {
+        validate_same_shape(gate, up)?;
+        if out.shape() != gate.shape() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: gate.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != gate.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "fused_silu_mul_into: out dtype {:?} != gate dtype {:?}",
+                out.dtype(),
+                gate.dtype()
+            )));
+        }
+        let n = gate.len() as u32;
         match gate.dtype() {
             DType::F16 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(n as usize)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let g = gate.f16_slice()?;
+                let u = up.f16_slice()?;
+                let o = out.f16_slice_mut()?;
                 let mut builder = self
                     .stream
                     .launch_builder(&self.kernels.fused_silu_mul_f16);
-                builder.arg(&mut out);
-                builder.arg(gate.f16_slice()?);
-                builder.arg(up.f16_slice()?);
+                builder.arg(o);
+                builder.arg(g);
+                builder.arg(u);
                 builder.arg(&n);
                 unsafe {
                     builder
                         .launch(LaunchConfig::for_num_elems(n))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f16_data(out, gate.shape.clone()))
+                Ok(())
             }
             DType::F32 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(n as usize)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let g = gate.f32_slice()?;
+                let u = up.f32_slice()?;
+                let o = out.f32_slice_mut()?;
                 let mut builder = self
                     .stream
                     .launch_builder(&self.kernels.fused_silu_mul_f32);
-                builder.arg(&mut out);
-                builder.arg(gate.f32_slice()?);
-                builder.arg(up.f32_slice()?);
+                builder.arg(o);
+                builder.arg(g);
+                builder.arg(u);
                 builder.arg(&n);
                 unsafe {
                     builder
                         .launch(LaunchConfig::for_num_elems(n))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f32_data(out, gate.shape.clone()))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
     }
 
     fn rms_norm(&self, x: &CudaTensor, weight: &CudaTensor, eps: f32) -> Result<CudaTensor> {
+        let mut out = self.allocate_zeros(&x.shape, x.dtype())?;
+        self.rms_norm_into(&mut out, x, weight, eps)?;
+        Ok(out)
+    }
+
+    /// In-place RMS normalization. See `matmul_into` for the
+    /// capture-stability contract.
+    fn rms_norm_into(
+        &self,
+        out: &mut CudaTensor,
+        x: &CudaTensor,
+        weight: &CudaTensor,
+        eps: f32,
+    ) -> Result<()> {
         let shape = x.shape();
         let cols = *shape.last().unwrap();
         if weight.len() != cols {
@@ -1084,6 +1118,19 @@ impl Backend for CudaBackend {
                 expected: vec![cols],
                 got: weight.shape().to_vec(),
             });
+        }
+        if out.shape() != shape {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "rms_norm_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
         }
         let rows = x.len() / cols;
         let rows_u32 = rows as u32;
@@ -1095,15 +1142,13 @@ impl Backend for CudaBackend {
 
         match x.dtype() {
             DType::F16 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(rows * cols)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let x_s = x.f16_slice()?;
+                let w_s = weight.f16_slice()?;
+                let o = out.f16_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.rms_norm_f16);
-                builder.arg(&mut out);
-                builder.arg(x.f16_slice()?);
-                builder.arg(weight.f16_slice()?);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(w_s);
                 builder.arg(&eps);
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
@@ -1116,19 +1161,16 @@ impl Backend for CudaBackend {
                         })
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f16_data(out, shape.to_vec()))
+                Ok(())
             }
             DType::F32 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(rows * cols)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let x_s = x.f32_slice()?;
+                let w_s = weight.f32_slice()?;
+                let o = out.f32_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.rms_norm_f32);
-                builder.arg(&mut out);
-                builder.arg(x.f32_slice()?);
-                builder.arg(weight.f32_slice()?);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(w_s);
                 builder.arg(&eps);
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
@@ -1141,8 +1183,7 @@ impl Backend for CudaBackend {
                         })
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f32_data(out, shape.to_vec()))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
@@ -1156,6 +1197,24 @@ impl Backend for CudaBackend {
         eps: f32,
     ) -> Result<(CudaTensor, CudaTensor)> {
         validate_same_shape(x, residual)?;
+        let mut normed = self.allocate_zeros(&x.shape, x.dtype())?;
+        let mut residual_out = self.allocate_zeros(&x.shape, x.dtype())?;
+        self.fused_residual_rms_norm_into(&mut normed, &mut residual_out, x, residual, weight, eps)?;
+        Ok((normed, residual_out))
+    }
+
+    /// In-place fused residual + RMS norm. See `matmul_into` for the
+    /// capture-stability contract.
+    fn fused_residual_rms_norm_into(
+        &self,
+        normed_out: &mut CudaTensor,
+        residual_out: &mut CudaTensor,
+        x: &CudaTensor,
+        residual: &CudaTensor,
+        weight: &CudaTensor,
+        eps: f32,
+    ) -> Result<()> {
+        validate_same_shape(x, residual)?;
         let shape = x.shape();
         let cols = *shape.last().unwrap();
         if weight.len() != cols {
@@ -1163,6 +1222,20 @@ impl Backend for CudaBackend {
                 expected: vec![cols],
                 got: weight.shape().to_vec(),
             });
+        }
+        if normed_out.shape() != shape || residual_out.shape() != shape {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: normed_out.shape().to_vec(),
+            });
+        }
+        if normed_out.dtype() != x.dtype() || residual_out.dtype() != x.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "fused_residual_rms_norm_into: out dtypes (norm={:?}, residual={:?}) != x dtype {:?}",
+                normed_out.dtype(),
+                residual_out.dtype(),
+                x.dtype()
+            )));
         }
         let rows = x.len() / cols;
         let rows_u32 = rows as u32;
@@ -1173,23 +1246,21 @@ impl Backend for CudaBackend {
 
         match x.dtype() {
             DType::F16 => {
-                let mut norm_out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(rows * cols)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                let mut residual_out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(rows * cols)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let x_s = x.f16_slice()?;
+                let r_s = residual.f16_slice()?;
+                let w_s = weight.f16_slice()?;
+                let n_o = normed_out.f16_slice_mut()?;
                 let mut builder = self
                     .stream
                     .launch_builder(&self.kernels.fused_residual_rms_norm_f16);
-                builder.arg(&mut norm_out);
-                builder.arg(&mut residual_out);
-                builder.arg(x.f16_slice()?);
-                builder.arg(residual.f16_slice()?);
-                builder.arg(weight.f16_slice()?);
+                builder.arg(n_o);
+                // Re-borrow residual_out's slice — but we still hold n_o mut borrow on normed_out;
+                // they're distinct tensors so separate borrows are fine.
+                let r_o = residual_out.f16_slice_mut()?;
+                builder.arg(r_o);
+                builder.arg(x_s);
+                builder.arg(r_s);
+                builder.arg(w_s);
                 builder.arg(&eps);
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
@@ -1202,30 +1273,22 @@ impl Backend for CudaBackend {
                         })
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok((
-                    CudaTensor::f16_data(norm_out, shape.to_vec()),
-                    CudaTensor::f16_data(residual_out, shape.to_vec()),
-                ))
+                Ok(())
             }
             DType::F32 => {
-                let mut norm_out = self
-                    .stream
-                    .alloc_zeros::<f32>(rows * cols)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-                let mut residual_out = self
-                    .stream
-                    .alloc_zeros::<f32>(rows * cols)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let x_s = x.f32_slice()?;
+                let r_s = residual.f32_slice()?;
+                let w_s = weight.f32_slice()?;
+                let n_o = normed_out.f32_slice_mut()?;
                 let mut builder = self
                     .stream
                     .launch_builder(&self.kernels.fused_residual_rms_norm_f32);
-                builder.arg(&mut norm_out);
-                builder.arg(&mut residual_out);
-                builder.arg(x.f32_slice()?);
-                builder.arg(residual.f32_slice()?);
-                builder.arg(weight.f32_slice()?);
+                builder.arg(n_o);
+                let r_o = residual_out.f32_slice_mut()?;
+                builder.arg(r_o);
+                builder.arg(x_s);
+                builder.arg(r_s);
+                builder.arg(w_s);
                 builder.arg(&eps);
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
@@ -1238,11 +1301,7 @@ impl Backend for CudaBackend {
                         })
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok((
-                    CudaTensor::f32_data(norm_out, shape.to_vec()),
-                    CudaTensor::f32_data(residual_out, shape.to_vec()),
-                ))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
@@ -1409,14 +1468,50 @@ impl Backend for CudaBackend {
                 "embedding weight must be 2D [vocab_size, embedding_dim]".into(),
             ));
         }
+        let embedding_dim = weight_shape[1];
+        let mut out =
+            self.allocate_zeros(&[indices.len(), embedding_dim], weight.dtype())?;
+        self.embedding_into(&mut out, weight, indices)?;
+        Ok(out)
+    }
+
+    /// In-place embedding lookup. See `matmul_into` for the
+    /// capture-stability contract.
+    fn embedding_into(
+        &self,
+        out: &mut CudaTensor,
+        weight: &CudaTensor,
+        indices: &[u32],
+    ) -> Result<()> {
+        let weight_shape = weight.shape();
+        if weight_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "embedding_into: weight must be 2D [vocab_size, embedding_dim]".into(),
+            ));
+        }
         let vocab_size = weight_shape[0];
         let embedding_dim = weight_shape[1];
         let num_indices = indices.len();
 
+        let expected_out = vec![num_indices, embedding_dim];
+        if out.shape() != expected_out.as_slice() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: expected_out,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != weight.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "embedding_into: out dtype {:?} != weight dtype {:?}",
+                out.dtype(),
+                weight.dtype()
+            )));
+        }
+
         for &idx in indices {
             if idx as usize >= vocab_size {
                 return Err(ForgeError::InvalidArgument(format!(
-                    "embedding index {idx} out of range (vocab_size={vocab_size})"
+                    "embedding_into: index {idx} out of range (vocab_size={vocab_size})"
                 )));
             }
         }
@@ -1430,56 +1525,46 @@ impl Backend for CudaBackend {
             .memcpy_stod(indices)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
+        let launch_cfg = LaunchConfig {
+            grid_dim: (num_indices as u32, 1, 1),
+            block_dim: (256.min(embedding_dim as u32), 1, 1),
+            shared_mem_bytes: 0,
+        };
+
         match weight.dtype() {
             DType::F16 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(num_indices * embedding_dim)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let w = weight.f16_slice()?;
+                let o = out.f16_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.embedding_f16);
-                builder.arg(&mut out);
-                builder.arg(weight.f16_slice()?);
+                builder.arg(o);
+                builder.arg(w);
                 builder.arg(&indices_dev);
                 builder.arg(&num_indices_u32);
                 builder.arg(&embedding_dim_u32);
                 builder.arg(&vocab_size_u32);
                 unsafe {
                     builder
-                        .launch(LaunchConfig {
-                            grid_dim: (num_indices as u32, 1, 1),
-                            block_dim: (256.min(embedding_dim as u32), 1, 1),
-                            shared_mem_bytes: 0,
-                        })
+                        .launch(launch_cfg)
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f16_data(out, vec![num_indices, embedding_dim]))
+                Ok(())
             }
             DType::F32 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(num_indices * embedding_dim)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let w = weight.f32_slice()?;
+                let o = out.f32_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.embedding_f32);
-                builder.arg(&mut out);
-                builder.arg(weight.f32_slice()?);
+                builder.arg(o);
+                builder.arg(w);
                 builder.arg(&indices_dev);
                 builder.arg(&num_indices_u32);
                 builder.arg(&embedding_dim_u32);
                 builder.arg(&vocab_size_u32);
                 unsafe {
                     builder
-                        .launch(LaunchConfig {
-                            grid_dim: (num_indices as u32, 1, 1),
-                            block_dim: (256.min(embedding_dim as u32), 1, 1),
-                            shared_mem_bytes: 0,
-                        })
+                        .launch(launch_cfg)
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f32_data(out, vec![num_indices, embedding_dim]))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
@@ -1644,48 +1729,74 @@ impl Backend for CudaBackend {
         if x.dtype() == dtype {
             return Ok(x.clone());
         }
+        let mut out = self.allocate_zeros(&x.shape, dtype)?;
+        self.cast_into(&mut out, x)?;
+        Ok(out)
+    }
+
+    /// In-place dtype cast. See `matmul_into` for the capture-stability
+    /// contract. If `out.dtype() == x.dtype()`, this is a device-to-device
+    /// memcpy (still inside `out`'s existing buffer).
+    fn cast_into(&self, out: &mut CudaTensor, x: &CudaTensor) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
         let n = x.len() as u32;
-        let shape = x.shape().to_vec();
-
-        match (x.dtype(), dtype) {
+        match (x.dtype(), out.dtype()) {
+            (a, b) if a == b => {
+                // Same dtype — d2d copy into out's existing buffer.
+                match a {
+                    DType::F32 => {
+                        let src = x.f32_slice()?;
+                        let dst = out.f32_slice_mut()?;
+                        self.stream
+                            .memcpy_dtod(src, dst)
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
+                    DType::F16 => {
+                        let src = x.f16_slice()?;
+                        let dst = out.f16_slice_mut()?;
+                        self.stream
+                            .memcpy_dtod(src, dst)
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
+                    other => return Err(ForgeError::UnsupportedDtype(other)),
+                }
+                Ok(())
+            }
             (DType::F16, DType::F32) => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(n as usize)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let src = x.f16_slice()?;
+                let dst = out.f32_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.cast_f16_to_f32);
-                builder.arg(&mut out);
-                builder.arg(x.f16_slice()?);
+                builder.arg(dst);
+                builder.arg(src);
                 builder.arg(&n);
                 unsafe {
                     builder
                         .launch(LaunchConfig::for_num_elems(n))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f32_data(out, shape))
+                Ok(())
             }
             (DType::F32, DType::F16) => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(n as usize)
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let src = x.f32_slice()?;
+                let dst = out.f16_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.cast_f32_to_f16);
-                builder.arg(&mut out);
-                builder.arg(x.f32_slice()?);
+                builder.arg(dst);
+                builder.arg(src);
                 builder.arg(&n);
                 unsafe {
                     builder
                         .launch(LaunchConfig::for_num_elems(n))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f16_data(out, shape))
+                Ok(())
             }
             (from, to) => Err(ForgeError::InvalidArgument(format!(
-                "cast from {:?} to {:?} not supported",
+                "cast_into from {:?} to {:?} not supported",
                 from, to
             ))),
         }

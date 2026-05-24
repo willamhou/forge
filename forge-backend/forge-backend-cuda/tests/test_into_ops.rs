@@ -133,4 +133,153 @@ fn into_variants_match_alloc_variants() {
     let _ = backend
         .add_into(&mut wrong_dtype_v, &v1, &v2)
         .expect_err("wrong out dtype rejected");
+
+    // ── rms_norm_into vs rms_norm (F32) ───────────────────────────
+    let rows = 3;
+    let cols = 8;
+    let x_data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.1 - 0.5).collect();
+    let weight_data: Vec<f32> = (0..cols).map(|i| 1.0 + (i as f32) * 0.05).collect();
+    let x = backend.copy_from_host_f32(&x_data, &[rows, cols]).unwrap();
+    let weight = backend.copy_from_host_f32(&weight_data, &[cols]).unwrap();
+    let eps = 1e-5_f32;
+
+    let rms_alloc = backend.rms_norm(&x, &weight, eps).unwrap();
+    backend.synchronize().unwrap();
+    let rms_alloc_host = backend.copy_to_host_f32(&rms_alloc).unwrap();
+
+    let mut rms_into = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
+    for _ in 0..3 {
+        backend.rms_norm_into(&mut rms_into, &x, &weight, eps).unwrap();
+    }
+    backend.synchronize().unwrap();
+    let rms_into_host = backend.copy_to_host_f32(&rms_into).unwrap();
+    for (i, (got, want)) in rms_into_host.iter().zip(&rms_alloc_host).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-5,
+            "rms_norm_into F32 diverges at [{i}]: got {got} want {want}"
+        );
+    }
+
+    // ── fused_residual_rms_norm_into ──────────────────────────────
+    let residual_data: Vec<f32> = (0..rows * cols).map(|i| -0.2 + (i as f32) * 0.07).collect();
+    let residual = backend
+        .copy_from_host_f32(&residual_data, &[rows, cols])
+        .unwrap();
+    let (frrn_norm_alloc, frrn_res_alloc) = backend
+        .fused_residual_rms_norm(&x, &residual, &weight, eps)
+        .unwrap();
+    backend.synchronize().unwrap();
+    let frrn_norm_alloc_host = backend.copy_to_host_f32(&frrn_norm_alloc).unwrap();
+    let frrn_res_alloc_host = backend.copy_to_host_f32(&frrn_res_alloc).unwrap();
+
+    let mut frrn_norm = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
+    let mut frrn_res = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
+    backend
+        .fused_residual_rms_norm_into(&mut frrn_norm, &mut frrn_res, &x, &residual, &weight, eps)
+        .unwrap();
+    backend.synchronize().unwrap();
+    let frrn_norm_host = backend.copy_to_host_f32(&frrn_norm).unwrap();
+    let frrn_res_host = backend.copy_to_host_f32(&frrn_res).unwrap();
+    for (i, (got, want)) in frrn_norm_host.iter().zip(&frrn_norm_alloc_host).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-5,
+            "fused_residual_rms_norm_into normed diverges at [{i}]: got {got} want {want}"
+        );
+    }
+    for (i, (got, want)) in frrn_res_host.iter().zip(&frrn_res_alloc_host).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-5,
+            "fused_residual_rms_norm_into residual diverges at [{i}]: got {got} want {want}"
+        );
+    }
+
+    // ── fused_silu_mul_into ───────────────────────────────────────
+    let gate_data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.13 - 0.6).collect();
+    let up_data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.09 + 0.2).collect();
+    let gate = backend
+        .copy_from_host_f32(&gate_data, &[rows, cols])
+        .unwrap();
+    let up = backend.copy_from_host_f32(&up_data, &[rows, cols]).unwrap();
+    let silu_alloc = backend.fused_silu_mul(&gate, &up).unwrap();
+    backend.synchronize().unwrap();
+    let silu_alloc_host = backend.copy_to_host_f32(&silu_alloc).unwrap();
+
+    let mut silu_into = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
+    for _ in 0..3 {
+        backend.fused_silu_mul_into(&mut silu_into, &gate, &up).unwrap();
+    }
+    backend.synchronize().unwrap();
+    let silu_into_host = backend.copy_to_host_f32(&silu_into).unwrap();
+    for (i, (got, want)) in silu_into_host.iter().zip(&silu_alloc_host).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "fused_silu_mul_into F32 diverges at [{i}]: got {got} want {want}"
+        );
+    }
+
+    // ── embedding_into ────────────────────────────────────────────
+    let vocab = 16usize;
+    let embed_dim = 6usize;
+    let emb_weight_data: Vec<f32> = (0..vocab * embed_dim).map(|i| (i as f32) * 0.04).collect();
+    let emb_weight = backend
+        .copy_from_host_f32(&emb_weight_data, &[vocab, embed_dim])
+        .unwrap();
+    let indices: Vec<u32> = vec![0, 5, 12, 3];
+
+    let emb_alloc = backend.embedding(&emb_weight, &indices).unwrap();
+    backend.synchronize().unwrap();
+    let emb_alloc_host = backend.copy_to_host_f32(&emb_alloc).unwrap();
+
+    let mut emb_into = backend
+        .allocate_zeros(&[indices.len(), embed_dim], DType::F32)
+        .unwrap();
+    for _ in 0..3 {
+        backend.embedding_into(&mut emb_into, &emb_weight, &indices).unwrap();
+    }
+    backend.synchronize().unwrap();
+    let emb_into_host = backend.copy_to_host_f32(&emb_into).unwrap();
+    assert_eq!(emb_into_host, emb_alloc_host);
+
+    // ── cast_into (F32 → F16 → F32 round trip) ───────────────────
+    let mut cast_to_f16 = backend.allocate_zeros(&[rows, cols], DType::F16).unwrap();
+    backend.cast_into(&mut cast_to_f16, &x).unwrap();
+    backend.synchronize().unwrap();
+    // cast back to F32 for comparison
+    let mut cast_back = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
+    backend.cast_into(&mut cast_back, &cast_to_f16).unwrap();
+    backend.synchronize().unwrap();
+    let cast_back_host = backend.copy_to_host_f32(&cast_back).unwrap();
+    let x_host = backend.copy_to_host_f32(&x).unwrap();
+    for (i, (got, want)) in cast_back_host.iter().zip(&x_host).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "cast F32→F16→F32 roundtrip diverges at [{i}]: got {got} want {want}"
+        );
+    }
+
+    // Same-dtype cast_into is a d2d copy.
+    let mut cast_same = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
+    backend.cast_into(&mut cast_same, &x).unwrap();
+    backend.synchronize().unwrap();
+    let cast_same_host = backend.copy_to_host_f32(&cast_same).unwrap();
+    assert_eq!(cast_same_host, x_host);
+
+    // ── Validation on the new ops ────────────────────────────────
+    let mut wrong = backend.allocate_zeros(&[rows, cols + 1], DType::F32).unwrap();
+    let _ = backend
+        .rms_norm_into(&mut wrong, &x, &weight, eps)
+        .expect_err("rms_norm_into wrong shape rejected");
+    let mut wrong_dt = backend.allocate_zeros(&[rows, cols], DType::F16).unwrap();
+    let _ = backend
+        .rms_norm_into(&mut wrong_dt, &x, &weight, eps)
+        .expect_err("rms_norm_into wrong dtype rejected");
+    let _ = backend
+        .fused_silu_mul_into(&mut wrong_dt, &gate, &up)
+        .expect_err("fused_silu_mul_into wrong dtype rejected");
+    let mut emb_wrong = backend
+        .allocate_zeros(&[indices.len() + 1, embed_dim], DType::F32)
+        .unwrap();
+    let _ = backend
+        .embedding_into(&mut emb_wrong, &emb_weight, &indices)
+        .expect_err("embedding_into wrong shape rejected");
 }
