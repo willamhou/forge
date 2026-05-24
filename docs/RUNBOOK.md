@@ -43,6 +43,36 @@ bash scripts/benchmark.sh /path/to/model 10 128 8080
 
 Reports TTFT (avg/p50/p99), ITL (avg), and throughput (tokens/s).
 
+### Comparative benchmark vs vLLM
+
+```bash
+bash scripts/benchmark_vllm.sh /path/to/model
+```
+
+Boots forge (port 8080) and vLLM 0.18 (port 8000) against the same model,
+runs a matrix of `prompt_len × concurrency` cells, and writes a side-by-side
+markdown report to `.reports/vllm-comparison-<timestamp>.md`.
+
+Override the matrix via env vars:
+
+```bash
+PROMPT_LENS=128,1024,4096 CONCURRENCIES=1,8,32,64 REQUESTS_PER_CELL=32 \
+    bash scripts/benchmark_vllm.sh /path/to/model
+```
+
+Prereq: `pip install vllm==0.18.*`. Server logs land in `.reports/forge-server.log`
+and `.reports/vllm-server.log` for triage.
+
+Validate the readiness/identity verifier without launching anything:
+
+```bash
+SELFTEST=1 bash scripts/benchmark_vllm.sh
+```
+
+Runs unit-style checks against `verify_models_response` — catches regressions
+in the `/v1/models` shape verifier (including stdin-routing bugs that would
+silently make every server look unhealthy).
+
 ## API Features
 
 ### Structured Output (JSON Schema / Regex)

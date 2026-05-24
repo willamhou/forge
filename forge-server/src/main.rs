@@ -145,7 +145,8 @@ async fn run_server<B: Backend + Clone>(
                     model_config.num_hidden_layers,
                     model_config.num_key_value_heads,
                     model_config.head_dim,
-                );
+                    model_config.dtype,
+                )?;
                 info!(
                     "Paged KV cache: {} blocks x {} tokens, kv_dim={}",
                     cli.num_blocks,

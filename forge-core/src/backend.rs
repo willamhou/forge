@@ -23,6 +23,335 @@ pub trait Backend: Send + Sync + 'static {
     // Core ops
     fn matmul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn add(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Matrix multiply, writing into a caller-provided output buffer.
+    ///
+    /// `a`: `[m, k]`, `b`: `[k, n]`, `out`: `[m, n]`; out dtype must match
+    /// a/b dtype.
+    ///
+    /// Used by the engine's persistent-buffer + CUDA-Graph capture path
+    /// (Task 5+) where the captured kernel's output arg must point at a
+    /// stable device address. CUDA backends override to gemm directly into
+    /// `out`'s underlying device slice; the default impl just allocates +
+    /// reassigns `*out`, which is correct numerically but does NOT preserve
+    /// the tensor's underlying device pointer — fine for non-CUDA backends
+    /// (they don't capture graphs).
+    ///
+    /// **Capture-safety contract**: backends that participate in CUDA Graph
+    /// capture (or any equivalent "record kernel arg pointers, replay
+    /// later" mechanism) MUST override this method to write in place.
+    /// The default impl's `*out = ...` reassignment changes the tensor's
+    /// underlying storage on every call and would invalidate any captured
+    /// graph that baked the previous pointer. The same contract applies
+    /// to every other `_into` method on this trait.
+    fn matmul_into(
+        &self,
+        out: &mut Self::Tensor,
+        a: &Self::Tensor,
+        b: &Self::Tensor,
+    ) -> Result<()> {
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "matmul_into: requires 2D tensors".into(),
+            ));
+        }
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = b_shape[1];
+        if b_shape[0] != k {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![k, n],
+                got: b_shape.to_vec(),
+            });
+        }
+        let out_shape = out.shape();
+        if out_shape != [m, n] {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![m, n],
+                got: out_shape.to_vec(),
+            });
+        }
+        if out.dtype() != a.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "matmul_into: out dtype {:?} != a dtype {:?}",
+                out.dtype(),
+                a.dtype()
+            )));
+        }
+        *out = self.matmul(a, b)?;
+        Ok(())
+    }
+
+    /// Element-wise add, writing into a caller-provided output buffer.
+    /// Out shape + dtype must match both inputs.
+    /// See [`Self::matmul_into`] for the capture-stability contract.
+    fn add_into(
+        &self,
+        out: &mut Self::Tensor,
+        a: &Self::Tensor,
+        b: &Self::Tensor,
+    ) -> Result<()> {
+        if a.shape() != b.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: a.shape().to_vec(),
+                got: b.shape().to_vec(),
+            });
+        }
+        if out.shape() != a.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: a.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != a.dtype() || a.dtype() != b.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "add_into: dtype mismatch out={:?} a={:?} b={:?}",
+                out.dtype(),
+                a.dtype(),
+                b.dtype()
+            )));
+        }
+        *out = self.add(a, b)?;
+        Ok(())
+    }
+
+    /// RMS normalization, writing into a caller-provided output buffer.
+    /// `out` shape + dtype must match `x`. See [`Self::matmul_into`] for the
+    /// capture-stability contract.
+    fn rms_norm_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        weight: &Self::Tensor,
+        eps: f32,
+    ) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "rms_norm_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        *out = self.rms_norm(x, weight, eps)?;
+        Ok(())
+    }
+
+    /// Fused residual-add + RMS normalization, writing into caller-provided
+    /// buffers. Both outputs share `x`'s shape + dtype.
+    fn fused_residual_rms_norm_into(
+        &self,
+        normed_out: &mut Self::Tensor,
+        residual_out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        residual: &Self::Tensor,
+        weight: &Self::Tensor,
+        eps: f32,
+    ) -> Result<()> {
+        if x.shape() != residual.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: residual.shape().to_vec(),
+            });
+        }
+        if normed_out.shape() != x.shape() || residual_out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: normed_out.shape().to_vec(),
+            });
+        }
+        if normed_out.dtype() != x.dtype() || residual_out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "fused_residual_rms_norm_into: out dtypes (norm={:?}, residual={:?}) != x dtype {:?}",
+                normed_out.dtype(),
+                residual_out.dtype(),
+                x.dtype()
+            )));
+        }
+        let (n, r) = self.fused_residual_rms_norm(x, residual, weight, eps)?;
+        *normed_out = n;
+        *residual_out = r;
+        Ok(())
+    }
+
+    /// Fused SiLU(gate) * up, writing into a caller-provided output buffer.
+    /// All three tensors share shape + dtype.
+    fn fused_silu_mul_into(
+        &self,
+        out: &mut Self::Tensor,
+        gate: &Self::Tensor,
+        up: &Self::Tensor,
+    ) -> Result<()> {
+        if gate.shape() != up.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: gate.shape().to_vec(),
+                got: up.shape().to_vec(),
+            });
+        }
+        if out.shape() != gate.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: gate.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != gate.dtype() || gate.dtype() != up.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "fused_silu_mul_into: dtype mismatch out={:?} gate={:?} up={:?}",
+                out.dtype(),
+                gate.dtype(),
+                up.dtype()
+            )));
+        }
+        *out = self.fused_silu_mul(gate, up)?;
+        Ok(())
+    }
+
+    /// Embedding lookup, writing into a caller-provided output buffer.
+    /// `out` shape: `[indices.len(), embedding_dim]`; `out` dtype = `weight` dtype.
+    fn embedding_into(
+        &self,
+        out: &mut Self::Tensor,
+        weight: &Self::Tensor,
+        indices: &[u32],
+    ) -> Result<()> {
+        let weight_shape = weight.shape();
+        if weight_shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "embedding_into: weight must be 2D [vocab, embed_dim]".into(),
+            ));
+        }
+        let embedding_dim = weight_shape[1];
+        let expected = vec![indices.len(), embedding_dim];
+        if out.shape() != expected.as_slice() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != weight.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "embedding_into: out dtype {:?} != weight dtype {:?}",
+                out.dtype(),
+                weight.dtype()
+            )));
+        }
+        *out = self.embedding(weight, indices)?;
+        Ok(())
+    }
+
+    /// In-place QKV split. All three outputs share `qkv`'s dtype; their
+    /// shapes are `[rows, q_size]`, `[rows, kv_size]`, `[rows, kv_size]`.
+    /// See [`Self::matmul_into`] for the capture-stability contract.
+    fn split_qkv_into(
+        &self,
+        q_out: &mut Self::Tensor,
+        k_out: &mut Self::Tensor,
+        v_out: &mut Self::Tensor,
+        qkv: &Self::Tensor,
+        q_size: usize,
+        kv_size: usize,
+    ) -> Result<()> {
+        let shape = qkv.shape();
+        if shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "split_qkv_into: qkv must be 2D".into(),
+            ));
+        }
+        let rows = shape[0];
+        let total_cols = q_size + 2 * kv_size;
+        if shape[1] != total_cols {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![rows, total_cols],
+                got: shape.to_vec(),
+            });
+        }
+        for (out, want_cols, label) in [
+            (&*q_out, q_size, "q_out"),
+            (&*k_out, kv_size, "k_out"),
+            (&*v_out, kv_size, "v_out"),
+        ] {
+            if out.shape() != [rows, want_cols] {
+                return Err(crate::ForgeError::ShapeMismatch {
+                    expected: vec![rows, want_cols],
+                    got: out.shape().to_vec(),
+                });
+            }
+            if out.dtype() != qkv.dtype() {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "split_qkv_into: {label} dtype {:?} != qkv dtype {:?}",
+                    out.dtype(),
+                    qkv.dtype()
+                )));
+            }
+        }
+        let (q, k, v) = self.split_qkv(qkv, q_size, kv_size)?;
+        *q_out = q;
+        *k_out = k;
+        *v_out = v;
+        Ok(())
+    }
+
+    /// In-place row-slice. `out` shape `[num_rows, cols..]` must match the
+    /// corresponding slice of `tensor`. See [`Self::matmul_into`].
+    fn slice_rows_into(
+        &self,
+        out: &mut Self::Tensor,
+        tensor: &Self::Tensor,
+        start_row: usize,
+        num_rows: usize,
+    ) -> Result<()> {
+        let in_shape = tensor.shape();
+        if in_shape.is_empty() {
+            return Err(crate::ForgeError::InvalidArgument(
+                "slice_rows_into: input tensor must be non-empty".into(),
+            ));
+        }
+        if start_row + num_rows > in_shape[0] {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "slice_rows_into: start_row {start_row} + num_rows {num_rows} > tensor rows {}",
+                in_shape[0]
+            )));
+        }
+        let mut expected = in_shape.to_vec();
+        expected[0] = num_rows;
+        if out.shape() != expected.as_slice() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != tensor.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "slice_rows_into: out dtype {:?} != tensor dtype {:?}",
+                out.dtype(),
+                tensor.dtype()
+            )));
+        }
+        *out = self.slice_rows(tensor, start_row, num_rows)?;
+        Ok(())
+    }
+
+    /// Dtype cast, writing into a caller-provided output buffer.
+    /// `out` shape must match `x`; cast direction implied by `x.dtype()` →
+    /// `out.dtype()`. If `out.dtype() == x.dtype()`, this is a copy (no
+    /// kernel launch on optimized backends).
+    fn cast_into(&self, out: &mut Self::Tensor, x: &Self::Tensor) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        *out = self.cast(x, out.dtype())?;
+        Ok(())
+    }
     fn mul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn mul_scalar(&self, a: &Self::Tensor, scalar: f32) -> Result<Self::Tensor>;
     fn silu(&self, a: &Self::Tensor) -> Result<Self::Tensor>;
@@ -202,14 +531,391 @@ pub trait Backend: Send + Sync + 'static {
         freqs_cos: &Self::Tensor,
         freqs_sin: &Self::Tensor,
     ) -> Result<Self::Tensor>;
+
+    /// In-place RoPE driven by host-side cos/sin slices.
+    ///
+    /// The caller passes the F32 cos/sin freq data as host slices; backends
+    /// upload them internally. CUDA backends route the upload through a
+    /// persistent device scratch so the kernel arg pointers are stable for
+    /// CUDA-Graph capture even though the cos/sin values themselves change
+    /// per call (positions differ per decode step).
+    ///
+    /// `cos_host` / `sin_host` are expected length `[seq_len * head_dim/2]`.
+    fn rope_with_host_freqs_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        cos_host: &[f32],
+        sin_host: &[f32],
+    ) -> Result<()> {
+        let shape = x.shape();
+        if shape.len() != 4 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "rope_with_host_freqs_into: x must be rank-4".into(),
+            ));
+        }
+        let seq_len = shape[1];
+        let head_dim = shape[3];
+        if head_dim % 2 != 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "rope_with_host_freqs_into: head_dim must be even".into(),
+            ));
+        }
+        let half = head_dim / 2;
+        let expected = seq_len * half;
+        if cos_host.len() != expected || sin_host.len() != expected {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "rope_with_host_freqs_into: cos/sin host slices must be {expected} elements (got cos={}, sin={})",
+                cos_host.len(),
+                sin_host.len()
+            )));
+        }
+        // Default impl: transient upload. CUDA override uses persistent scratch.
+        let cos = self.copy_from_host_f32(cos_host, &[seq_len, half])?;
+        let sin = self.copy_from_host_f32(sin_host, &[seq_len, half])?;
+        self.rope_into(out, x, &cos, &sin)
+    }
+
+    /// In-place RoPE. `out` shape + dtype must match `x` (which is rank-4
+    /// `[batch, seq_len, num_heads, head_dim]`). cos/sin are F32 freq tables
+    /// of length `[seq_len, head_dim/2]`. See [`Self::matmul_into`] for
+    /// capture-stability semantics.
+    fn rope_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        freqs_cos: &Self::Tensor,
+        freqs_sin: &Self::Tensor,
+    ) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "rope_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        *out = self.rope(x, freqs_cos, freqs_sin)?;
+        Ok(())
+    }
     fn softmax(&self, x: &Self::Tensor, dim: i32) -> Result<Self::Tensor>;
     fn embedding(&self, weight: &Self::Tensor, indices: &[u32]) -> Result<Self::Tensor>;
     fn reshape(&self, x: &Self::Tensor, shape: &[usize]) -> Result<Self::Tensor>;
+
+    /// In-place reshape — copy `x`'s contents into `out` (whose shape acts
+    /// as the target shape; numel must match). On CUDA backends today this
+    /// is a `memcpy_dtod` into `out`'s existing device buffer, so the
+    /// output pointer stays stable across calls (capture-safe).
+    ///
+    /// **Why not zero-copy?** CudaTensor wraps an owned CudaSlice, and
+    /// cudarc 0.17.8's `CudaSlice::clone` is a device-to-device copy, not
+    /// an Arc-share — see `rope_with_host_freqs_into` in CudaBackend for
+    /// the same finding. Properly view-based reshape would need
+    /// CudaTensor to hold either an `Arc<CudaSlice>` or a `CudaView`
+    /// variant, both larger refactors. The memcpy is a per-call cost but
+    /// dominated by surrounding matmul/norm work; profile shows it's
+    /// noise. The capture-stability benefit dominates.
+    fn reshape_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        shape: &[usize],
+    ) -> Result<()> {
+        let want_numel: usize = shape.iter().product();
+        if want_numel != x.shape().iter().product::<usize>() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: x.shape().to_vec(),
+            });
+        }
+        if out.shape() != shape {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "reshape_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        *out = self.reshape(x, shape)?;
+        Ok(())
+    }
     fn transpose(&self, x: &Self::Tensor, dim0: usize, dim1: usize) -> Result<Self::Tensor>;
     fn cat(&self, tensors: &[&Self::Tensor], dim: usize) -> Result<Self::Tensor>;
 
     /// Cast a tensor to a different dtype. Returns the input unchanged if already the target dtype.
     fn cast(&self, x: &Self::Tensor, dtype: DType) -> Result<Self::Tensor>;
+
+    // ── Paged KV pool primitives ────────────────────────────────
+    // Used by PagedKvCache. CUDA backend overrides with device-to-device memcpy
+    // so the pool's device address stays stable across writes (prereq for
+    // CUDA Graph capture — see docs/plans/2026-05-22-cuda-graphs-plan.md).
+
+    /// Write rows from `src` into the paged pool at the given slot positions.
+    ///
+    /// `pool` shape: `[num_blocks, block_size, kv_dim]`
+    /// `src`  shape: `[num_tokens, kv_dim]`
+    /// `slot_mapping[t]` = `block_id_t * block_size + slot_in_block_t` (absolute slot index).
+    ///
+    /// The pool is updated in place. The default impl round-trips through the
+    /// host (correct, but allocates a fresh tensor — defeats the "stable address"
+    /// goal); GPU backends override with device-to-device memcpy.
+    fn paged_write_kv(
+        &self,
+        pool: &mut Self::Tensor,
+        src: &Self::Tensor,
+        slot_mapping: &[i32],
+    ) -> Result<()> {
+        // Reject non-F32 pools: the host-fallback path round-trips through
+        // f32 (no `copy_to_host_f16` / `copy_to_host_bf16` exists on Backend),
+        // so an F16/BF16 pool would be silently coerced to F32 and corrupt
+        // the model's activation dtype. Backends supporting non-F32 pools
+        // (CUDA) must override this method.
+        if pool.dtype() != crate::DType::F32 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_write_kv default impl only supports F32 pools (got {:?}); backend must override for non-F32 dtypes",
+                pool.dtype()
+            )));
+        }
+        let pool_shape = pool.shape().to_vec();
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let pool_capacity_slots = pool_shape[0] * block_size;
+        let mut pool_data = self.copy_to_host_f32(pool)?;
+        let src_data = self.copy_to_host_f32(src)?;
+        for (t, &slot) in slot_mapping.iter().enumerate() {
+            let slot_u = slot as usize;
+            if slot_u >= pool_capacity_slots {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "paged_write_kv: slot {slot_u} out of bounds (capacity {pool_capacity_slots})"
+                )));
+            }
+            let dst_off = slot_u * kv_dim;
+            let src_off = t * kv_dim;
+            pool_data[dst_off..dst_off + kv_dim]
+                .copy_from_slice(&src_data[src_off..src_off + kv_dim]);
+        }
+        *pool = self.copy_from_host_f32(&pool_data, &pool_shape)?;
+        Ok(())
+    }
+
+    /// Decode attention against a paged K/V pool.
+    ///
+    /// - `q`: `[batch, num_heads * head_dim]` — one query token per sequence (decode `q_len = 1`)
+    /// - `k_pool` / `v_pool`: `[num_blocks, block_size, num_kv_heads * head_dim]` (device-resident,
+    ///   stable address) — see [`Self::paged_write_kv`]
+    /// - `block_tables`: row-major `[batch * max_blocks_per_seq]` i32 slice, padding = `-1`.
+    ///   Host-side on purpose; the trait keeps i32 dtype out of the tensor type system. CUDA
+    ///   backends maintain an internal device scratch tensor that they upload to on each call
+    ///   (the upload is small — kilobytes — relative to per-step kernel work; the scratch's
+    ///   device address is stable for graph capture).
+    /// - `kv_lens`: `[batch]` host i32 slice — current KV length per sequence
+    ///
+    /// Returns: `[batch, num_heads * head_dim]`
+    ///
+    /// Default impl gathers each sequence's K/V via [`Self::paged_gather_kv`] then dispatches
+    /// to [`Self::batched_decode_attention`]. Correct but slow (one gather per sequence per
+    /// call); GPU backends override with a single fused paged-attention kernel (Task 2.2).
+    fn paged_attention(
+        &self,
+        q: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_tables: &[i32],
+        kv_lens: &[i32],
+        max_blocks_per_seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<Self::Tensor> {
+        let batch_size = kv_lens.len();
+        if block_tables.len() != batch_size * max_blocks_per_seq {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: block_tables.len()={} != batch_size={batch_size} * max_blocks_per_seq={max_blocks_per_seq}",
+                block_tables.len()
+            )));
+        }
+        let pool_shape = k_pool.shape();
+        if pool_shape.len() != 3 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: k_pool must be rank-3, got {pool_shape:?}"
+            )));
+        }
+        if v_pool.shape() != pool_shape {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: k_pool and v_pool shape mismatch ({pool_shape:?} vs {:?})",
+                v_pool.shape()
+            )));
+        }
+        let kv_dim_expected = num_kv_heads * head_dim;
+        if pool_shape[2] != kv_dim_expected {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: pool kv_dim {} != num_kv_heads {} * head_dim {} = {}",
+                pool_shape[2], num_kv_heads, head_dim, kv_dim_expected
+            )));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: num_heads {num_heads} not divisible by num_kv_heads {num_kv_heads}"
+            )));
+        }
+
+        let num_blocks = pool_shape[0];
+        let block_size = pool_shape[1];
+
+        let mut k_caches = Vec::with_capacity(batch_size);
+        let mut v_caches = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let kv_len = kv_lens[b];
+            if kv_len < 0 {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "paged_attention: kv_lens[{b}] = {kv_len} < 0"
+                )));
+            }
+            let kv_len = kv_len as usize;
+            // Per-seq: must have enough block-table entries to cover kv_len.
+            let blocks_needed = kv_len.div_ceil(block_size);
+            if blocks_needed > max_blocks_per_seq {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "paged_attention: seq[{b}] kv_len={kv_len} needs {blocks_needed} blocks but max_blocks_per_seq={max_blocks_per_seq}"
+                )));
+            }
+            let row_start = b * max_blocks_per_seq;
+            let row = &block_tables[row_start..row_start + max_blocks_per_seq];
+            // Per-seq: the first blocks_needed entries must be valid (no -1, in pool range).
+            for (j, &id) in row.iter().take(blocks_needed).enumerate() {
+                if id < 0 || (id as usize) >= num_blocks {
+                    return Err(crate::ForgeError::InvalidArgument(format!(
+                        "paged_attention: seq[{b}] block_tables[{j}]={id} invalid (num_blocks={num_blocks})"
+                    )));
+                }
+            }
+            let block_ids: Vec<usize> =
+                row.iter().take(blocks_needed).map(|&id| id as usize).collect();
+            k_caches.push(self.paged_gather_kv(k_pool, &block_ids, kv_len)?);
+            v_caches.push(self.paged_gather_kv(v_pool, &block_ids, kv_len)?);
+        }
+
+        self.batched_decode_attention(
+            q,
+            &k_caches,
+            &v_caches,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+    }
+
+    /// Decode attention against a paged K/V pool, writing into a caller-
+    /// provided output buffer.
+    ///
+    /// Same algorithm as [`Self::paged_attention`] but `out` is supplied by
+    /// the caller — required for CUDA Graph capture (the captured kernel
+    /// arg's device pointer must be stable across replays).
+    ///
+    /// `out` shape: `[batch, num_heads * head_dim]`; dtype matches `q`.
+    ///
+    /// Default impl: calls `paged_attention` to allocate the result, then
+    /// copies via `reshape_into` into `out` (non-zero-cost on CUDA today;
+    /// future iteration can override with an in-place kernel that skips
+    /// the intermediate alloc). The CUDA backend overrides directly.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_attention_into(
+        &self,
+        out: &mut Self::Tensor,
+        q: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_tables: &[i32],
+        kv_lens: &[i32],
+        max_blocks_per_seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let batch = kv_lens.len();
+        let expected = vec![batch, num_heads * head_dim];
+        if out.shape() != expected.as_slice() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != q.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention_into: out dtype {:?} != q dtype {:?}",
+                out.dtype(),
+                q.dtype()
+            )));
+        }
+        let result = self.paged_attention(
+            q,
+            k_pool,
+            v_pool,
+            block_tables,
+            kv_lens,
+            max_blocks_per_seq,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )?;
+        let expected_again = vec![batch, num_heads * head_dim];
+        self.reshape_into(out, &result, &expected_again)
+    }
+
+    /// Gather `total_tokens` tokens from the given block IDs into a contiguous tensor.
+    ///
+    /// `pool` shape: `[num_blocks, block_size, kv_dim]`
+    /// Returns shape: `[total_tokens, kv_dim]`
+    ///
+    /// Tokens are read in order from `block_ids[0]` (up to `block_size` tokens), then
+    /// `block_ids[1]`, etc., stopping when `total_tokens` have been collected.
+    fn paged_gather_kv(
+        &self,
+        pool: &Self::Tensor,
+        block_ids: &[usize],
+        total_tokens: usize,
+    ) -> Result<Self::Tensor> {
+        // Same restriction as `paged_write_kv`: default impl is F32-only.
+        // Non-F32 backends must override or the returned tensor's dtype
+        // will silently disagree with the pool's.
+        if pool.dtype() != crate::DType::F32 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_gather_kv default impl only supports F32 pools (got {:?}); backend must override for non-F32 dtypes",
+                pool.dtype()
+            )));
+        }
+        let pool_shape = pool.shape();
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let pool_data = self.copy_to_host_f32(pool)?;
+        let mut out = Vec::with_capacity(total_tokens * kv_dim);
+        let mut remaining = total_tokens;
+        for &block_id in block_ids {
+            if remaining == 0 {
+                break;
+            }
+            let fill = remaining.min(block_size);
+            let block_off = block_id * block_size * kv_dim;
+            let bytes = fill * kv_dim;
+            out.extend_from_slice(&pool_data[block_off..block_off + bytes]);
+            remaining -= fill;
+        }
+        self.copy_from_host_f32(&out, &[total_tokens, kv_dim])
+    }
 
     // ── Attention helpers ───────────────────────────────────────
     // Default impls go through host; CudaBackend overrides with GPU kernels.

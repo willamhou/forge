@@ -1,6 +1,9 @@
-use forge_core::{Backend, ForgeError, KvCache, Model, ModelConfig, ModelInput, ModelOutput, Result};
+use forge_core::{
+    Backend, ForgeError, KvCache, Model, ModelConfig, ModelInput, ModelOutput, Result, Tensor,
+};
 
 use crate::layers::{LlamaDecoderLayer, RMSNorm};
+use crate::persistent_buffers::LlamaPersistentBuffers;
 use crate::rope::RopeFreqs;
 
 pub struct LlamaModel<B: Backend> {
@@ -104,6 +107,122 @@ impl<B: Backend + Clone> LlamaModel<B> {
         let logits = self.backend.matmul(&hidden, &self.lm_head)?;
 
         Ok(ModelOutput { logits })
+    }
+
+    /// Persistent-buffer batched-decode forward.
+    ///
+    /// All intermediates and the final logits land in `buffers`. The caller
+    /// constructs `buffers` once per batch shape (see [`LlamaPersistentBuffers::new`])
+    /// and reuses it across calls. After this returns, `buffers.logits`
+    /// holds `[batch, vocab_size]` and is the model's output.
+    ///
+    /// **Requirements**:
+    /// - All sequences in `input` must be decode (1 token each), not prefill.
+    /// - `input` must contain exactly `buffers.batch_size` sequences.
+    /// - `kv_cache` must be a paged cache (PagedKvCache); naive caches are
+    ///   rejected by `LlamaAttention::forward_batch_into` upfront.
+    ///
+    /// Returns `Ok(())` on success; callers read `buffers.logits` to consume.
+    ///
+    /// ## ⚠️ CUDA-Graph capture not yet safe
+    ///
+    /// `forward_into` is structurally compatible with capture (every
+    /// kernel arg's device pointer is stable), but two host-side gaps
+    /// remain that would cause silent corruption on replay:
+    ///
+    /// 1. `PagedKvCache::append` builds a fresh `Vec<i32>` slot_mapping
+    ///    per call and passes a borrowed slice to `paged_write_kv`. The
+    ///    captured `memcpy_htod` node bakes the Vec's host pointer; on
+    ///    replay that pointer is stale (Vec dropped).
+    /// 2. `forward_into` itself builds fresh `all_tokens` / `all_positions`
+    ///    / `seq_ids` Vecs (and `RopeFreqs::apply_with_positions_into`
+    ///    builds fresh `cos_data`/`sin_data`). Same captured-memcpy_htod
+    ///    issue.
+    ///
+    /// Until the engine wires persistent host buffers for all of these,
+    /// **do NOT wrap `forward_into` in `CudaGraphCache::run_or_capture`
+    /// directly** — replays produce wrong KV / wrong token / wrong RoPE
+    /// state. Use the alloc-variant `forward()` for eager runs in the
+    /// meantime; `forward_into` is currently a foundation for the
+    /// upcoming engine integration, not a drop-in user-facing API.
+    pub fn forward_into(
+        &self,
+        input: &ModelInput,
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        buffers: &mut LlamaPersistentBuffers<B>,
+    ) -> Result<()> {
+        let n = input.seq_metadata.len();
+        if n != buffers.batch_size {
+            return Err(ForgeError::InvalidArgument(format!(
+                "forward_into: input has {n} seqs but buffers.batch_size = {}",
+                buffers.batch_size
+            )));
+        }
+        // Decode-only validation (mirrors forward()).
+        for (i, meta) in input.seq_metadata.iter().enumerate() {
+            if meta.is_prefill {
+                return Err(ForgeError::InvalidArgument(
+                    "forward_into does not support prefill sequences".into(),
+                ));
+            }
+            if input.token_ids[i].len() != 1 {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "forward_into expects 1 token per sequence, seq {} has {}",
+                    meta.seq_id,
+                    input.token_ids[i].len()
+                )));
+            }
+        }
+
+        let all_tokens: Vec<u32> = input.token_ids.iter().flatten().copied().collect();
+        let all_positions: Vec<u32> = input.positions.iter().flatten().copied().collect();
+        let seq_ids: Vec<u64> = input.seq_metadata.iter().map(|m| m.seq_id).collect();
+
+        // Embedding lookup → buffers.embeddings → seeds buffers.hidden.
+        self.backend.embedding_into(
+            &mut buffers.embeddings,
+            &self.embed_tokens,
+            &all_tokens,
+        )?;
+        // hidden := embeddings (memcpy via reshape_into with same shape).
+        self.backend.reshape_into(
+            &mut buffers.hidden,
+            &buffers.embeddings,
+            buffers.embeddings.shape().to_vec().as_slice(),
+        )?;
+
+        // Per-layer decoder pass — each layer reads + writes buffers.hidden.
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_batch_into(
+                &self.rope_freqs,
+                &all_positions,
+                &seq_ids,
+                kv_cache,
+                i,
+                buffers,
+                &self.backend,
+            )?;
+        }
+
+        // Final norm + lm_head:
+        //   hidden → rms_norm → final_normed (activation dtype)
+        //   → cast → final_normed_cast (lm_head dtype)
+        //   → matmul(lm_head) → logits (lm_head dtype)
+        // The cast is a no-op memcpy when dtypes match.
+        self.backend.rms_norm_into(
+            &mut buffers.final_normed,
+            &buffers.hidden,
+            &self.norm.weight,
+            self.norm.eps,
+        )?;
+        self.backend
+            .cast_into(&mut buffers.final_normed_cast, &buffers.final_normed)?;
+        self.backend.matmul_into(
+            &mut buffers.logits,
+            &buffers.final_normed_cast,
+            &self.lm_head,
+        )?;
+        Ok(())
     }
 }
 

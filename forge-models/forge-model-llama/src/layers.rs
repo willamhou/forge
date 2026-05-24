@@ -1,5 +1,6 @@
-use forge_core::{Backend, KvCache, ModelConfig, Result, Tensor};
+use forge_core::{Backend, ForgeError, KvCache, ModelConfig, Result, Tensor};
 
+use crate::persistent_buffers::LlamaPersistentBuffers;
 use crate::rope::RopeFreqs;
 
 /// RMS normalization layer.
@@ -15,6 +16,16 @@ impl<B: Backend> RMSNorm<B> {
 
     pub fn forward(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
         backend.rms_norm(x, &self.weight, self.eps)
+    }
+
+    /// Persistent-buffer variant — writes into a caller-provided `out`.
+    pub fn forward_into(
+        &self,
+        out: &mut B::Tensor,
+        x: &B::Tensor,
+        backend: &B,
+    ) -> Result<()> {
+        backend.rms_norm_into(out, x, &self.weight, self.eps)
     }
 }
 
@@ -44,6 +55,26 @@ impl<B: Backend> LlamaMLP<B> {
         // output = (silu(gate) * up) @ down_proj — fused into one kernel
         let fused = backend.fused_silu_mul(&gate, &up)?;
         backend.matmul(&fused, &self.down_proj)
+    }
+
+    /// Persistent-buffer variant.
+    ///
+    /// **Buffer convention**: reads input from `buffers.normed` (caller
+    /// must have populated it), writes the final MLP output to
+    /// `buffers.mlp_out`. Stages through `buffers.{gate, up, silu_mul}`.
+    /// Reading via the buffers struct (vs an `x: &B::Tensor` parameter)
+    /// lets us use disjoint &mut/& borrows on buffer fields and avoids
+    /// the borrow-checker conflict that an explicit `x` would create.
+    pub fn forward_into(
+        &self,
+        buffers: &mut LlamaPersistentBuffers<B>,
+        backend: &B,
+    ) -> Result<()> {
+        backend.matmul_into(&mut buffers.gate, &buffers.normed, &self.gate_proj)?;
+        backend.matmul_into(&mut buffers.up, &buffers.normed, &self.up_proj)?;
+        backend.fused_silu_mul_into(&mut buffers.silu_mul, &buffers.gate, &buffers.up)?;
+        backend.matmul_into(&mut buffers.mlp_out, &buffers.silu_mul, &self.down_proj)?;
+        Ok(())
     }
 }
 
@@ -186,7 +217,36 @@ impl<B: Backend> LlamaAttention<B> {
             kv_cache.append(seq_ids[i], layer_idx, &k_row, &v_row)?;
         }
 
-        // Retrieve full KV caches for all sequences
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+        // Paged attention fast path (PagedKvCache only). Single fused kernel
+        // launch reading K/V from the device-resident pool through block tables
+        // — no per-seq gather + multi_head_attention dance, capture-friendly.
+        //
+        // TODO(task-3 capture): this calls the allocating variant, which
+        // produces a fresh output CudaTensor every step. For CUDA Graph
+        // capture, the engine must thread a persistent output buffer through
+        // here and call `CudaBackend::paged_attention_into` instead so the
+        // captured kernel's output arg points at a stable device address.
+        if let Some(inputs) = kv_cache.paged_attention_inputs(layer_idx, seq_ids)? {
+            let attn_out = backend.paged_attention(
+                &q,
+                inputs.k_pool,
+                inputs.v_pool,
+                &inputs.block_tables,
+                &inputs.kv_lens,
+                inputs.max_blocks_per_seq,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                scale,
+            )?;
+            let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
+            return backend.matmul(&attn_out, &self.wo);
+        }
+
+        // Fallback for non-paged caches (e.g. NaiveKvCache): retrieve full KV
+        // per seq and dispatch to batched_decode_attention.
         let mut k_caches = Vec::with_capacity(n);
         let mut v_caches = Vec::with_capacity(n);
         for i in 0..n {
@@ -195,7 +255,6 @@ impl<B: Backend> LlamaAttention<B> {
             v_caches.push(v_full);
         }
 
-        // Batched decode attention -- single kernel for all sequences
         let attn_out = backend.batched_decode_attention(
             &q,
             &k_caches,
@@ -203,12 +262,128 @@ impl<B: Backend> LlamaAttention<B> {
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            1.0 / (self.head_dim as f32).sqrt(),
+            scale,
         )?;
 
         // Cast + output projection
         let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
         backend.matmul(&attn_out, &self.wo)
+    }
+
+    /// Persistent-buffer batched-decode forward.
+    ///
+    /// Same algorithm as [`Self::forward_batch`] but every intermediate
+    /// is written into a pre-allocated buffer in `buffers`. Requires a
+    /// `PagedKvCache` — non-paged caches (NaiveKvCache) are rejected
+    /// upfront because their fallback path (per-seq gather +
+    /// `batched_decode_attention`) is not capture-safe.
+    ///
+    /// **Buffer convention**: reads input from `buffers.normed` (caller
+    /// must have populated it via `input_layernorm.forward_into`), writes
+    /// the layer's attention output to `buffers.attn_proj`.
+    pub fn forward_batch_into(
+        &self,
+        rope_freqs: &RopeFreqs<B>,
+        positions: &[u32],
+        seq_ids: &[u64],
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        layer_idx: usize,
+        buffers: &mut LlamaPersistentBuffers<B>,
+        backend: &B,
+    ) -> Result<()> {
+        let n = buffers.batch_size;
+
+        // QKV projection + split. Reads from buffers.normed (caller convention).
+        backend.matmul_into(&mut buffers.qkv, &buffers.normed, &self.wqkv)?;
+        backend.split_qkv_into(
+            &mut buffers.q_2d,
+            &mut buffers.k_2d,
+            &mut buffers.v_2d,
+            &buffers.qkv,
+            self.q_proj_size,
+            self.kv_proj_size,
+        )?;
+
+        // Reshape Q/K to 4D for RoPE (capture-safe via reshape_into memcpy).
+        backend.reshape_into(
+            &mut buffers.q_4d,
+            &buffers.q_2d,
+            &[1, n, self.num_heads, self.head_dim],
+        )?;
+        backend.reshape_into(
+            &mut buffers.k_4d,
+            &buffers.k_2d,
+            &[1, n, self.num_kv_heads, self.head_dim],
+        )?;
+
+        // Apply RoPE with per-token positions.
+        rope_freqs.apply_with_positions_into(
+            &mut buffers.q_rotated_4d,
+            &buffers.q_4d,
+            positions,
+            backend,
+        )?;
+        rope_freqs.apply_with_positions_into(
+            &mut buffers.k_rotated_4d,
+            &buffers.k_4d,
+            positions,
+            backend,
+        )?;
+
+        // Flatten back to 2D for attention + cache append.
+        backend.reshape_into(
+            &mut buffers.q_rotated_2d,
+            &buffers.q_rotated_4d,
+            &[n, self.num_heads * self.head_dim],
+        )?;
+        backend.reshape_into(
+            &mut buffers.k_rotated_2d,
+            &buffers.k_rotated_4d,
+            &[n, self.num_kv_heads * self.head_dim],
+        )?;
+
+        // Per-token KV cache append via persistent k_row/v_row buffers.
+        for i in 0..n {
+            backend.slice_rows_into(&mut buffers.k_rows[i], &buffers.k_rotated_2d, i, 1)?;
+            backend.slice_rows_into(&mut buffers.v_rows[i], &buffers.v_2d, i, 1)?;
+            kv_cache.append(seq_ids[i], layer_idx, &buffers.k_rows[i], &buffers.v_rows[i])?;
+        }
+
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+        // Paged attention — required for the persistent-buffer path. We
+        // route through `paged_attention_into` (Task 5c.5 promoted from
+        // CudaBackend inherent to Backend trait) so the captured kernel's
+        // output arg points at `buffers.attn_out`'s stable device address.
+        let inputs = kv_cache
+            .paged_attention_inputs(layer_idx, seq_ids)?
+            .ok_or_else(|| {
+                ForgeError::InvalidArgument(
+                    "forward_batch_into requires a paged KV cache (PagedKvCache); \
+                     naive caches have no capture-safe attention path"
+                        .into(),
+                )
+            })?;
+        backend.paged_attention_into(
+            &mut buffers.attn_out,
+            &buffers.q_rotated_2d,
+            inputs.k_pool,
+            inputs.v_pool,
+            &inputs.block_tables,
+            &inputs.kv_lens,
+            inputs.max_blocks_per_seq,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            scale,
+        )?;
+
+        // Cast attn_out to wo's weight dtype (no-op memcpy if dtypes match).
+        backend.cast_into(&mut buffers.attn_out_cast, &buffers.attn_out)?;
+
+        // Output projection.
+        backend.matmul_into(&mut buffers.attn_proj, &buffers.attn_out_cast, &self.wo)?;
+        Ok(())
     }
 
 }
@@ -267,6 +442,68 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         )?;
         let mlp_out = self.mlp.forward(&normed, backend)?;
         backend.add(&x, &mlp_out)
+    }
+
+    /// Persistent-buffer batched forward (decode).
+    ///
+    /// Reads `buffers.hidden` (residual stream from prior layer), runs
+    /// pre-attn norm + attention + post-attn fused-norm + MLP + residual
+    /// add. Writes the updated residual stream back into `buffers.hidden`
+    /// so the next layer's iteration reads it.
+    pub fn forward_batch_into(
+        &self,
+        rope_freqs: &RopeFreqs<B>,
+        positions: &[u32],
+        seq_ids: &[u64],
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+        layer_idx: usize,
+        buffers: &mut LlamaPersistentBuffers<B>,
+        backend: &B,
+    ) -> Result<()> {
+        // Pre-attention norm: buffers.normed = rms_norm(buffers.hidden).
+        // Split-borrow on disjoint fields (&mut .normed, & .hidden).
+        backend.rms_norm_into(
+            &mut buffers.normed,
+            &buffers.hidden,
+            &self.input_layernorm.weight,
+            self.input_layernorm.eps,
+        )?;
+
+        // Attention reads buffers.normed (by convention), writes buffers.attn_proj.
+        self.self_attn.forward_batch_into(
+            rope_freqs,
+            positions,
+            seq_ids,
+            kv_cache,
+            layer_idx,
+            buffers,
+            backend,
+        )?;
+
+        // Fused residual + post-attn norm:
+        //   buffers.normed = rms_norm(buffers.attn_proj + buffers.hidden)
+        //   buffers.residual_after_attn = buffers.attn_proj + buffers.hidden
+        backend.fused_residual_rms_norm_into(
+            &mut buffers.normed,
+            &mut buffers.residual_after_attn,
+            &buffers.attn_proj,
+            &buffers.hidden,
+            &self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )?;
+
+        // MLP reads buffers.normed (post-attn norm), writes buffers.mlp_out.
+        self.mlp.forward_into(buffers, backend)?;
+
+        // Final residual add: buffers.hidden = buffers.residual_after_attn + buffers.mlp_out.
+        // Overwriting buffers.hidden in place is safe — residual_after_attn
+        // and mlp_out are distinct buffer fields, so no aliasing.
+        backend.add_into(
+            &mut buffers.hidden,
+            &buffers.residual_after_attn,
+            &buffers.mlp_out,
+        )?;
+        Ok(())
     }
 
     /// Batched forward for decode: N sequences, 1 token each.

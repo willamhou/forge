@@ -1,6 +1,23 @@
 use crate::tensor::Tensor;
 use crate::Result;
 
+/// Inputs for a fused paged-attention kernel call, produced by paged caches
+/// and consumed by the model's decode path. Naive (non-paged) caches return
+/// `None` from `KvCache::paged_attention_inputs` — the caller falls back to
+/// the `get_kv` + `multi_head_attention` path.
+pub struct PagedAttentionInputs<'a, T: Tensor> {
+    /// Per-layer K pool tensor (device-resident). Shape: `[num_blocks, block_size, num_kv_heads * head_dim]`.
+    pub k_pool: &'a T,
+    /// Per-layer V pool, same shape as `k_pool`.
+    pub v_pool: &'a T,
+    /// Row-major `[batch * max_blocks_per_seq]` i32; `-1` is padding.
+    pub block_tables: Vec<i32>,
+    /// Per-sequence KV length, `[batch]`.
+    pub kv_lens: Vec<i32>,
+    /// Stride of `block_tables` (the table's second dimension).
+    pub max_blocks_per_seq: usize,
+}
+
 pub struct CacheUsage {
     pub total_blocks: usize,
     pub used_blocks: usize,
@@ -50,4 +67,24 @@ pub trait KvCache: Send + Sync {
 
     /// Check if we can allocate for a given length.
     fn can_allocate(&self, num_tokens: usize) -> bool;
+
+    /// Assemble inputs for the fused paged-attention kernel.
+    ///
+    /// - `Ok(None)`: this cache doesn't support paged attention — the caller
+    ///   falls back to the `get_kv` + `multi_head_attention` path.
+    /// - `Ok(Some(inputs))`: paged inputs assembled; caller can dispatch the
+    ///   fused single-kernel paged_attention launch.
+    /// - `Err(_)`: paged inputs were requested but could not be assembled
+    ///   (e.g. unknown seq_id, layer out of bounds).
+    ///
+    /// `Result<Option<_>>` rather than `Option<Result<_>>` so the call site
+    /// can use `?` to propagate errors and then match on the `Option` for
+    /// the dispatch decision.
+    fn paged_attention_inputs<'a>(
+        &'a self,
+        _layer: usize,
+        _seq_ids: &[u64],
+    ) -> Result<Option<PagedAttentionInputs<'a, Self::T>>> {
+        Ok(None)
+    }
 }
