@@ -253,6 +253,100 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Decode attention against a paged K/V pool.
+    ///
+    /// - `q`: `[batch, num_heads * head_dim]` — one query token per sequence (decode `q_len = 1`)
+    /// - `k_pool` / `v_pool`: `[num_blocks, block_size, num_kv_heads * head_dim]` (device-resident,
+    ///   stable address) — see [`Self::paged_write_kv`]
+    /// - `block_tables`: row-major `[batch * max_blocks_per_seq]` i32 slice, padding = `-1`.
+    ///   Host-side on purpose; the trait keeps i32 dtype out of the tensor type system. CUDA
+    ///   backends maintain an internal device scratch tensor that they upload to on each call
+    ///   (the upload is small — kilobytes — relative to per-step kernel work; the scratch's
+    ///   device address is stable for graph capture).
+    /// - `kv_lens`: `[batch]` host i32 slice — current KV length per sequence
+    ///
+    /// Returns: `[batch, num_heads * head_dim]`
+    ///
+    /// Default impl gathers each sequence's K/V via [`Self::paged_gather_kv`] then dispatches
+    /// to [`Self::batched_decode_attention`]. Correct but slow (one gather per sequence per
+    /// call); GPU backends override with a single fused paged-attention kernel (Task 2.2).
+    fn paged_attention(
+        &self,
+        q: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_tables: &[i32],
+        kv_lens: &[i32],
+        max_blocks_per_seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<Self::Tensor> {
+        let batch_size = kv_lens.len();
+        if block_tables.len() != batch_size * max_blocks_per_seq {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: block_tables.len()={} != batch_size={batch_size} * max_blocks_per_seq={max_blocks_per_seq}",
+                block_tables.len()
+            )));
+        }
+        let pool_shape = k_pool.shape();
+        if pool_shape.len() != 3 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: k_pool must be rank-3, got {pool_shape:?}"
+            )));
+        }
+        if v_pool.shape() != pool_shape {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: k_pool and v_pool shape mismatch ({pool_shape:?} vs {:?})",
+                v_pool.shape()
+            )));
+        }
+        let kv_dim_expected = num_kv_heads * head_dim;
+        if pool_shape[2] != kv_dim_expected {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: pool kv_dim {} != num_kv_heads {} * head_dim {} = {}",
+                pool_shape[2], num_kv_heads, head_dim, kv_dim_expected
+            )));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_attention: num_heads {num_heads} not divisible by num_kv_heads {num_kv_heads}"
+            )));
+        }
+
+        let mut k_caches = Vec::with_capacity(batch_size);
+        let mut v_caches = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let kv_len = kv_lens[b];
+            if kv_len < 0 {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "paged_attention: kv_lens[{b}] = {kv_len} < 0"
+                )));
+            }
+            let kv_len = kv_len as usize;
+            let row_start = b * max_blocks_per_seq;
+            let row = &block_tables[row_start..row_start + max_blocks_per_seq];
+            let block_ids: Vec<usize> = row
+                .iter()
+                .take_while(|&&id| id >= 0)
+                .map(|&id| id as usize)
+                .collect();
+            k_caches.push(self.paged_gather_kv(k_pool, &block_ids, kv_len)?);
+            v_caches.push(self.paged_gather_kv(v_pool, &block_ids, kv_len)?);
+        }
+
+        self.batched_decode_attention(
+            q,
+            &k_caches,
+            &v_caches,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+    }
+
     /// Gather `total_tokens` tokens from the given block IDs into a contiguous tensor.
     ///
     /// `pool` shape: `[num_blocks, block_size, kv_dim]`

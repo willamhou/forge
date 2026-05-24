@@ -9,3 +9,6 @@ forge-core.workspace = true
 half.workspace = true
 cblas = "0.4"
 openblas-src = { version = "0.10", features = ["cblas", "static"] }
+
+[dev-dependencies]
+forge-kvcache.workspace = true

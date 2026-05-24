@@ -21,7 +21,6 @@ use forge_core::{Backend, CacheUsage, DType, ForgeError, KvCache, Result, Tensor
 struct BlockPool<B: Backend> {
     /// `layers[layer] = (k_pool, v_pool)`; each pool shape `[num_blocks, block_size, kv_dim]`.
     layers: Vec<(B::Tensor, B::Tensor)>,
-    block_size: usize,
     kv_dim: usize,
 }
 
@@ -40,11 +39,7 @@ impl<B: Backend> BlockPool<B> {
             let v = backend.allocate_zeros(&shape, DType::F32)?;
             layers.push((k, v));
         }
-        Ok(Self {
-            layers,
-            block_size,
-            kv_dim,
-        })
+        Ok(Self { layers, kv_dim })
     }
 
     /// Write K/V rows for a layer at the given slot positions.
