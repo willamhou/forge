@@ -1313,10 +1313,24 @@ impl Backend for CudaBackend {
         freqs_cos: &CudaTensor,
         freqs_sin: &CudaTensor,
     ) -> Result<CudaTensor> {
+        let mut out = self.allocate_zeros(&x.shape, x.dtype())?;
+        self.rope_into(&mut out, x, freqs_cos, freqs_sin)?;
+        Ok(out)
+    }
+
+    /// In-place RoPE kernel. See `matmul_into` for the capture-stability
+    /// contract.
+    fn rope_into(
+        &self,
+        out: &mut CudaTensor,
+        x: &CudaTensor,
+        freqs_cos: &CudaTensor,
+        freqs_sin: &CudaTensor,
+    ) -> Result<()> {
         let shape = x.shape();
         if shape.len() != 4 {
             return Err(ForgeError::InvalidArgument(
-                "rope expects 4D tensor [batch, seq_len, heads, head_dim]".into(),
+                "rope_into expects 4D tensor [batch, seq_len, heads, head_dim]".into(),
             ));
         }
         let batch = shape[0] as u32;
@@ -1325,34 +1339,45 @@ impl Backend for CudaBackend {
         let head_dim = shape[3] as u32;
         if head_dim % 2 != 0 {
             return Err(ForgeError::InvalidArgument(
-                "rope requires even head_dim".into(),
+                "rope_into requires even head_dim".into(),
             ));
         }
         let half_dim = head_dim / 2;
         let expected_freq_len = (seq_len * half_dim) as usize;
         if freqs_cos.len() < expected_freq_len || freqs_sin.len() < expected_freq_len {
             return Err(ForgeError::InvalidArgument(format!(
-                "freq tensors need at least {} elements, got cos={} sin={}",
+                "rope_into: freq tensors need at least {} elements, got cos={} sin={}",
                 expected_freq_len,
                 freqs_cos.len(),
                 freqs_sin.len()
+            )));
+        }
+        if out.shape() != shape {
+            return Err(ForgeError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "rope_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
             )));
         }
         let total = batch * seq_len * num_heads * half_dim;
 
         match x.dtype() {
             DType::F16 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<half::f16>(x.len())
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
-                // RoPE F16 kernel reads input as __half, freqs as float (f32)
+                let x_s = x.f16_slice()?;
+                let c_s = freqs_cos.f32_slice()?;
+                let s_s = freqs_sin.f32_slice()?;
+                let o = out.f16_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.rope_f16);
-                builder.arg(&mut out);
-                builder.arg(x.f16_slice()?);
-                builder.arg(freqs_cos.f32_slice()?);
-                builder.arg(freqs_sin.f32_slice()?);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(c_s);
+                builder.arg(s_s);
                 builder.arg(&batch);
                 builder.arg(&seq_len);
                 builder.arg(&num_heads);
@@ -1362,20 +1387,18 @@ impl Backend for CudaBackend {
                         .launch(LaunchConfig::for_num_elems(total))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f16_data(out, shape.to_vec()))
+                Ok(())
             }
             DType::F32 => {
-                let mut out = self
-                    .stream
-                    .alloc_zeros::<f32>(x.len())
-                    .map_err(|e| ForgeError::Cuda(e.to_string()))?;
-
+                let x_s = x.f32_slice()?;
+                let c_s = freqs_cos.f32_slice()?;
+                let s_s = freqs_sin.f32_slice()?;
+                let o = out.f32_slice_mut()?;
                 let mut builder = self.stream.launch_builder(&self.kernels.rope_f32);
-                builder.arg(&mut out);
-                builder.arg(x.f32_slice()?);
-                builder.arg(freqs_cos.f32_slice()?);
-                builder.arg(freqs_sin.f32_slice()?);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(c_s);
+                builder.arg(s_s);
                 builder.arg(&batch);
                 builder.arg(&seq_len);
                 builder.arg(&num_heads);
@@ -1385,8 +1408,7 @@ impl Backend for CudaBackend {
                         .launch(LaunchConfig::for_num_elems(total))
                         .map_err(|e| ForgeError::Cuda(e.to_string()))?;
                 }
-
-                Ok(CudaTensor::f32_data(out, shape.to_vec()))
+                Ok(())
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }

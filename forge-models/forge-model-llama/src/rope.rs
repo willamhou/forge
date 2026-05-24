@@ -105,6 +105,28 @@ impl<B: Backend> RopeFreqs<B> {
         positions: &[u32],
         backend: &B,
     ) -> Result<B::Tensor> {
+        let mut out = backend.allocate_zeros(x.shape(), x.dtype())?;
+        self.apply_with_positions_into(&mut out, x, positions, backend)?;
+        Ok(out)
+    }
+
+    /// In-place per-token RoPE — writes the rotated tensor into a
+    /// caller-provided `out` buffer instead of allocating.
+    ///
+    /// Used by the CUDA-Graph capture path so the captured kernel arg
+    /// pointers stay stable across replays.
+    ///
+    /// Note: the cos/sin freq tensors uploaded each call are still
+    /// transient (allocated fresh from the cached host tables). Wiring
+    /// them through persistent device scratches is Task 5c.3 (along with
+    /// embedding's indices scratch).
+    pub fn apply_with_positions_into(
+        &self,
+        out: &mut B::Tensor,
+        x: &B::Tensor,
+        positions: &[u32],
+        backend: &B,
+    ) -> Result<()> {
         let seq_len = x.shape()[1];
         if positions.len() != seq_len {
             return Err(ForgeError::InvalidArgument(format!(
@@ -137,6 +159,72 @@ impl<B: Backend> RopeFreqs<B> {
         let sin_tensor =
             backend.copy_from_host_f32(&sin_data, &[seq_len, self.half_dim])?;
 
-        backend.rope(x, &cos_tensor, &sin_tensor)
+        backend.rope_into(out, x, &cos_tensor, &sin_tensor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_backend_cpu::CpuBackend;
+    use forge_core::DType;
+
+    fn tiny_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 4,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            vocab_size: 4,
+            max_position_embeddings: 32,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F32,
+        }
+    }
+
+    #[test]
+    fn apply_with_positions_into_matches_alloc() {
+        let backend = CpuBackend::new();
+        let config = tiny_config();
+        let rope = RopeFreqs::precompute(&config, 32, &backend).unwrap();
+
+        // [1, 3, num_heads=2, head_dim=4] = 24 elements
+        let x_data: Vec<f32> = (0..24).map(|i| (i as f32) * 0.05).collect();
+        let x = backend
+            .copy_from_host_f32(&x_data, &[1, 3, 2, 4])
+            .unwrap();
+        let positions: Vec<u32> = vec![0, 1, 5];
+
+        let out_alloc = rope.apply_with_positions(&x, &positions, &backend).unwrap();
+        let alloc_host = backend.copy_to_host_f32(&out_alloc).unwrap();
+
+        let mut out_into = backend
+            .allocate_zeros(&[1, 3, 2, 4], DType::F32)
+            .unwrap();
+        rope.apply_with_positions_into(&mut out_into, &x, &positions, &backend)
+            .unwrap();
+        let into_host = backend.copy_to_host_f32(&out_into).unwrap();
+        assert_eq!(alloc_host, into_host);
+    }
+
+    #[test]
+    fn apply_with_positions_into_validates_length() {
+        let backend = CpuBackend::new();
+        let config = tiny_config();
+        let rope = RopeFreqs::precompute(&config, 32, &backend).unwrap();
+
+        let x = backend
+            .copy_from_host_f32(&vec![0.0; 24], &[1, 3, 2, 4])
+            .unwrap();
+        let mut out = backend
+            .allocate_zeros(&[1, 3, 2, 4], DType::F32)
+            .unwrap();
+        // positions length != seq_len → error
+        let _ = rope
+            .apply_with_positions_into(&mut out, &x, &[0, 1], &backend)
+            .expect_err("position length mismatch should error");
     }
 }

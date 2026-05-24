@@ -342,4 +342,45 @@ fn into_variants_match_alloc_variants() {
     let _ = backend
         .slice_rows_into(&mut row_bad, &row_src, 18, 5)
         .expect_err("slice_rows_into oob rejected");
+
+    // ── rope_into vs rope (F32) ──────────────────────────────────
+    let batch = 1;
+    let rseq = 3;
+    let heads = 2;
+    let dim = 4; // head_dim even
+    let half = dim / 2;
+    let rope_x: Vec<f32> = (0..batch * rseq * heads * dim)
+        .map(|i| (i as f32) * 0.07)
+        .collect();
+    let rope_cos: Vec<f32> = (0..rseq * half).map(|i| ((i as f32) * 0.3).cos()).collect();
+    let rope_sin: Vec<f32> = (0..rseq * half).map(|i| ((i as f32) * 0.3).sin()).collect();
+    let x_rope = backend
+        .copy_from_host_f32(&rope_x, &[batch, rseq, heads, dim])
+        .unwrap();
+    let cos_t = backend.copy_from_host_f32(&rope_cos, &[rseq, half]).unwrap();
+    let sin_t = backend.copy_from_host_f32(&rope_sin, &[rseq, half]).unwrap();
+
+    let rope_alloc = backend.rope(&x_rope, &cos_t, &sin_t).unwrap();
+    backend.synchronize().unwrap();
+    let rope_alloc_host = backend.copy_to_host_f32(&rope_alloc).unwrap();
+
+    let mut rope_into = backend
+        .allocate_zeros(&[batch, rseq, heads, dim], DType::F32)
+        .unwrap();
+    for _ in 0..3 {
+        backend.rope_into(&mut rope_into, &x_rope, &cos_t, &sin_t).unwrap();
+    }
+    backend.synchronize().unwrap();
+    assert_eq!(
+        backend.copy_to_host_f32(&rope_into).unwrap(),
+        rope_alloc_host
+    );
+
+    // Wrong out shape rejected
+    let mut rope_wrong = backend
+        .allocate_zeros(&[batch, rseq, heads, dim + 2], DType::F32)
+        .unwrap();
+    let _ = backend
+        .rope_into(&mut rope_wrong, &x_rope, &cos_t, &sin_t)
+        .expect_err("rope_into wrong out shape rejected");
 }

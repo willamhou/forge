@@ -523,6 +523,34 @@ pub trait Backend: Send + Sync + 'static {
         freqs_cos: &Self::Tensor,
         freqs_sin: &Self::Tensor,
     ) -> Result<Self::Tensor>;
+
+    /// In-place RoPE. `out` shape + dtype must match `x` (which is rank-4
+    /// `[batch, seq_len, num_heads, head_dim]`). cos/sin are F32 freq tables
+    /// of length `[seq_len, head_dim/2]`. See [`Self::matmul_into`] for
+    /// capture-stability semantics.
+    fn rope_into(
+        &self,
+        out: &mut Self::Tensor,
+        x: &Self::Tensor,
+        freqs_cos: &Self::Tensor,
+        freqs_sin: &Self::Tensor,
+    ) -> Result<()> {
+        if out.shape() != x.shape() {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: x.shape().to_vec(),
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != x.dtype() {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "rope_into: out dtype {:?} != x dtype {:?}",
+                out.dtype(),
+                x.dtype()
+            )));
+        }
+        *out = self.rope(x, freqs_cos, freqs_sin)?;
+        Ok(())
+    }
     fn softmax(&self, x: &Self::Tensor, dim: i32) -> Result<Self::Tensor>;
     fn embedding(&self, weight: &Self::Tensor, indices: &[u32]) -> Result<Self::Tensor>;
     fn reshape(&self, x: &Self::Tensor, shape: &[usize]) -> Result<Self::Tensor>;
