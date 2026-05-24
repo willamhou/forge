@@ -338,4 +338,114 @@ fn paged_attention_cuda_matches_default_impl() {
         v_bt_post2, v_bt_post,
         "no further grow on second identical call"
     );
+
+    // ── paged_attention_into: caller-provided output buffer ────────────
+    //
+    // Capture-mode pattern: pre-allocate one output, reuse across multiple
+    // calls. The same `&mut CudaTensor` is passed each time, so the kernel
+    // writes to the same underlying CudaSlice / device pointer — structurally
+    // guaranteed and what CUDA Graph capture relies on.
+    let mut out_persistent = backend
+        .allocate_zeros(&[batch_size, num_heads * head_dim], DType::F32)
+        .unwrap();
+
+    // First call into persistent buffer.
+    backend
+        .paged_attention_into(
+            &mut out_persistent,
+            &q,
+            &k_pool,
+            &v_pool,
+            &block_tables,
+            &kv_lens,
+            max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+    backend.synchronize().unwrap();
+    let into_first = backend.copy_to_host_f32(&out_persistent).unwrap();
+
+    // Equivalent to the alloc-variant output (within the kernel's nondeterminism
+    // floor — atomicAdd order can differ across launches; bound at 1e-4).
+    let diff_alloc_vs_into = into_first
+        .iter()
+        .zip(&out_cuda_host)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        diff_alloc_vs_into < 1e-4,
+        "paged_attention_into result diverges from paged_attention: max diff {diff_alloc_vs_into}"
+    );
+
+    // Reuse the SAME out_persistent across many calls — proves the API works
+    // with buffer reuse (the property CUDA Graph capture exploits).
+    for _ in 0..5 {
+        backend
+            .paged_attention_into(
+                &mut out_persistent,
+                &q,
+                &k_pool,
+                &v_pool,
+                &block_tables,
+                &kv_lens,
+                max_blocks,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+            )
+            .unwrap();
+    }
+    backend.synchronize().unwrap();
+    let into_last = backend.copy_to_host_f32(&out_persistent).unwrap();
+    // Deterministic for fixed inputs (atomicAdd order is launch-fixed at this
+    // shape — confirmed by the first-vs-Nth comparison): should match the
+    // first call exactly.
+    assert_eq!(
+        into_last, into_first,
+        "repeated paged_attention_into into same buffer should be deterministic"
+    );
+
+    // Wrong out shape rejected upfront.
+    let mut wrong_out = backend
+        .allocate_zeros(&[batch_size, num_heads * head_dim + 1], DType::F32)
+        .unwrap();
+    let _ = backend
+        .paged_attention_into(
+            &mut wrong_out,
+            &q,
+            &k_pool,
+            &v_pool,
+            &block_tables,
+            &kv_lens,
+            max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect_err("wrong out shape should fail");
+
+    // Wrong out dtype rejected upfront.
+    let mut wrong_dtype_out = backend
+        .allocate_zeros(&[batch_size, num_heads * head_dim], DType::F16)
+        .unwrap();
+    let _ = backend
+        .paged_attention_into(
+            &mut wrong_dtype_out,
+            &q,
+            &k_pool,
+            &v_pool,
+            &block_tables,
+            &kv_lens,
+            max_blocks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect_err("wrong out dtype should fail");
 }
