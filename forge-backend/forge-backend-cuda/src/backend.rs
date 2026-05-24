@@ -88,7 +88,21 @@ impl CudaBackend {
     pub fn new(ordinal: usize) -> Result<Self> {
         let ctx =
             CudaContext::new(ordinal).map_err(|e| ForgeError::Cuda(format!("context: {e}")))?;
-        let stream = ctx.default_stream();
+        // Two CUDA-Graph-capture preconditions (validated in Task 1 spike):
+        //
+        // 1. `ctx.default_stream()` returns the NULL / legacy stream — CUDA
+        //    Graphs cannot capture it (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED).
+        //    Use a real non-blocking stream instead.
+        //
+        // 2. cudarc's `launch_builder` in multi-stream contexts auto-inserts
+        //    `cuStreamWaitEvent` dependencies for read/write tracking. Those
+        //    waits reference events recorded outside the capture region and
+        //    would invalidate the graph (CUDA_ERROR_STREAM_CAPTURE_INVALIDATED).
+        //    We use one stream FIFO-ordered, so disable event tracking.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx
+            .new_stream()
+            .map_err(|e| ForgeError::Cuda(format!("new_stream: {e}")))?;
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| ForgeError::Cuda(format!("cublas: {e}")))?;
 
@@ -213,6 +227,23 @@ impl CudaBackend {
                 version: 0,
             })),
         })
+    }
+
+    /// Shared handle to the CUDA context. Used by callers that need to
+    /// build secondary resources (e.g. `CudaGraphCache`) on the same
+    /// context. The context is configured with `disable_event_tracking`
+    /// (capture prereq); creating additional streams from it that are then
+    /// captured is supported.
+    pub fn ctx(&self) -> Arc<CudaContext> {
+        self.ctx.clone()
+    }
+
+    /// Shared handle to the backend's primary stream. All ops in this
+    /// backend launch on this stream — kernels, memcpys, cuBLAS. CUDA Graph
+    /// capture must capture this same stream so the captured graph replays
+    /// exactly the launch sequence the engine would have issued.
+    pub fn stream(&self) -> Arc<CudaStream> {
+        self.stream.clone()
     }
 
     /// Current `(block_tables_version, kv_lens_version)` for the paged
