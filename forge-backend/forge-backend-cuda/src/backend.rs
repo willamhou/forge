@@ -48,6 +48,8 @@ struct KernelFunctions {
     // Batched decode attention
     batched_decode_attention_f32: CudaFunction,
     batched_decode_attention_f16: CudaFunction,
+    // Paged attention (decode)
+    paged_attention_f32: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -74,13 +76,14 @@ impl CudaBackend {
 
         // Compile F32 kernels (concatenate all module sources)
         let f32_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F32_SRC,
             forge_kernels::norm::F32_SRC,
             forge_kernels::positional::F32_SRC,
             forge_kernels::memory::F32_SRC,
             forge_kernels::attention::F32_SRC,
             forge_kernels::decode_attention::F32_SRC,
+            forge_kernels::paged_attention::F32_SRC,
         );
         let ptx_f32 = compile_ptx(&f32_src)
             .map_err(|e| ForgeError::Cuda(format!("nvrtc f32: {e}")))?;
@@ -161,6 +164,8 @@ impl CudaBackend {
             // Batched decode attention
             batched_decode_attention_f32: load_f32("batched_decode_attention_f32")?,
             batched_decode_attention_f16: load_f16("batched_decode_attention_f16")?,
+            // Paged attention (decode)
+            paged_attention_f32: load_f32("paged_attention_f32")?,
         };
 
         Ok(Self {
@@ -1433,6 +1438,141 @@ impl Backend for CudaBackend {
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
+    }
+
+    /// Paged attention decode kernel.
+    ///
+    /// Fused single-kernel path: each thread block handles one (seq, head)
+    /// pair and walks the seq's block table to read K/V slots directly from
+    /// the pool — no intermediate gather, no cuBLAS, capture-safe.
+    ///
+    /// Per-call i32 scratch upload for block_tables + kv_lens. Persistent
+    /// scratch (capture-stable address) is Task 2.5.
+    fn paged_attention(
+        &self,
+        q: &CudaTensor,
+        k_pool: &CudaTensor,
+        v_pool: &CudaTensor,
+        block_tables: &[i32],
+        kv_lens: &[i32],
+        max_blocks_per_seq: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<CudaTensor> {
+        // Validation mirrors the trait default impl.
+        let batch_size = kv_lens.len();
+        if block_tables.len() != batch_size * max_blocks_per_seq {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_attention: block_tables.len()={} != batch_size={batch_size} * max_blocks_per_seq={max_blocks_per_seq}",
+                block_tables.len()
+            )));
+        }
+        let pool_shape = k_pool.shape();
+        if pool_shape.len() != 3 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_attention: k_pool must be rank-3, got {pool_shape:?}"
+            )));
+        }
+        if v_pool.shape() != pool_shape {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_attention: k_pool/v_pool shape mismatch ({pool_shape:?} vs {:?})",
+                v_pool.shape()
+            )));
+        }
+        let kv_dim_expected = num_kv_heads * head_dim;
+        if pool_shape[2] != kv_dim_expected {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_attention: pool kv_dim {} != num_kv_heads {} * head_dim {} = {}",
+                pool_shape[2], num_kv_heads, head_dim, kv_dim_expected
+            )));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "paged_attention: num_heads {num_heads} not divisible by num_kv_heads {num_kv_heads}"
+            )));
+        }
+        let q_shape = q.shape();
+        if q_shape.len() != 2 || q_shape[0] != batch_size || q_shape[1] != num_heads * head_dim {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![batch_size, num_heads * head_dim],
+                got: q_shape.to_vec(),
+            });
+        }
+        if kv_lens.iter().any(|&l| l < 0) {
+            return Err(ForgeError::InvalidArgument(
+                "paged_attention: kv_lens contains negative value".into(),
+            ));
+        }
+        if batch_size == 0 {
+            return self.allocate(&[0, num_heads * head_dim], q.dtype());
+        }
+
+        // F32-only for now; F16/BF16 land alongside their kernel variants.
+        if q.dtype() != DType::F32 {
+            return Err(ForgeError::UnsupportedDtype(q.dtype()));
+        }
+        if k_pool.dtype() != DType::F32 {
+            return Err(ForgeError::UnsupportedDtype(k_pool.dtype()));
+        }
+
+        let block_size = pool_shape[1];
+
+        // Per-call upload of i32 metadata. Task 2.5 will switch this to a
+        // persistent scratch buffer for graph-capture stability.
+        let block_tables_dev = self
+            .stream
+            .memcpy_stod(block_tables)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let kv_lens_dev = self
+            .stream
+            .memcpy_stod(kv_lens)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let mut out = self
+            .stream
+            .alloc_zeros::<f32>(batch_size * num_heads * head_dim)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let block_dim = next_power_of_2(128u32.min(head_dim as u32));
+        let shared_mem = (block_dim + head_dim as u32) * 4;
+
+        let num_heads_i32 = num_heads as i32;
+        let num_kv_heads_i32 = num_kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let block_size_i32 = block_size as i32;
+        let max_blocks_i32 = max_blocks_per_seq as i32;
+
+        let mut builder = self
+            .stream
+            .launch_builder(&self.kernels.paged_attention_f32);
+        builder.arg(&mut out);
+        builder.arg(q.f32_slice()?);
+        builder.arg(k_pool.f32_slice()?);
+        builder.arg(v_pool.f32_slice()?);
+        builder.arg(&block_tables_dev);
+        builder.arg(&kv_lens_dev);
+        builder.arg(&scale);
+        builder.arg(&num_heads_i32);
+        builder.arg(&num_kv_heads_i32);
+        builder.arg(&head_dim_i32);
+        builder.arg(&block_size_i32);
+        builder.arg(&max_blocks_i32);
+        unsafe {
+            builder
+                .launch(LaunchConfig {
+                    grid_dim: (batch_size as u32, num_heads as u32, 1),
+                    block_dim: (block_dim, 1, 1),
+                    shared_mem_bytes: shared_mem,
+                })
+                .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        }
+
+        Ok(CudaTensor::f32_data(
+            out,
+            vec![batch_size, num_heads * head_dim],
+        ))
     }
 
     fn split_qkv(
