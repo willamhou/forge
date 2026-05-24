@@ -50,7 +50,14 @@ pub trait Backend: Send + Sync + 'static {
             ));
         }
         let m = a_shape[0];
+        let k = a_shape[1];
         let n = b_shape[1];
+        if b_shape[0] != k {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![k, n],
+                got: b_shape.to_vec(),
+            });
+        }
         let out_shape = out.shape();
         if out_shape != [m, n] {
             return Err(crate::ForgeError::ShapeMismatch {
@@ -309,6 +316,17 @@ pub trait Backend: Send + Sync + 'static {
         src: &Self::Tensor,
         slot_mapping: &[i32],
     ) -> Result<()> {
+        // Reject non-F32 pools: the host-fallback path round-trips through
+        // f32 (no `copy_to_host_f16` / `copy_to_host_bf16` exists on Backend),
+        // so an F16/BF16 pool would be silently coerced to F32 and corrupt
+        // the model's activation dtype. Backends supporting non-F32 pools
+        // (CUDA) must override this method.
+        if pool.dtype() != crate::DType::F32 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_write_kv default impl only supports F32 pools (got {:?}); backend must override for non-F32 dtypes",
+                pool.dtype()
+            )));
+        }
         let pool_shape = pool.shape().to_vec();
         let block_size = pool_shape[1];
         let kv_dim = pool_shape[2];
@@ -453,6 +471,15 @@ pub trait Backend: Send + Sync + 'static {
         block_ids: &[usize],
         total_tokens: usize,
     ) -> Result<Self::Tensor> {
+        // Same restriction as `paged_write_kv`: default impl is F32-only.
+        // Non-F32 backends must override or the returned tensor's dtype
+        // will silently disagree with the pool's.
+        if pool.dtype() != crate::DType::F32 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "paged_gather_kv default impl only supports F32 pools (got {:?}); backend must override for non-F32 dtypes",
+                pool.dtype()
+            )));
+        }
         let pool_shape = pool.shape();
         let block_size = pool_shape[1];
         let kv_dim = pool_shape[2];

@@ -20,6 +20,20 @@
 //!   cudarc's auto-inserted `cuStreamWaitEvent` calls reference events
 //!   outside the capture region and invalidate the graph.
 //!
+//! ## Threading
+//!
+//! `&mut self` on `run_or_capture` prevents concurrent capture on the same
+//! cache instance. However, the captured stream is `Arc<CudaStream>` — any
+//! other holder (e.g. another `CudaBackend` op called from a background
+//! task) that issues launches against that stream BETWEEN `begin_capture`
+//! and `end_capture` will have those launches accidentally recorded into
+//! the graph, or worse, invalidate the capture.
+//!
+//! This is safe today because `CudaBackend`'s contract (see its struct doc)
+//! is single-threaded engine access. If that contract is ever relaxed,
+//! `CudaGraphCache` callers must serialize all stream usage during
+//! `run_or_capture` themselves.
+//!
 //! No engine integration here — that's Task 4 (`DecodeGraphRunner`).
 
 use std::collections::HashMap;

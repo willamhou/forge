@@ -91,6 +91,16 @@ impl DecodeGraphRunner {
     /// argument is stable across calls (persistent pool tensors, persistent
     /// scratches, caller-provided output buffers). Otherwise the replay reads
     /// from stale / freed memory.
+    ///
+    /// ## Host-side side effects are NOT replayed
+    ///
+    /// On bucket cache hit the closure is NOT invoked — cudarc replays only
+    /// the recorded kernel launches + memcpys. Any host-side bookkeeping the
+    /// closure performs (counters, tracing, metrics, log lines) only runs on
+    /// the first call (during capture) and is silently skipped on every
+    /// subsequent replay. Callers that need per-call host-side bookkeeping
+    /// must hoist it OUT of the closure (i.e. perform it around `dispatch`,
+    /// not inside `fwd`).
     pub fn dispatch<F>(&mut self, batch_size: u32, fwd: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,

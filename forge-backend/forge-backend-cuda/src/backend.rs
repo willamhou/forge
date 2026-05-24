@@ -757,6 +757,11 @@ impl Backend for CudaBackend {
             )));
         }
 
+        // Row-major `A * B` in cuBLAS (which is column-major) is computed
+        // as `B^T * A^T` from cuBLAS's POV: pass (b, a) and swap (m, n)
+        // and (lda, ldb) accordingly. The result lands row-major in `out`
+        // without any explicit transpose. This is load-bearing — touching
+        // the swap or arg order will produce a silently transposed result.
         match a.dtype() {
             DType::F32 => {
                 let a_slice = a.f32_slice()?;
