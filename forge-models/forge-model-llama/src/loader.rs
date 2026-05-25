@@ -78,7 +78,19 @@ fn load_decoder_layer<B: Backend>(
     let wv_t = backend.transpose(&wv, 0, 1)?; // [kv_proj, hidden]
     let cat_t = backend.cat(&[&wq_t, &wk_t, &wv_t], 0)?; // [q+2*kv, hidden]
     let wqkv = backend.transpose(&cat_t, 0, 1)?; // [hidden, q+2*kv]
-    let attn = LlamaAttention::new(wqkv, wo, config);
+
+    // Optional QKV bias (Qwen2-family). If q_proj.bias is present, all three
+    // (q/k/v) are; concatenate into a single [q+2*kv] bias vector matching the
+    // wqkv column layout. Biases are 1D so no transpose needed — just cat.
+    let qkv_bias = match loader.load_tensor(&format!("{prefix}.self_attn.q_proj.bias"), backend) {
+        Ok(q_bias) => {
+            let k_bias = loader.load_tensor(&format!("{prefix}.self_attn.k_proj.bias"), backend)?;
+            let v_bias = loader.load_tensor(&format!("{prefix}.self_attn.v_proj.bias"), backend)?;
+            Some(backend.cat(&[&q_bias, &k_bias, &v_bias], 0)?)
+        }
+        Err(_) => None, // Llama: no QKV bias
+    };
+    let attn = LlamaAttention::new_with_bias(wqkv, qkv_bias, wo, config);
 
     // MLP weights (transposed at load)
     let gate_proj = load_linear(loader, &format!("{prefix}.mlp.gate_proj.weight"), backend)?;

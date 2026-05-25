@@ -24,6 +24,43 @@ pub trait Backend: Send + Sync + 'static {
     fn matmul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn add(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
 
+    /// Broadcast bias add: `out[r, c] = x[r, c] + bias[c]`.
+    ///
+    /// `x` is `[rows, cols]` (2D), `bias` is `[cols]`. Used for the QKV
+    /// projection bias in Qwen2-family models (Llama has no QKV bias).
+    /// Default impl round-trips through host f32; GPU backends override with
+    /// a broadcast kernel.
+    fn add_bias(&self, x: &Self::Tensor, bias: &Self::Tensor) -> Result<Self::Tensor> {
+        let shape = x.shape();
+        if shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "add_bias: x must be 2D [rows, cols]".into(),
+            ));
+        }
+        let cols = shape[1];
+        if bias.shape() != [cols] {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: bias.shape().to_vec(),
+            });
+        }
+        if x.dtype() != crate::DType::F32 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "add_bias default impl is F32-only (got {:?}); backend must override",
+                x.dtype()
+            )));
+        }
+        let mut data = self.copy_to_host_f32(x)?;
+        let bias_data = self.copy_to_host_f32(bias)?;
+        let rows = shape[0];
+        for r in 0..rows {
+            for c in 0..cols {
+                data[r * cols + c] += bias_data[c];
+            }
+        }
+        self.copy_from_host_f32(&data, shape)
+    }
+
     /// Matrix multiply, writing into a caller-provided output buffer.
     ///
     /// `a`: `[m, k]`, `b`: `[k, n]`, `out`: `[m, n]`; out dtype must match
