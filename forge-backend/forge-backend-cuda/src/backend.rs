@@ -101,6 +101,13 @@ pub struct CudaBackend {
 struct I32Scratch {
     buf: CudaSlice<i32>,
     version: u64,
+    /// Persistent HOST mirror used as the `memcpy_htod` source. A captured
+    /// graph bakes the host source pointer of an H2D copy; sourcing from this
+    /// stable backend-owned buffer (instead of a per-call Vec that drops when
+    /// the caller returns) keeps that pointer valid across capture + replay.
+    /// Sized to match `buf`; never shrinks, so the pointer is stable once
+    /// warmed to the steady-state size.
+    host: Vec<i32>,
 }
 
 /// u32 sibling of `I32Scratch` — for kernels that read indices as u32
@@ -108,6 +115,7 @@ struct I32Scratch {
 struct U32Scratch {
     buf: CudaSlice<u32>,
     version: u64,
+    host: Vec<u32>,
 }
 
 /// f32 sibling of `I32Scratch` — for kernels that need a small per-call
@@ -115,6 +123,7 @@ struct U32Scratch {
 struct F32Scratch {
     buf: CudaSlice<f32>,
     version: u64,
+    host: Vec<f32>,
 }
 
 impl CudaBackend {
@@ -270,26 +279,32 @@ impl CudaBackend {
             paged_block_tables: Arc::new(Mutex::new(I32Scratch {
                 buf: block_tables,
                 version: 0,
+                host: Vec::new(),
             })),
             paged_kv_lens: Arc::new(Mutex::new(I32Scratch {
                 buf: kv_lens,
                 version: 0,
+                host: Vec::new(),
             })),
             embedding_indices: Arc::new(Mutex::new(U32Scratch {
                 buf: emb_indices,
                 version: 0,
+                host: Vec::new(),
             })),
             rope_cos: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_cos_buf,
                 version: 0,
+                host: Vec::new(),
             })),
             rope_sin: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_sin_buf,
                 version: 0,
+                host: Vec::new(),
             })),
             scatter_slot_mapping: Arc::new(Mutex::new(I32Scratch {
                 buf: slot_mapping_buf,
                 version: 0,
+                host: Vec::new(),
             })),
         })
     }
@@ -510,6 +525,49 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Upload `src` into `scratch`'s device buffer, sourcing the `memcpy_htod`
+    /// from the scratch's persistent HOST mirror (not `src` directly). A
+    /// captured CUDA Graph bakes the H2D source pointer; the mirror is a
+    /// stable backend-owned buffer, so the baked pointer stays valid across
+    /// capture + replay even after the caller's `src` Vec is dropped. See the
+    /// `I32Scratch::host` doc. The mirror never shrinks → pointer is stable
+    /// once warmed to steady-state size (a `grow` bumps `version`, which the
+    /// capture cache uses to invalidate).
+    fn upload_i32_scratch(&self, scratch: &mut I32Scratch, src: &[i32]) -> Result<()> {
+        self.ensure_i32_scratch(scratch, src.len().max(1))?;
+        if scratch.host.len() < src.len() {
+            scratch.host.resize(src.len(), 0);
+        }
+        scratch.host[..src.len()].copy_from_slice(src);
+        self.stream
+            .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// u32 sibling of `upload_i32_scratch`.
+    fn upload_u32_scratch(&self, scratch: &mut U32Scratch, src: &[u32]) -> Result<()> {
+        self.ensure_u32_scratch(scratch, src.len().max(1))?;
+        if scratch.host.len() < src.len() {
+            scratch.host.resize(src.len(), 0);
+        }
+        scratch.host[..src.len()].copy_from_slice(src);
+        self.stream
+            .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// f32 sibling of `upload_i32_scratch`.
+    fn upload_f32_scratch(&self, scratch: &mut F32Scratch, src: &[f32]) -> Result<()> {
+        self.ensure_f32_scratch(scratch, src.len().max(1))?;
+        if scratch.host.len() < src.len() {
+            scratch.host.resize(src.len(), 0.0);
+        }
+        scratch.host[..src.len()].copy_from_slice(src);
+        self.stream
+            .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
     /// Inherent implementation of paged_attention_into. The `Backend` trait
     /// method `paged_attention_into` (in `impl Backend for CudaBackend`)
     /// delegates here. Keeping the implementation inherent lets unit tests
@@ -641,19 +699,13 @@ impl CudaBackend {
             .paged_block_tables
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_block_tables mutex poisoned".into()))?;
-        self.ensure_i32_scratch(&mut bt_scratch, block_tables.len())?;
-        self.stream
-            .memcpy_htod(block_tables, &mut bt_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_i32_scratch(&mut bt_scratch, block_tables)?;
 
         let mut kv_scratch = self
             .paged_kv_lens
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_kv_lens mutex poisoned".into()))?;
-        self.ensure_i32_scratch(&mut kv_scratch, kv_lens.len())?;
-        self.stream
-            .memcpy_htod(kv_lens, &mut kv_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_i32_scratch(&mut kv_scratch, kv_lens)?;
 
         let block_tables_dev = &bt_scratch.buf;
         let kv_lens_dev = &kv_scratch.buf;
@@ -1679,19 +1731,13 @@ impl Backend for CudaBackend {
             .rope_cos
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_cos mutex poisoned".into()))?;
-        self.ensure_f32_scratch(&mut cos_scratch, expected)?;
-        self.stream
-            .memcpy_htod(cos_host, &mut cos_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_f32_scratch(&mut cos_scratch, cos_host)?;
 
         let mut sin_scratch = self
             .rope_sin
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_sin mutex poisoned".into()))?;
-        self.ensure_f32_scratch(&mut sin_scratch, expected)?;
-        self.stream
-            .memcpy_htod(sin_host, &mut sin_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_f32_scratch(&mut sin_scratch, sin_host)?;
 
         let cos_dev = &cos_scratch.buf;
         let sin_dev = &sin_scratch.buf;
@@ -1980,10 +2026,7 @@ impl Backend for CudaBackend {
             .embedding_indices
             .lock()
             .map_err(|_| ForgeError::Cuda("embedding_indices mutex poisoned".into()))?;
-        self.ensure_u32_scratch(&mut indices_scratch, num_indices)?;
-        self.stream
-            .memcpy_htod(indices, &mut indices_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_u32_scratch(&mut indices_scratch, indices)?;
         let indices_dev = &indices_scratch.buf;
 
         let launch_cfg = LaunchConfig {

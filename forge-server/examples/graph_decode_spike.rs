@@ -144,9 +144,72 @@ fn main() -> anyhow::Result<()> {
                         .fold(0.0_f32, f32::max);
                     println!("[replay] argmax={r_arg} ({r_val:.3}) max|Δ vs captured|={max_diff:.4}");
                     if r_arg == c_arg && max_diff < 1e-3 {
-                        println!("\nGREEN — capture + replay both work, results stable. \
-                                  CUDA Graphs end-to-end is viable; remaining work is \
-                                  engine wiring + multi-step KV/host-buffer correctness.");
+                        println!("\nGREEN — capture + replay both work, results stable.");
+
+                        // ── Latency measurement: eager vs captured replay ──
+                        // Both measure per-decode-step GPU cost. Eager pays
+                        // ~220 kernel launches/step; replay pays 1 (the graph).
+                        let warmup = 5usize;
+                        let iters = 100usize;
+
+                        // Captured replay FIRST: one graph launch per step. Must
+                        // run before the eager loop below — eager appends tokens,
+                        // which grows the kv_lens/block_tables scratches, frees the
+                        // device buffers the captured graph baked, and would make
+                        // replay read freed memory (the version-bump invalidation
+                        // case the production cache must handle by recapturing).
+                        for _ in 0..warmup {
+                            cache.replay(1)?;
+                        }
+                        backend.synchronize()?;
+                        let t1 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            cache.replay(1)?;
+                        }
+                        backend.synchronize()?;
+                        let replay_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+                        // Replay per-call-sync (still before any eager grow).
+                        let t2 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            cache.replay(1)?;
+                            backend.synchronize()?;
+                        }
+                        let replay_sync_ms = t2.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+                        // Eager: full forward_into each step (grows the cache).
+                        for _ in 0..warmup {
+                            model_ref.forward_into(decode_ref, &mut kv, &mut buffers)?;
+                        }
+                        backend.synchronize()?;
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            model_ref.forward_into(decode_ref, &mut kv, &mut buffers)?;
+                        }
+                        backend.synchronize()?;
+                        let eager_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+                        println!("\n── pipelined latency (sync at end, {iters} iters, {} layers) ──", config.num_hidden_layers);
+                        println!("  eager forward_into : {eager_ms:.3} ms/step ({:.1} tok/s)", 1e3 / eager_ms);
+                        println!("  captured replay    : {replay_ms:.3} ms/step ({:.1} tok/s)", 1e3 / replay_ms);
+                        println!("  speedup            : {:.2}x  (saved {:.3} ms/step)",
+                                 eager_ms / replay_ms, eager_ms - replay_ms);
+
+                        // Per-call-sync latency: closer to what the engine sees,
+                        // since it syncs every token (copy_to_host logits → sample).
+                        // Launch overhead can't pipeline across the sync barrier.
+                        // (replay_sync_ms was measured above, before the eager grow.)
+                        let t3 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            model_ref.forward_into(decode_ref, &mut kv, &mut buffers)?;
+                            backend.synchronize()?;
+                        }
+                        let eager_sync_ms = t3.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                        println!("\n── per-call-sync latency (engine-realistic) ──");
+                        println!("  eager forward_into : {eager_sync_ms:.3} ms/step ({:.1} tok/s)", 1e3 / eager_sync_ms);
+                        println!("  captured replay    : {replay_sync_ms:.3} ms/step ({:.1} tok/s)", 1e3 / replay_sync_ms);
+                        println!("  speedup            : {:.2}x  (saved {:.3} ms/step)",
+                                 eager_sync_ms / replay_sync_ms, eager_sync_ms - replay_sync_ms);
                     } else {
                         println!("\nYELLOW — capture + replay run, but replay result differs \
                                   from captured (argmax {c_arg}->{r_arg}, Δ={max_diff:.4}). \
