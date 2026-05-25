@@ -73,6 +73,17 @@ impl SafeTensorsLoader {
     pub fn tensor_names(&self) -> Vec<String> {
         self.tensor_index.keys().cloned().collect()
     }
+
+    /// True if a tensor with this exact name exists in any loaded file.
+    ///
+    /// Use this to distinguish "optional tensor is absent" from "tensor is
+    /// present but failed to load" — `load_tensor` returns the same
+    /// `ModelLoad` error variant for both, so callers that want to fall
+    /// back on absence (e.g. optional QKV bias, tied lm_head) must check
+    /// existence first and let real load errors propagate.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tensor_index.contains_key(name)
+    }
 }
 
 fn view_to_tensor<B: Backend>(

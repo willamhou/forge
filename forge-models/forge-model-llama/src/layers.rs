@@ -85,6 +85,9 @@ impl<B: Backend> LlamaMLP<B> {
 /// cached K/V are retrieved so attention sees the full context.
 pub struct LlamaAttention<B: Backend> {
     wqkv: B::Tensor,    // [hidden_size, q_proj_size + 2 * kv_proj_size]
+    /// Optional fused QKV bias `[q_proj_size + 2 * kv_proj_size]`. Present
+    /// for Qwen2-family models (q/k/v_proj have bias); `None` for Llama.
+    qkv_bias: Option<B::Tensor>,
     wo: B::Tensor,
     num_heads: usize,
     num_kv_heads: usize,
@@ -94,19 +97,40 @@ pub struct LlamaAttention<B: Backend> {
 }
 
 impl<B: Backend> LlamaAttention<B> {
+    /// Construct without QKV bias (Llama).
     pub fn new(
         wqkv: B::Tensor,
         wo: B::Tensor,
         config: &ModelConfig,
     ) -> Self {
+        Self::new_with_bias(wqkv, None, wo, config)
+    }
+
+    /// Construct with an optional fused QKV bias (Qwen2 sets this).
+    pub fn new_with_bias(
+        wqkv: B::Tensor,
+        qkv_bias: Option<B::Tensor>,
+        wo: B::Tensor,
+        config: &ModelConfig,
+    ) -> Self {
         Self {
             wqkv,
+            qkv_bias,
             wo,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             q_proj_size: config.num_attention_heads * config.head_dim,
             kv_proj_size: config.num_key_value_heads * config.head_dim,
+        }
+    }
+
+    /// Apply the fused QKV projection (matmul + optional bias).
+    fn project_qkv(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
+        let qkv = backend.matmul(x, &self.wqkv)?;
+        match &self.qkv_bias {
+            Some(bias) => backend.add_bias(&qkv, bias),
+            None => Ok(qkv),
         }
     }
 
@@ -130,8 +154,8 @@ impl<B: Backend> LlamaAttention<B> {
         let shape = x.shape();
         let seq_len = shape[0];
 
-        // Fused QKV projection — single GEMM + split
-        let qkv = backend.matmul(x, &self.wqkv)?;
+        // Fused QKV projection (matmul + optional Qwen2 bias) — single GEMM + split
+        let qkv = self.project_qkv(x, backend)?;
         let (q, k, v) = backend.split_qkv(&qkv, self.q_proj_size, self.kv_proj_size)?;
 
         // Reshape for RoPE: [1, seq_len, num_heads/kv_heads, head_dim]
@@ -194,8 +218,8 @@ impl<B: Backend> LlamaAttention<B> {
     ) -> Result<B::Tensor> {
         let n = x.shape()[0];
 
-        // Fused QKV projection — single GEMM + split
-        let qkv = backend.matmul(x, &self.wqkv)?;
+        // Fused QKV projection (matmul + optional Qwen2 bias) — single GEMM + split
+        let qkv = self.project_qkv(x, backend)?;
         let (q, k, v) = backend.split_qkv(&qkv, self.q_proj_size, self.kv_proj_size)?;
 
         // Reshape for RoPE: [1, N, num_heads/kv_heads, head_dim]
@@ -292,6 +316,18 @@ impl<B: Backend> LlamaAttention<B> {
         backend: &B,
     ) -> Result<()> {
         let n = buffers.batch_size;
+
+        // QKV bias not yet supported in the persistent-buffer (capture) path —
+        // would need an add_bias_into op + a buffer for the biased qkv. The
+        // capture path isn't engine-wired yet anyway; reject loudly rather
+        // than silently dropping the bias (which would corrupt Qwen output).
+        if self.qkv_bias.is_some() {
+            return Err(ForgeError::InvalidArgument(
+                "forward_batch_into: QKV bias (Qwen2) not yet supported on the \
+                 persistent-buffer path; use the allocating forward_batch"
+                    .into(),
+            ));
+        }
 
         // QKV projection + split. Reads from buffers.normed (caller convention).
         backend.matmul_into(&mut buffers.qkv, &buffers.normed, &self.wqkv)?;

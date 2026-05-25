@@ -39,6 +39,19 @@ extern "C" __global__ void fused_silu_mul_f32(
         out[i] = (g / (1.0f + expf(-g))) * up[i];
     }
 }
+
+// out[r, c] = x[r, c] + bias[c]  — bias broadcast over rows.
+// x shape [rows, cols] row-major; bias length `cols`. In place into `out`
+// (out may alias x). Used for QKV projection bias (Qwen2).
+extern "C" __global__ void add_bias_f32(
+    float* out, const float* x, const float* bias, unsigned int rows, unsigned int cols
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int n = rows * cols;
+    if (i < n) {
+        out[i] = x[i] + bias[i % cols];
+    }
+}
 "#;
 
 pub const F16_SRC: &str = r#"
@@ -78,6 +91,17 @@ extern "C" __global__ void fused_silu_mul_f16(
     if (i < n) {
         float g = __half2float(gate[i]);
         out[i] = __float2half((g / (1.0f + expf(-g))) * __half2float(up[i]));
+    }
+}
+
+// out[r, c] = x[r, c] + bias[c] — bias broadcast over rows. See f32 variant.
+extern "C" __global__ void add_bias_f16(
+    __half* out, const __half* x, const __half* bias, unsigned int rows, unsigned int cols
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int n = rows * cols;
+    if (i < n) {
+        out[i] = __hadd(x[i], bias[i % cols]);
     }
 }
 "#;

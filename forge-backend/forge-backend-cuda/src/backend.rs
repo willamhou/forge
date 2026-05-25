@@ -13,6 +13,7 @@ use crate::tensor::CudaTensor;
 
 struct KernelFunctions {
     add_f32: CudaFunction,
+    add_bias_f32: CudaFunction,
     mul_f32: CudaFunction,
     mul_scalar_f32: CudaFunction,
     silu_f32: CudaFunction,
@@ -25,6 +26,7 @@ struct KernelFunctions {
     transpose_f32: CudaFunction,
     // FP16 variants
     add_f16: CudaFunction,
+    add_bias_f16: CudaFunction,
     mul_f16: CudaFunction,
     mul_scalar_f16: CudaFunction,
     silu_f16: CudaFunction,
@@ -184,6 +186,7 @@ impl CudaBackend {
 
         let kernels = KernelFunctions {
             add_f32: load_f32("add_f32")?,
+            add_bias_f32: load_f32("add_bias_f32")?,
             mul_f32: load_f32("mul_f32")?,
             mul_scalar_f32: load_f32("mul_scalar_f32")?,
             silu_f32: load_f32("silu_f32")?,
@@ -197,6 +200,7 @@ impl CudaBackend {
             split_qkv_f32: load_f32("split_qkv_f32")?,
             // F16 kernels
             add_f16: load_f16("add_f16")?,
+            add_bias_f16: load_f16("add_bias_f16")?,
             mul_f16: load_f16("mul_f16")?,
             mul_scalar_f16: load_f16("mul_scalar_f16")?,
             silu_f16: load_f16("silu_f16")?,
@@ -909,6 +913,73 @@ impl Backend for CudaBackend {
         validate_same_shape(a, b)?;
         let mut out = self.allocate_zeros(&a.shape, a.dtype())?;
         self.add_into(&mut out, a, b)?;
+        Ok(out)
+    }
+
+    /// Broadcast bias add: `out[r,c] = x[r,c] + bias[c]`. x is `[rows, cols]`,
+    /// bias is `[cols]`. Used for Qwen2 QKV projection bias.
+    fn add_bias(&self, x: &CudaTensor, bias: &CudaTensor) -> Result<CudaTensor> {
+        let shape = x.shape();
+        if shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "add_bias: x must be 2D [rows, cols]".into(),
+            ));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        if bias.shape() != [cols] {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: bias.shape().to_vec(),
+            });
+        }
+        if x.dtype() != bias.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "add_bias: x dtype {:?} != bias dtype {:?}",
+                x.dtype(),
+                bias.dtype()
+            )));
+        }
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let n = (rows * cols) as u32;
+        let mut out = self.allocate_zeros(shape, x.dtype())?;
+
+        match x.dtype() {
+            DType::F32 => {
+                let x_s = x.f32_slice()?;
+                let b_s = bias.f32_slice()?;
+                let o = out.f32_slice_mut()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias_f32);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(b_s);
+                builder.arg(&rows_u);
+                builder.arg(&cols_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let x_s = x.f16_slice()?;
+                let b_s = bias.f16_slice()?;
+                let o = out.f16_slice_mut()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias_f16);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(b_s);
+                builder.arg(&rows_u);
+                builder.arg(&cols_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
         Ok(out)
     }
 
