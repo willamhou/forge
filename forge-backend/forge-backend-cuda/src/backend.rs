@@ -54,6 +54,9 @@ struct KernelFunctions {
     // Paged attention (decode)
     paged_attention_f32: CudaFunction,
     paged_attention_f16: CudaFunction,
+
+    scatter_kv_f32: CudaFunction,
+    scatter_kv_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -85,6 +88,11 @@ pub struct CudaBackend {
     rope_cos: Arc<Mutex<F32Scratch>>,
     /// Persistent device scratch for RoPE's f32 sin table. See `rope_cos`.
     rope_sin: Arc<Mutex<F32Scratch>>,
+    /// Persistent device scratch for the KV-scatter slot_mapping (i32). Lets
+    /// `scatter_kv` read write destinations from a stable device pointer so the
+    /// op can be recorded in a captured graph (the old `paged_write_kv`
+    /// host-loop bakes destinations into memcpy nodes — not replay-safe).
+    scatter_slot_mapping: Arc<Mutex<I32Scratch>>,
 }
 
 /// Monotonically-growing i32 device buffer. `version` increments on every
@@ -227,6 +235,8 @@ impl CudaBackend {
             // Paged attention (decode)
             paged_attention_f32: load_f32("paged_attention_f32")?,
             paged_attention_f16: load_f16("paged_attention_f16")?,
+            scatter_kv_f32: load_f32("scatter_kv_f32")?,
+            scatter_kv_f16: load_f16("scatter_kv_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -246,6 +256,9 @@ impl CudaBackend {
         let rope_sin_buf = stream
             .alloc_zeros::<f32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc rope_sin: {e}")))?;
+        let slot_mapping_buf = stream
+            .alloc_zeros::<i32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc scatter_slot_mapping: {e}")))?;
 
         Ok(Self {
             ctx,
@@ -272,6 +285,10 @@ impl CudaBackend {
             })),
             rope_sin: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_sin_buf,
+                version: 0,
+            })),
+            scatter_slot_mapping: Arc::new(Mutex::new(I32Scratch {
+                buf: slot_mapping_buf,
                 version: 0,
             })),
         })
@@ -325,6 +342,131 @@ impl CudaBackend {
         let c = self.rope_cos.lock().map(|g| g.version).unwrap_or(0);
         let s = self.rope_sin.lock().map(|g| g.version).unwrap_or(0);
         (c, s)
+    }
+
+    /// Version of the scatter slot_mapping scratch (bumps on grow).
+    pub fn scatter_slot_mapping_version(&self) -> u64 {
+        self.scatter_slot_mapping
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
+    }
+
+    /// Upload `slot_mapping` into the persistent device scratch. This is the
+    /// capture-UNSAFE half of the KV scatter (a `memcpy_htod`) and must run
+    /// OUTSIDE any captured region — call it in the stage phase, before
+    /// `graph.launch`. The captured `scatter_kv` then reads the staged buffer.
+    ///
+    /// Returns the staged length (= `slot_mapping.len()`), which the caller
+    /// passes to `scatter_kv` as `n_rows`.
+    pub fn stage_slot_mapping(&self, slot_mapping: &[i32]) -> Result<usize> {
+        let mut scratch = self
+            .scatter_slot_mapping
+            .lock()
+            .map_err(|_| ForgeError::Cuda("scatter_slot_mapping mutex poisoned".into()))?;
+        self.ensure_i32_scratch(&mut scratch, slot_mapping.len().max(1))?;
+        if !slot_mapping.is_empty() {
+            self.stream
+                .memcpy_htod(slot_mapping, &mut scratch.buf)
+                .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        }
+        Ok(slot_mapping.len())
+    }
+
+    /// Capture-safe KV scatter: writes the first `n_rows` rows of `src` into
+    /// `pool` at the slots previously uploaded via `stage_slot_mapping`. Pure
+    /// kernel launch (reads the device slot_mapping scratch) — no host upload,
+    /// so it can be recorded inside a captured CUDA Graph.
+    ///
+    /// `pool` is rank-3 `[num_blocks, block_size, kv_dim]`; `src` is
+    /// `[>= n_rows, kv_dim]`. Bounds are enforced defensively in-kernel
+    /// (OOB/negative slots are skipped); the host should have validated during
+    /// staging.
+    pub fn scatter_kv(&self, pool: &mut CudaTensor, src: &CudaTensor, n_rows: usize) -> Result<()> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        if pool.dtype() != src.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: pool/src dtype mismatch ({:?} vs {:?})",
+                pool.dtype(),
+                src.dtype()
+            )));
+        }
+        let pool_shape = pool.shape().to_vec();
+        if pool_shape.len() != 3 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: pool must be rank-3 [num_blocks, block_size, kv_dim], got {pool_shape:?}"
+            )));
+        }
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let total_slots = pool_shape[0] * block_size;
+        let src_rows = src.shape().first().copied().unwrap_or(0);
+        if src_rows < n_rows {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: src has {src_rows} rows but n_rows={n_rows}"
+            )));
+        }
+
+        let scratch = self
+            .scatter_slot_mapping
+            .lock()
+            .map_err(|_| ForgeError::Cuda("scatter_slot_mapping mutex poisoned".into()))?;
+        if scratch.buf.len() < n_rows {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: slot_mapping scratch holds {} entries but n_rows={n_rows} (call stage_slot_mapping first)",
+                scratch.buf.len()
+            )));
+        }
+        let slot_dev = &scratch.buf;
+
+        let n_rows_u32 = n_rows as u32;
+        let kv_dim_u32 = kv_dim as u32;
+        let total_slots_u32 = total_slots as u32;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (256.min(kv_dim as u32).max(1), 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        match pool.dtype() {
+            DType::F32 => {
+                let p = pool.f32_slice_mut()?;
+                let s = src.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.scatter_kv_f32);
+                builder.arg(p);
+                builder.arg(s);
+                builder.arg(slot_dev);
+                builder.arg(&n_rows_u32);
+                builder.arg(&kv_dim_u32);
+                builder.arg(&total_slots_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+                Ok(())
+            }
+            DType::F16 => {
+                let p = pool.f16_slice_mut()?;
+                let s = src.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.scatter_kv_f16);
+                builder.arg(p);
+                builder.arg(s);
+                builder.arg(slot_dev);
+                builder.arg(&n_rows_u32);
+                builder.arg(&kv_dim_u32);
+                builder.arg(&total_slots_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+                Ok(())
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
     }
 
     /// Grow `scratch` if its capacity is below `needed`. Bumps `version` on

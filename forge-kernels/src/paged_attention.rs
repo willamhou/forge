@@ -121,6 +121,35 @@ extern "C" __global__ void paged_attention_f32(
     for (int d = tid; d < head_dim; d += blockDim.x)
         out_ptr[d] = s_out[d] * inv_sum;
 }
+
+// Scatter rows of `src` into the paged pool at slots given by a DEVICE
+// `slot_mapping` tensor. Unlike the host-loop memcpy_dtod in paged_write_kv,
+// the write destination is computed from a device value at kernel runtime, so
+// this op is safe to record inside a captured CUDA Graph: re-staging
+// slot_mapping (and replaying) writes to the new slots without re-capture.
+//
+// Pool is contiguous [num_blocks, block_size, kv_dim]; a flat slot index
+// `slot` addresses element block*block_size + slot_in_block, exactly what
+// slot_mapping encodes (dst = slot * kv_dim). OOB / negative slots are skipped
+// defensively (a kernel cannot return an error); the host validates first.
+//
+// Grid: (n_rows, 1, 1)   Block: (min(256, kv_dim), 1, 1)
+extern "C" __global__ void scatter_kv_f32(
+    float* pool,                  // [total_slots, kv_dim] (flattened pool)
+    const float* src,             // [n_rows, kv_dim]
+    const int* slot_mapping,      // [n_rows]
+    unsigned int n_rows,
+    unsigned int kv_dim,
+    unsigned int total_slots) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+    int slot = slot_mapping[row];
+    if (slot < 0 || (unsigned int)slot >= total_slots) return;
+    const float* s = src + (size_t)row * kv_dim;
+    float* d = pool + (size_t)slot * kv_dim;
+    for (unsigned int i = threadIdx.x; i < kv_dim; i += blockDim.x)
+        d[i] = s[i];
+}
 "#;
 
 /// F16 variant. Same algorithm; accumulation stays in f32 for numerical
@@ -226,5 +255,24 @@ extern "C" __global__ void paged_attention_f16(
     __half* out_ptr = out + seq_idx * num_heads * head_dim + head_idx * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x)
         out_ptr[d] = __float2half(s_out[d] * inv_sum);
+}
+
+// F16 sibling of scatter_kv_f32. Pure element copy (no arithmetic), so no
+// f32 intermediate is needed — copy __half words directly. See the F32 doc.
+extern "C" __global__ void scatter_kv_f16(
+    __half* pool,
+    const __half* src,
+    const int* slot_mapping,
+    unsigned int n_rows,
+    unsigned int kv_dim,
+    unsigned int total_slots) {
+    unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+    int slot = slot_mapping[row];
+    if (slot < 0 || (unsigned int)slot >= total_slots) return;
+    const __half* s = src + (size_t)row * kv_dim;
+    __half* d = pool + (size_t)slot * kv_dim;
+    for (unsigned int i = threadIdx.x; i < kv_dim; i += blockDim.x)
+        d[i] = s[i];
 }
 "#;
