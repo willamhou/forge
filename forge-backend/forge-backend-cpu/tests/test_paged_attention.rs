@@ -180,7 +180,13 @@ fn paged_attention_validates_inputs() {
         .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 5, 2, 4, scale)
         .is_err());
 
-    // 5. Valid call succeeds (1 seq, 1 block, 1 token, all-zeros)
+    // 5. num_kv_heads == 0 must error cleanly, NOT panic on the `num_heads %
+    //    num_kv_heads` divide-by-zero (Codex review on PR #5).
+    assert!(backend
+        .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 0, 4, scale)
+        .is_err());
+
+    // 6. Valid call succeeds (1 seq, 1 block, 1 token, all-zeros)
     let _ = backend
         .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 2, 4, scale)
         .unwrap();
