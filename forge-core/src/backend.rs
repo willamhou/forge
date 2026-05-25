@@ -757,6 +757,11 @@ pub trait Backend: Send + Sync + 'static {
                 v_pool.shape()
             )));
         }
+        if num_kv_heads == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "paged_attention: num_kv_heads must be > 0".into(),
+            ));
+        }
         let kv_dim_expected = num_kv_heads * head_dim;
         if pool_shape[2] != kv_dim_expected {
             return Err(crate::ForgeError::InvalidArgument(format!(

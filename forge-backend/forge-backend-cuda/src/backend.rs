@@ -402,6 +402,11 @@ impl CudaBackend {
                 v_pool.shape()
             )));
         }
+        if num_kv_heads == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "paged_attention_into: num_kv_heads must be > 0".into(),
+            ));
+        }
         let kv_dim_expected = num_kv_heads * head_dim;
         if pool_shape[2] != kv_dim_expected {
             return Err(ForgeError::InvalidArgument(format!(
