@@ -186,6 +186,24 @@ pub async fn chat_completions(
             None
         };
 
+    // Per-request event channel capacity.
+    //
+    // The engine emits Token events via `try_send` and cancels a sequence if
+    // the channel is full ("slow consumer" protection — one stuck client must
+    // not stall the shared engine). The streaming consumer drains
+    // incrementally as it writes SSE, so 256 of slack is plenty. The
+    // non-streaming consumer accumulates tokens and only returns at Finish; if
+    // the engine bursts faster than the consumer task gets scheduled, a
+    // bounded 256 channel overflows on long generations (observed:
+    // max_tokens=256 → HTTP 500 "event channel full"). Size the non-streaming
+    // channel to hold the whole generation plus slack so it can't drop a
+    // well-behaved consumer.
+    let channel_cap = if is_stream {
+        256
+    } else {
+        (params.max_tokens + 16).max(256)
+    };
+
     let inference_req = InferenceRequest {
         request_id: request_id.clone(),
         prompt_tokens,
@@ -193,7 +211,7 @@ pub async fn chat_completions(
     };
 
     // Create per-request event channel
-    let (event_tx, event_rx) = mpsc::channel(256);
+    let (event_tx, event_rx) = mpsc::channel(channel_cap);
 
     let engine_req = EngineRequest {
         inference_req,
