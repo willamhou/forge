@@ -1180,7 +1180,7 @@ pub trait Backend: Send + Sync + 'static {
                 "sample_gumbel: empty logits (cols == 0)".into(),
             ));
         }
-        if !(temperature > 0.0) {
+        if temperature <= 0.0 || temperature.is_nan() {
             return Err(crate::ForgeError::InvalidArgument(
                 "sample_gumbel: temperature must be > 0 (use argmax for greedy)".into(),
             ));
@@ -1194,6 +1194,69 @@ pub trait Backend: Send + Sync + 'static {
             let mut best_i = 0usize;
             for (i, &v) in row.iter().enumerate() {
                 let key = v * inv_temp + gumbel_noise(seed, step, r as u32, i as u32);
+                if key >= best {
+                    best = key;
+                    best_i = i;
+                }
+            }
+            out.push(best_i as u32);
+        }
+        Ok(out)
+    }
+
+    /// Per-row sampling with per-sequence parameters: row `r` decodes greedily
+    /// (argmax) when `temps[r] <= 0`, else draws via Gumbel-max at that row's
+    /// temperature/seed/step. One call handles a decode batch mixing greedy and
+    /// sampled sequences. `temps`, `seeds`, `steps` all have `rows` entries.
+    /// Returns one token id per row; only those ids cross PCIe.
+    ///
+    /// Default: copy to host and reduce on CPU with the identical RNG, so the
+    /// CPU and CUDA paths agree; CUDA overrides with an on-device kernel.
+    fn sample(
+        &self,
+        logits: &Self::Tensor,
+        temps: &[f32],
+        seeds: &[u64],
+        steps: &[u32],
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "sample: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "sample: empty logits (cols == 0)".into(),
+            ));
+        }
+        if temps.len() != rows || seeds.len() != rows || steps.len() != rows {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "sample: per-row params must have {rows} entries (got temps={}, seeds={}, steps={})",
+                temps.len(),
+                seeds.len(),
+                steps.len()
+            )));
+        }
+        let host = self.copy_to_host_f32(logits)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let temp = temps[r];
+            let do_sample = temp > 0.0;
+            let inv_temp = if do_sample { 1.0 / temp } else { 0.0 };
+            let mut best = f32::NEG_INFINITY;
+            let mut best_i = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                let key = if do_sample {
+                    v * inv_temp + gumbel_noise(seeds[r], steps[r], r as u32, i as u32)
+                } else {
+                    v
+                };
                 if key >= best {
                     best = key;
                     best_i = i;

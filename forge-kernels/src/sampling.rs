@@ -157,10 +157,70 @@ macro_rules! sample_gumbel_src {
     };
 }
 
+/// Per-row sampling: each row carries its own `temp[row]`, `seed[row]`,
+/// `step[row]`. A row with `temp <= 0` decodes greedily (key = logit); a row
+/// with `temp > 0` draws via Gumbel-max (key = logit/temp + gumbel). One call
+/// thus handles a batch mixing greedy and sampled sequences — what the engine
+/// needs, since each sequence has its own sampling params.
+macro_rules! sample_perrow_src {
+    ($name:literal, $ty:literal, $load:literal) => {
+        concat!(
+            "extern \"C\" __global__ void ", $name, "(\n",
+            "    unsigned int* out_ids,\n",
+            "    const ", $ty, "* logits,\n",
+            "    unsigned int rows,\n",
+            "    unsigned int cols,\n",
+            "    const float* temps,\n",
+            "    const unsigned long long* seeds,\n",
+            "    const unsigned int* steps\n",
+            ") {\n",
+            "    unsigned int row = blockIdx.x;\n",
+            "    if (row >= rows) return;\n",
+            "    const ", $ty, "* x = logits + (size_t)row * cols;\n",
+            "    float temp = temps[row];\n",
+            "    int do_sample = (temp > 0.0f);\n",
+            "    float inv_temp = do_sample ? (1.0f / temp) : 0.0f;\n",
+            "    unsigned long long seed = seeds[row];\n",
+            "    unsigned int step = steps[row];\n",
+            "\n",
+            "    extern __shared__ unsigned char argmax_smem[];\n",
+            "    float* sval = (float*)argmax_smem;\n",
+            "    unsigned int* sidx = (unsigned int*)(sval + blockDim.x);\n",
+            "\n",
+            "    float best = __uint_as_float(0xff800000u);\n",
+            "    unsigned int best_i = 0;\n",
+            "    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
+            "        float lg = ", $load, ";\n",
+            "        float key = do_sample ? (lg * inv_temp + forge_gumbel(seed, step, row, i)) : lg;\n",
+            "        if (key >= best) { best = key; best_i = i; }\n",
+            "    }\n",
+            "    sval[threadIdx.x] = best;\n",
+            "    sidx[threadIdx.x] = best_i;\n",
+            "    __syncthreads();\n",
+            "\n",
+            "    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {\n",
+            "        if (threadIdx.x < s) {\n",
+            "            float other = sval[threadIdx.x + s];\n",
+            "            unsigned int oidx = sidx[threadIdx.x + s];\n",
+            "            if (other > sval[threadIdx.x] ||\n",
+            "                (other == sval[threadIdx.x] && oidx > sidx[threadIdx.x])) {\n",
+            "                sval[threadIdx.x] = other;\n",
+            "                sidx[threadIdx.x] = oidx;\n",
+            "            }\n",
+            "        }\n",
+            "        __syncthreads();\n",
+            "    }\n",
+            "    if (threadIdx.x == 0) out_ids[row] = sidx[0];\n",
+            "}\n",
+        )
+    };
+}
+
 pub const F32_SRC: &str = concat!(
     rng_helpers!(),
     argmax_src!("argmax_f32", "float", "x[i]"),
     sample_gumbel_src!("sample_gumbel_f32", "float", "x[i]"),
+    sample_perrow_src!("sample_perrow_f32", "float", "x[i]"),
 );
 
 // No `#include <cuda_fp16.h>` here — the backend prepends it once when
@@ -170,4 +230,5 @@ pub const F16_SRC: &str = concat!(
     rng_helpers!(),
     argmax_src!("argmax_f16", "__half", "__half2float(x[i])"),
     sample_gumbel_src!("sample_gumbel_f16", "__half", "__half2float(x[i])"),
+    sample_perrow_src!("sample_perrow_f16", "__half", "__half2float(x[i])"),
 );

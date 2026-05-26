@@ -445,12 +445,35 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let input = self.build_batch_input(&active_seqs);
         let n = active_seqs.len() as u32;
 
-        // When every sequence in the batch is greedy + unconstrained, sample
-        // with a pure device-side argmax and pull back only N token ids,
-        // skipping the [N, vocab_size] logits D2H. Any sequence needing the CPU
-        // sampler (temperature/top-k/p, penalties, FSM mask) forces the full
+        // Device-side sampling plan. Greedy (temp ≤ 0) + unconstrained seqs use
+        // argmax; temp > 0 seqs without top-k/p/min-p use on-device Gumbel-max.
+        // Either way only N token ids leave the GPU. Any seq needing the CPU
+        // sampler (top-k/p/min-p, penalties, FSM mask) forces the full
         // host-logits path for the whole batch.
         let all_argmax = active_seqs.iter().all(|s| self.decode_argmax_eligible(s));
+        let all_device = all_argmax
+            || active_seqs
+                .iter()
+                .all(|s| self.decode_argmax_eligible(s) || self.decode_gumbel_eligible(s));
+
+        // Per-row sampling params, built once (they don't depend on the logits).
+        // Only needed for the mixed greedy/Gumbel `sample` path; the all-argmax
+        // path uploads nothing.
+        let sample_params: Option<(Vec<f32>, Vec<u64>, Vec<u32>)> = if all_device && !all_argmax {
+            let mut temps = Vec::with_capacity(active_seqs.len());
+            let mut seeds = Vec::with_capacity(active_seqs.len());
+            let mut steps = Vec::with_capacity(active_seqs.len());
+            for s in &active_seqs {
+                temps.push(s.sampling_params.temperature);
+                // seed: explicit per-request seed, else derive from seq_id so
+                // each sequence still gets an independent, deterministic stream.
+                seeds.push(s.sampling_params.seed.unwrap_or(s.seq_id));
+                steps.push(self.get_generated_count(s.seq_id) as u32);
+            }
+            Some((temps, seeds, steps))
+        } else {
+            None
+        };
 
         // Run the decode forward via the CUDA-Graph capture/replay path
         // (bucketed batch sizes) or the eager forward, then produce either the
@@ -503,6 +526,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             let logits = self.model.decode_logits(state);
             if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(logits)?)
+            } else if let Some((temps, seeds, steps)) = &sample_params {
+                DecodeOut::Ids(self.backend.sample(logits, temps, seeds, steps)?)
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(logits)?)
             }
@@ -511,6 +536,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             self.backend.synchronize()?;
             if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(&output.logits)?)
+            } else if let Some((temps, seeds, steps)) = &sample_params {
+                DecodeOut::Ids(self.backend.sample(&output.logits, temps, seeds, steps)?)
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(&output.logits)?)
             }
@@ -561,6 +588,22 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     fn decode_argmax_eligible(&self, seq: &ScheduledSeq) -> bool {
         let p = &seq.sampling_params;
         p.temperature <= 0.0
+            && p.repetition_penalty == 1.0
+            && p.presence_penalty == 0.0
+            && p.frequency_penalty == 0.0
+            && !self.constraints.contains_key(&seq.seq_id)
+    }
+
+    /// Whether `seq` can be sampled with on-device Gumbel-max: temperature > 0,
+    /// no top-k/top-p/min-p filtering (not yet on the device path), no penalties
+    /// (which need the token history on host), and no FSM constraint. The
+    /// device `sample` op draws from `softmax(logits / temperature)`.
+    fn decode_gumbel_eligible(&self, seq: &ScheduledSeq) -> bool {
+        let p = &seq.sampling_params;
+        p.temperature > 0.0
+            && p.top_k.is_none()
+            && p.top_p >= 1.0
+            && p.min_p.is_none()
             && p.repetition_penalty == 1.0
             && p.presence_penalty == 0.0
             && p.frequency_penalty == 0.0

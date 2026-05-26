@@ -100,3 +100,59 @@ fn gumbel_rejects_nonpositive_temperature() {
     let logits = backend.copy_from_host_f32(&[1.0, 2.0], &[1, 2]).unwrap();
     assert!(backend.sample_gumbel(&logits, 0.0, 1, 1).is_err());
 }
+
+// ── Per-row `sample` (mixed greedy + Gumbel) ──────────────────────────
+
+#[test]
+fn sample_all_greedy_matches_argmax() {
+    // temp <= 0 on every row → pure argmax, RNG-independent.
+    let backend = CudaBackend::new(0).unwrap();
+    let data = [1.0, 2.0, 9.0, 0.0, 5.0, 1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 4.0];
+    let logits = backend.copy_from_host_f32(&data, &[3, 4]).unwrap();
+    let temps = [0.0f32; 3];
+    let seeds = [1u64; 3];
+    let steps = [0u32; 3];
+    assert_eq!(
+        backend.sample(&logits, &temps, &seeds, &steps).unwrap(),
+        backend.argmax(&logits).unwrap()
+    );
+}
+
+#[test]
+fn sample_single_row_matches_scalar_gumbel() {
+    // One row: per-row sample with temp>0 must equal the scalar sample_gumbel
+    // (both use row index 0 and the same (seed, step) RNG key).
+    let backend = CudaBackend::new(0).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[0.5, 1.0, 0.2, 0.8, 0.1, 0.9], &[1, 6])
+        .unwrap();
+    for (seed, step) in [(1u64, 0u32), (42, 7), (12345, 99)] {
+        let via_perrow = backend.sample(&logits, &[0.7], &[seed], &[step]).unwrap();
+        let via_scalar = backend.sample_gumbel(&logits, 0.7, seed, step).unwrap();
+        assert_eq!(via_perrow, via_scalar, "(seed {seed}, step {step})");
+    }
+}
+
+#[test]
+fn sample_mixed_batch_greedy_and_sampled() {
+    // row 0: greedy (temp 0) over peaked logits → index 2.
+    // row 1: sampled (temp 1) over peaked logits → peak still dominates → 0.
+    let backend = CudaBackend::new(0).unwrap();
+    let data = [
+        0.0, 0.0, 20.0, 0.0, // row 0 greedy → 2
+        20.0, 0.0, 0.0, 0.0, // row 1 sampled → 0 (peak dominates)
+    ];
+    let logits = backend.copy_from_host_f32(&data, &[2, 4]).unwrap();
+    let out = backend
+        .sample(&logits, &[0.0, 1.0], &[7, 7], &[0, 3])
+        .unwrap();
+    assert_eq!(out, vec![2, 0]);
+}
+
+#[test]
+fn sample_rejects_param_length_mismatch() {
+    let backend = CudaBackend::new(0).unwrap();
+    let logits = backend.copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+    // 2 rows but only 1 temp.
+    assert!(backend.sample(&logits, &[1.0], &[1, 2], &[0, 0]).is_err());
+}

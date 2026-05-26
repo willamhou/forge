@@ -65,6 +65,8 @@ struct KernelFunctions {
     argmax_f16: CudaFunction,
     sample_gumbel_f32: CudaFunction,
     sample_gumbel_f16: CudaFunction,
+    sample_perrow_f32: CudaFunction,
+    sample_perrow_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -260,6 +262,8 @@ impl CudaBackend {
             argmax_f16: load_f16("argmax_f16")?,
             sample_gumbel_f32: load_f32("sample_gumbel_f32")?,
             sample_gumbel_f16: load_f16("sample_gumbel_f16")?,
+            sample_perrow_f32: load_f32("sample_perrow_f32")?,
+            sample_perrow_f16: load_f16("sample_perrow_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -3338,7 +3342,7 @@ impl Backend for CudaBackend {
                 "sample_gumbel: empty logits (cols == 0)".into(),
             ));
         }
-        if !(temperature > 0.0) {
+        if temperature <= 0.0 || temperature.is_nan() {
             return Err(ForgeError::InvalidArgument(
                 "sample_gumbel: temperature must be > 0 (use argmax for greedy)".into(),
             ));
@@ -3387,6 +3391,109 @@ impl Backend for CudaBackend {
                 builder.arg(&inv_temp);
                 builder.arg(&seed);
                 builder.arg(&step);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+
+        self.stream
+            .memcpy_dtov(&out_ids)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// On-device per-row sampling (see [`Backend::sample`]): one block per row,
+    /// greedy (argmax) when `temps[row] <= 0` else Gumbel-max. The per-row
+    /// params are uploaded to small device buffers (sampling runs outside any
+    /// captured region, so no staging is needed).
+    fn sample(
+        &self,
+        logits: &CudaTensor,
+        temps: &[f32],
+        seeds: &[u64],
+        steps: &[u32],
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1usize, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "sample: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "sample: empty logits (cols == 0)".into(),
+            ));
+        }
+        if temps.len() != rows || seeds.len() != rows || steps.len() != rows {
+            return Err(ForgeError::InvalidArgument(format!(
+                "sample: per-row params must have {rows} entries (got temps={}, seeds={}, steps={})",
+                temps.len(),
+                seeds.len(),
+                steps.len()
+            )));
+        }
+
+        let temps_dev = self
+            .stream
+            .memcpy_stod(temps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let seeds_dev = self
+            .stream
+            .memcpy_stod(seeds)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let steps_dev = self
+            .stream
+            .memcpy_stod(steps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let mut out_ids = self
+            .stream
+            .alloc_zeros::<u32>(rows)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let block_dim = next_power_of_2(256u32.min(cols as u32)).max(1);
+        let shared_mem = block_dim * 8; // f32 value + u32 index per thread
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        match logits.dtype() {
+            DType::F32 => {
+                let l = logits.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_perrow_f32);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&temps_dev);
+                builder.arg(&seeds_dev);
+                builder.arg(&steps_dev);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let l = logits.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_perrow_f16);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&temps_dev);
+                builder.arg(&seeds_dev);
+                builder.arg(&steps_dev);
                 unsafe {
                     builder
                         .launch(launch_cfg)
