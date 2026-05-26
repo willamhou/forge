@@ -112,6 +112,11 @@ pub struct LlamaPersistentBuffers<B: Backend> {
     pub q_4d: B::Tensor,
     /// K reshaped to 4D for RoPE input. `[1, N, num_kv_heads, head_dim]`.
     pub k_4d: B::Tensor,
+    /// Q after Qwen3 QK-norm, 4D (RoPE input when q_norm is present). Unused
+    /// for models without QK-norm. `[1, N, num_heads, head_dim]`.
+    pub q_normed_4d: B::Tensor,
+    /// K after Qwen3 QK-norm, 4D. `[1, N, num_kv_heads, head_dim]`.
+    pub k_normed_4d: B::Tensor,
     /// Q post-RoPE, 4D. `[1, N, num_heads, head_dim]`.
     pub q_rotated_4d: B::Tensor,
     /// K post-RoPE, 4D. `[1, N, num_kv_heads, head_dim]`.
@@ -220,6 +225,10 @@ impl<B: Backend> LlamaPersistentBuffers<B> {
             q_4d: backend
                 .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
             k_4d: backend
+                .allocate_zeros(&[1, n, config.num_key_value_heads, config.head_dim], dt)?,
+            q_normed_4d: backend
+                .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
+            k_normed_4d: backend
                 .allocate_zeros(&[1, n, config.num_key_value_heads, config.head_dim], dt)?,
             q_rotated_4d: backend
                 .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,

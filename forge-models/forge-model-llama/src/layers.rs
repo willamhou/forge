@@ -79,6 +79,11 @@ pub struct LlamaAttention<B: Backend> {
     /// Optional fused QKV bias `[q_proj_size + 2 * kv_proj_size]`. Present
     /// for Qwen2-family models (q/k/v_proj have bias); `None` for Llama.
     qkv_bias: Option<B::Tensor>,
+    /// Optional per-head RMSNorm on Q / K before RoPE (Qwen3 `q_norm`/`k_norm`,
+    /// each `[head_dim]`). `None` for Llama/Qwen2. Applied to every head's
+    /// `head_dim` slice independently.
+    q_norm: Option<RMSNorm<B>>,
+    k_norm: Option<RMSNorm<B>>,
     wo: B::Tensor,
     num_heads: usize,
     num_kv_heads: usize,
@@ -103,12 +108,49 @@ impl<B: Backend> LlamaAttention<B> {
         Self {
             wqkv,
             qkv_bias,
+            q_norm: None,
+            k_norm: None,
             wo,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             q_proj_size: config.num_attention_heads * config.head_dim,
             kv_proj_size: config.num_key_value_heads * config.head_dim,
+        }
+    }
+
+    /// Attach Qwen3 per-head QK-norm (RMSNorm on Q / K over `head_dim`,
+    /// applied before RoPE). No-op for models without it.
+    pub fn with_qk_norm(mut self, q_norm: Option<RMSNorm<B>>, k_norm: Option<RMSNorm<B>>) -> Self {
+        self.q_norm = q_norm;
+        self.k_norm = k_norm;
+        self
+    }
+
+    /// Apply Qwen3 Q-norm (per-head RMSNorm over `head_dim`) to a 4D tensor
+    /// `[1, n, num_heads, head_dim]`. Reshapes to `[n*num_heads, head_dim]` so
+    /// each head is normalised independently, then back. No-op without q_norm.
+    /// (Allocating; eager paths only — the capture path uses `*_into`.)
+    fn maybe_q_norm(&self, q: B::Tensor, n: usize, backend: &B) -> Result<B::Tensor> {
+        match &self.q_norm {
+            Some(qn) => {
+                let flat = backend.reshape(&q, &[n * self.num_heads, self.head_dim])?;
+                let normed = backend.rms_norm(&flat, &qn.weight, qn.eps)?;
+                backend.reshape(&normed, &[1, n, self.num_heads, self.head_dim])
+            }
+            None => Ok(q),
+        }
+    }
+
+    /// K-norm sibling of [`Self::maybe_q_norm`] (uses `num_kv_heads`).
+    fn maybe_k_norm(&self, k: B::Tensor, n: usize, backend: &B) -> Result<B::Tensor> {
+        match &self.k_norm {
+            Some(kn) => {
+                let flat = backend.reshape(&k, &[n * self.num_kv_heads, self.head_dim])?;
+                let normed = backend.rms_norm(&flat, &kn.weight, kn.eps)?;
+                backend.reshape(&normed, &[1, n, self.num_kv_heads, self.head_dim])
+            }
+            None => Ok(k),
         }
     }
 
@@ -156,7 +198,9 @@ impl<B: Backend> LlamaAttention<B> {
         let k = backend.reshape(&k, &[1, seq_len, self.num_kv_heads, self.head_dim])?;
         let v = backend.reshape(&v, &[1, seq_len, self.num_kv_heads, self.head_dim])?;
 
-        // Apply RoPE with position offset
+        // Qwen3 QK-norm (no-op otherwise), then RoPE with position offset.
+        let q = self.maybe_q_norm(q, seq_len, backend)?;
+        let k = self.maybe_k_norm(k, seq_len, backend)?;
         let q = rope_freqs.apply_with_offset(&q, pos_offset, backend)?;
         let k = rope_freqs.apply_with_offset(&k, pos_offset, backend)?;
 
@@ -224,7 +268,9 @@ impl<B: Backend> LlamaAttention<B> {
         let q = backend.reshape(&q, &[1, n, self.num_heads, self.head_dim])?;
         let k = backend.reshape(&k, &[1, n, self.num_kv_heads, self.head_dim])?;
 
-        // Apply RoPE with per-token positions
+        // Qwen3 QK-norm (no-op otherwise), then RoPE with per-token positions.
+        let q = self.maybe_q_norm(q, n, backend)?;
+        let k = self.maybe_k_norm(k, n, backend)?;
         let q = rope_freqs.apply_with_positions(&q, positions, backend)?;
         let k = rope_freqs.apply_with_positions(&k, positions, backend)?;
 
@@ -345,16 +391,36 @@ impl<B: Backend> LlamaAttention<B> {
             &[1, n, self.num_kv_heads, self.head_dim],
         )?;
 
+        // Qwen3 QK-norm (per-head RMSNorm over head_dim) into the normed
+        // buffers, then RoPE reads those; without QK-norm RoPE reads q_4d/k_4d
+        // directly. The norm weights are static, so this stays capture-safe.
+        if let Some(qn) = &self.q_norm {
+            backend.rms_norm_into(&mut buffers.q_normed_4d, &buffers.q_4d, &qn.weight, qn.eps)?;
+        }
+        if let Some(kn) = &self.k_norm {
+            backend.rms_norm_into(&mut buffers.k_normed_4d, &buffers.k_4d, &kn.weight, kn.eps)?;
+        }
+        let q_rope_src = if self.q_norm.is_some() {
+            &buffers.q_normed_4d
+        } else {
+            &buffers.q_4d
+        };
+        let k_rope_src = if self.k_norm.is_some() {
+            &buffers.k_normed_4d
+        } else {
+            &buffers.k_4d
+        };
+
         // Apply RoPE with per-token positions.
         rope_freqs.apply_with_positions_into(
             &mut buffers.q_rotated_4d,
-            &buffers.q_4d,
+            q_rope_src,
             positions,
             backend,
         )?;
         rope_freqs.apply_with_positions_into(
             &mut buffers.k_rotated_4d,
-            &buffers.k_4d,
+            k_rope_src,
             positions,
             backend,
         )?;

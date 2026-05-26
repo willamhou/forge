@@ -798,6 +798,7 @@ dependencies = [
  "forge-transport",
  "http-body-util",
  "minijinja",
+ "minijinja-contrib",
  "serde",
  "serde_json",
  "tokenizers",
@@ -1249,6 +1250,16 @@ checksum = "b479616bb6f0779fb0f3964246beda02d4b01144e1b0d5519616e012ccc2a245"
 dependencies = [
  "memo-map",
  "self_cell",
+ "serde",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7826089e6af7bc638f69a44b100ebe7f6c64b182cfde16558d5cd38ac8adde20"
+dependencies = [
+ "minijinja",
  "serde",
 ]
 

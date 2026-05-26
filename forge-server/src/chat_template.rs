@@ -32,6 +32,10 @@ impl ChatTemplate {
         eos_token: &str,
     ) -> Result<Self> {
         let mut env = Environment::new();
+        // HF chat templates (Qwen3, Llama-3, …) call Python string methods like
+        // `.startswith()` / `.endswith()`. minijinja doesn't implement these
+        // natively; the contrib `pycompat` callback adds them.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template_owned("chat", template_str.to_string())
             .map_err(|e| ForgeError::Internal(format!("Template parse error: {e}")))?;
         Ok(Self {
