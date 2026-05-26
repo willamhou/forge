@@ -8,4 +8,4 @@ pub mod rope;
 
 pub use loader::load_llama_model;
 pub use model::LlamaModel;
-pub use persistent_buffers::LlamaPersistentBuffers;
+pub use persistent_buffers::{LlamaDecodeState, LlamaPersistentBuffers, StagedDecodeMeta};

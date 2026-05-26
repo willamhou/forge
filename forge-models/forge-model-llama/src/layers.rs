@@ -1,6 +1,6 @@
 use forge_core::{Backend, ForgeError, KvCache, ModelConfig, Result, Tensor};
 
-use crate::persistent_buffers::LlamaPersistentBuffers;
+use crate::persistent_buffers::{LlamaPersistentBuffers, StagedDecodeMeta};
 use crate::rope::RopeFreqs;
 
 /// RMS normalization layer.
@@ -19,12 +19,7 @@ impl<B: Backend> RMSNorm<B> {
     }
 
     /// Persistent-buffer variant — writes into a caller-provided `out`.
-    pub fn forward_into(
-        &self,
-        out: &mut B::Tensor,
-        x: &B::Tensor,
-        backend: &B,
-    ) -> Result<()> {
+    pub fn forward_into(&self, out: &mut B::Tensor, x: &B::Tensor, backend: &B) -> Result<()> {
         backend.rms_norm_into(out, x, &self.weight, self.eps)
     }
 }
@@ -65,11 +60,7 @@ impl<B: Backend> LlamaMLP<B> {
     /// Reading via the buffers struct (vs an `x: &B::Tensor` parameter)
     /// lets us use disjoint &mut/& borrows on buffer fields and avoids
     /// the borrow-checker conflict that an explicit `x` would create.
-    pub fn forward_into(
-        &self,
-        buffers: &mut LlamaPersistentBuffers<B>,
-        backend: &B,
-    ) -> Result<()> {
+    pub fn forward_into(&self, buffers: &mut LlamaPersistentBuffers<B>, backend: &B) -> Result<()> {
         backend.matmul_into(&mut buffers.gate, &buffers.normed, &self.gate_proj)?;
         backend.matmul_into(&mut buffers.up, &buffers.normed, &self.up_proj)?;
         backend.fused_silu_mul_into(&mut buffers.silu_mul, &buffers.gate, &buffers.up)?;
@@ -84,7 +75,7 @@ impl<B: Backend> LlamaMLP<B> {
 /// KV cache is used: during prefill, K/V are appended to cache; during decode,
 /// cached K/V are retrieved so attention sees the full context.
 pub struct LlamaAttention<B: Backend> {
-    wqkv: B::Tensor,    // [hidden_size, q_proj_size + 2 * kv_proj_size]
+    wqkv: B::Tensor, // [hidden_size, q_proj_size + 2 * kv_proj_size]
     /// Optional fused QKV bias `[q_proj_size + 2 * kv_proj_size]`. Present
     /// for Qwen2-family models (q/k/v_proj have bias); `None` for Llama.
     qkv_bias: Option<B::Tensor>,
@@ -98,11 +89,7 @@ pub struct LlamaAttention<B: Backend> {
 
 impl<B: Backend> LlamaAttention<B> {
     /// Construct without QKV bias (Llama).
-    pub fn new(
-        wqkv: B::Tensor,
-        wo: B::Tensor,
-        config: &ModelConfig,
-    ) -> Self {
+    pub fn new(wqkv: B::Tensor, wo: B::Tensor, config: &ModelConfig) -> Self {
         Self::new_with_bias(wqkv, None, wo, config)
     }
 
@@ -186,9 +173,14 @@ impl<B: Backend> LlamaAttention<B> {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let is_causal = seq_len > 1;
         let attn_out = backend.multi_head_attention(
-            &q, &k_4d, &v_4d,
-            self.num_heads, self.num_kv_heads, self.head_dim,
-            scale, is_causal,
+            &q,
+            &k_4d,
+            &v_4d,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            scale,
+            is_causal,
         )?;
 
         // Cast attention output to match weight dtype (naive attention produces F32,
@@ -308,14 +300,14 @@ impl<B: Backend> LlamaAttention<B> {
     pub fn forward_batch_into(
         &self,
         rope_freqs: &RopeFreqs<B>,
-        positions: &[u32],
-        seq_ids: &[u64],
+        meta: &StagedDecodeMeta,
         kv_cache: &mut dyn KvCache<T = B::Tensor>,
         layer_idx: usize,
         buffers: &mut LlamaPersistentBuffers<B>,
         backend: &B,
     ) -> Result<()> {
         let n = buffers.batch_size;
+        let positions = &meta.positions;
 
         // QKV bias not yet supported in the persistent-buffer (capture) path —
         // would need an add_bias_into op + a buffer for the biased qkv. The
@@ -378,21 +370,27 @@ impl<B: Backend> LlamaAttention<B> {
             &[n, self.num_kv_heads * self.head_dim],
         )?;
 
-        // Per-token KV cache append via persistent k_row/v_row buffers.
-        for i in 0..n {
-            backend.slice_rows_into(&mut buffers.k_rows[i], &buffers.k_rotated_2d, i, 1)?;
-            backend.slice_rows_into(&mut buffers.v_rows[i], &buffers.v_2d, i, 1)?;
-            kv_cache.append(seq_ids[i], layer_idx, &buffers.k_rows[i], &buffers.v_rows[i])?;
-        }
+        // Capture-safe KV write: scatter all N new rows into this layer's pool
+        // at the slots staged by `stage_decode` (rotated K, un-rotated V). On
+        // CUDA this reads a device-resident slot scratch (no host pointer baked
+        // into the captured graph); the host `slot_mapping` is used only by the
+        // CPU fallback. Replaces the old per-token `append` loop.
+        kv_cache.scatter_decode(
+            layer_idx,
+            &buffers.k_rotated_2d,
+            &buffers.v_2d,
+            &meta.slot_mapping,
+            n,
+        )?;
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Paged attention — required for the persistent-buffer path. We
-        // route through `paged_attention_into` (Task 5c.5 promoted from
-        // CudaBackend inherent to Backend trait) so the captured kernel's
-        // output arg points at `buffers.attn_out`'s stable device address.
+        // Paged attention. We borrow the device-resident pool tensors from the
+        // cache but feed the *staged* fixed-width block_tables / kv_lens (not
+        // the cache's per-step dynamic ones) so the captured kernel's metadata
+        // buffer size is stable across replays.
         let inputs = kv_cache
-            .paged_attention_inputs(layer_idx, seq_ids)?
+            .paged_attention_inputs(layer_idx, &meta.seq_ids)?
             .ok_or_else(|| {
                 ForgeError::InvalidArgument(
                     "forward_batch_into requires a paged KV cache (PagedKvCache); \
@@ -405,9 +403,9 @@ impl<B: Backend> LlamaAttention<B> {
             &buffers.q_rotated_2d,
             inputs.k_pool,
             inputs.v_pool,
-            &inputs.block_tables,
-            &inputs.kv_lens,
-            inputs.max_blocks_per_seq,
+            &meta.block_tables,
+            &meta.kv_lens,
+            meta.max_blocks_per_seq,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -421,7 +419,6 @@ impl<B: Backend> LlamaAttention<B> {
         backend.matmul_into(&mut buffers.attn_proj, &buffers.attn_out_cast, &self.wo)?;
         Ok(())
     }
-
 }
 
 /// A single Llama decoder layer (attention + MLP with residual connections).
@@ -460,13 +457,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         // Pre-attention norm + attention + residual
         let normed = self.input_layernorm.forward(x, backend)?;
         let attn_out = self.self_attn.forward(
-            &normed,
-            rope_freqs,
-            pos_offset,
-            kv_cache,
-            seq_id,
-            layer_idx,
-            backend,
+            &normed, rope_freqs, pos_offset, kv_cache, seq_id, layer_idx, backend,
         )?;
 
         // Fused residual add + post-attention norm
@@ -489,8 +480,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
     pub fn forward_batch_into(
         &self,
         rope_freqs: &RopeFreqs<B>,
-        positions: &[u32],
-        seq_ids: &[u64],
+        meta: &StagedDecodeMeta,
         kv_cache: &mut dyn KvCache<T = B::Tensor>,
         layer_idx: usize,
         buffers: &mut LlamaPersistentBuffers<B>,
@@ -506,15 +496,8 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         )?;
 
         // Attention reads buffers.normed (by convention), writes buffers.attn_proj.
-        self.self_attn.forward_batch_into(
-            rope_freqs,
-            positions,
-            seq_ids,
-            kv_cache,
-            layer_idx,
-            buffers,
-            backend,
-        )?;
+        self.self_attn
+            .forward_batch_into(rope_freqs, meta, kv_cache, layer_idx, buffers, backend)?;
 
         // Fused residual + post-attn norm:
         //   buffers.normed = rms_norm(buffers.attn_proj + buffers.hidden)
@@ -559,13 +542,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         // Pre-attention norm + batched attention + residual
         let normed = self.input_layernorm.forward(x, backend)?;
         let attn_out = self.self_attn.forward_batch(
-            &normed,
-            rope_freqs,
-            positions,
-            seq_ids,
-            kv_cache,
-            layer_idx,
-            backend,
+            &normed, rope_freqs, positions, seq_ids, kv_cache, layer_idx, backend,
         )?;
 
         // Fused residual add + post-attention norm

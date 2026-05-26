@@ -23,6 +23,62 @@
 
 use forge_core::{Backend, DType, ModelConfig, Result};
 
+/// Staged per-step decode metadata: computed host-side in
+/// [`LlamaModel::stage_decode`](crate::LlamaModel) and read by the
+/// capture-safe [`LlamaModel::compute_decode`](crate::LlamaModel) kernel
+/// sequence. Shapes are fixed across steps (block-table width anchored to the
+/// model's max context) so a captured graph's metadata buffers never resize.
+pub struct StagedDecodeMeta {
+    /// Absolute position of each sequence's new token (`[batch]`).
+    pub positions: Vec<u32>,
+    /// Sequence ids, in batch order (`[batch]`).
+    pub seq_ids: Vec<u64>,
+    /// Absolute pool slot for each sequence's new token (`[batch]`).
+    pub slot_mapping: Vec<i32>,
+    /// Row-major paged block tables (`[batch * max_blocks_per_seq]`, `-1` pad).
+    pub block_tables: Vec<i32>,
+    /// Per-sequence KV length after this step's append (`[batch]`).
+    pub kv_lens: Vec<i32>,
+    /// Fixed stride of `block_tables`.
+    pub max_blocks_per_seq: usize,
+}
+
+impl StagedDecodeMeta {
+    fn empty() -> Self {
+        Self {
+            positions: Vec::new(),
+            seq_ids: Vec::new(),
+            slot_mapping: Vec::new(),
+            block_tables: Vec::new(),
+            kv_lens: Vec::new(),
+            max_blocks_per_seq: 0,
+        }
+    }
+}
+
+/// Per-batch decode state: persistent activation buffers plus the per-step
+/// inputs that [`LlamaModel::stage_decode`](crate::LlamaModel) refreshes and
+/// [`LlamaModel::compute_decode`](crate::LlamaModel) reads. This is the
+/// `Model::DecodeState` for Llama.
+pub struct LlamaDecodeState<B: Backend> {
+    /// Persistent activation + logits buffers.
+    pub buffers: LlamaPersistentBuffers<B>,
+    /// This step's token ids (`[batch]`), staged for the embedding lookup.
+    pub token_ids: Vec<u32>,
+    /// This step's staged metadata.
+    pub meta: StagedDecodeMeta,
+}
+
+impl<B: Backend> LlamaDecodeState<B> {
+    pub fn new(buffers: LlamaPersistentBuffers<B>) -> Self {
+        Self {
+            buffers,
+            token_ids: Vec::new(),
+            meta: StagedDecodeMeta::empty(),
+        }
+    }
+}
+
 /// Per-batch persistent buffers for [`LlamaModel::forward_into`].
 ///
 /// Construct once with [`Self::new`] for a fixed `batch_size`; pass the
@@ -161,22 +217,14 @@ impl<B: Backend> LlamaPersistentBuffers<B> {
             q_2d: backend.allocate_zeros(&[n, q_size], dt)?,
             k_2d: backend.allocate_zeros(&[n, kv_size], dt)?,
             v_2d: backend.allocate_zeros(&[n, kv_size], dt)?,
-            q_4d: backend.allocate_zeros(
-                &[1, n, config.num_attention_heads, config.head_dim],
-                dt,
-            )?,
-            k_4d: backend.allocate_zeros(
-                &[1, n, config.num_key_value_heads, config.head_dim],
-                dt,
-            )?,
-            q_rotated_4d: backend.allocate_zeros(
-                &[1, n, config.num_attention_heads, config.head_dim],
-                dt,
-            )?,
-            k_rotated_4d: backend.allocate_zeros(
-                &[1, n, config.num_key_value_heads, config.head_dim],
-                dt,
-            )?,
+            q_4d: backend
+                .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
+            k_4d: backend
+                .allocate_zeros(&[1, n, config.num_key_value_heads, config.head_dim], dt)?,
+            q_rotated_4d: backend
+                .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
+            k_rotated_4d: backend
+                .allocate_zeros(&[1, n, config.num_key_value_heads, config.head_dim], dt)?,
             q_rotated_2d: backend.allocate_zeros(&[n, q_size], dt)?,
             k_rotated_2d: backend.allocate_zeros(&[n, kv_size], dt)?,
             k_rows,
@@ -205,11 +253,7 @@ impl<B: Backend> LlamaPersistentBuffers<B> {
     /// production norm).
     ///
     /// Equivalent to [`Self::new`] with `wo_dtype = lm_head_dtype = config.dtype`.
-    pub fn new_uniform(
-        backend: &B,
-        config: &ModelConfig,
-        batch_size: usize,
-    ) -> Result<Self> {
+    pub fn new_uniform(backend: &B, config: &ModelConfig, batch_size: usize) -> Result<Self> {
         Self::new(backend, config, batch_size, config.dtype, config.dtype)
     }
 }

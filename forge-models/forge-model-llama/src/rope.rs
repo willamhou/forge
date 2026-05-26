@@ -28,8 +28,7 @@ impl<B: Backend> RopeFreqs<B> {
 
         for pos in 0..max_seq_len {
             for i in 0..half_dim {
-                let freq = (pos as f64)
-                    / theta.powf(2.0 * (i as f64) / (head_dim as f64));
+                let freq = (pos as f64) / theta.powf(2.0 * (i as f64) / (head_dim as f64));
                 cos_data.push(freq.cos() as f32);
                 sin_data.push(freq.sin() as f32);
             }
@@ -134,10 +133,20 @@ impl<B: Backend> RopeFreqs<B> {
             )));
         }
 
-        // Gather cos/sin rows by position index
-        let mut cos_data = Vec::with_capacity(seq_len * self.half_dim);
-        let mut sin_data = Vec::with_capacity(seq_len * self.half_dim);
+        let (cos_data, sin_data) = self.gather_host_freqs(positions)?;
+        backend.rope_with_host_freqs_into(out, x, &cos_data, &sin_data)
+    }
 
+    /// Gather the cos/sin table rows for arbitrary per-token positions,
+    /// returning the flattened `[positions.len() * head_dim/2]` host vectors.
+    ///
+    /// The capture-safe decode path stages these into the backend (via
+    /// [`Backend::stage_decode_inputs`](forge_core::Backend::stage_decode_inputs))
+    /// before launching a replayed graph, so the captured RoPE kernel reads
+    /// the current step's frequencies.
+    pub fn gather_host_freqs(&self, positions: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut cos_data = Vec::with_capacity(positions.len() * self.half_dim);
+        let mut sin_data = Vec::with_capacity(positions.len() * self.half_dim);
         for &pos in positions {
             let pos = pos as usize;
             if pos >= self.max_seq_len {
@@ -151,8 +160,7 @@ impl<B: Backend> RopeFreqs<B> {
             cos_data.extend_from_slice(&self.cos_host[start..end]);
             sin_data.extend_from_slice(&self.sin_host[start..end]);
         }
-
-        backend.rope_with_host_freqs_into(out, x, &cos_data, &sin_data)
+        Ok((cos_data, sin_data))
     }
 }
 
@@ -186,17 +194,13 @@ mod tests {
 
         // [1, 3, num_heads=2, head_dim=4] = 24 elements
         let x_data: Vec<f32> = (0..24).map(|i| (i as f32) * 0.05).collect();
-        let x = backend
-            .copy_from_host_f32(&x_data, &[1, 3, 2, 4])
-            .unwrap();
+        let x = backend.copy_from_host_f32(&x_data, &[1, 3, 2, 4]).unwrap();
         let positions: Vec<u32> = vec![0, 1, 5];
 
         let out_alloc = rope.apply_with_positions(&x, &positions, &backend).unwrap();
         let alloc_host = backend.copy_to_host_f32(&out_alloc).unwrap();
 
-        let mut out_into = backend
-            .allocate_zeros(&[1, 3, 2, 4], DType::F32)
-            .unwrap();
+        let mut out_into = backend.allocate_zeros(&[1, 3, 2, 4], DType::F32).unwrap();
         rope.apply_with_positions_into(&mut out_into, &x, &positions, &backend)
             .unwrap();
         let into_host = backend.copy_to_host_f32(&out_into).unwrap();
@@ -212,9 +216,7 @@ mod tests {
         let x = backend
             .copy_from_host_f32(&vec![0.0; 24], &[1, 3, 2, 4])
             .unwrap();
-        let mut out = backend
-            .allocate_zeros(&[1, 3, 2, 4], DType::F32)
-            .unwrap();
+        let mut out = backend.allocate_zeros(&[1, 3, 2, 4], DType::F32).unwrap();
         // positions length != seq_len → error
         let _ = rope
             .apply_with_positions_into(&mut out, &x, &[0, 1], &backend)
