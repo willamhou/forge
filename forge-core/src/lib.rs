@@ -9,7 +9,7 @@ pub mod scheduler;
 pub mod tensor;
 pub mod types;
 
-pub use backend::Backend;
+pub use backend::{Backend, DecodeGraphDispatch, DecodeStageInputs};
 pub use error::{ForgeError, Result};
 pub use kvcache::{CacheUsage, KvCache, PagedAttentionInputs};
 pub use model::{Model, ModelOutput};

@@ -1,6 +1,49 @@
 use crate::tensor::Tensor;
 use crate::{DType, Result};
 
+/// Per-step decode inputs the engine stages into backend-persistent scratch
+/// buffers before a captured/replayed decode forward (see
+/// [`Backend::stage_decode_inputs`]). On replay the captured graph re-reads
+/// these scratches, so they must hold the *current* step's data — staging
+/// runs every step, outside the captured region.
+///
+/// All slices are host-side; the backend uploads them to stable device
+/// addresses. `slot_mapping` is staged separately via
+/// [`Backend::stage_slot_mapping`] because the KV scatter consumes it directly.
+pub struct DecodeStageInputs<'a> {
+    /// Flattened token ids, one per sequence (`[batch]`).
+    pub token_indices: &'a [u32],
+    /// Gathered RoPE cos table rows for this step's positions
+    /// (`[batch * head_dim/2]`).
+    pub rope_cos: &'a [f32],
+    /// Gathered RoPE sin table rows, same shape as `rope_cos`.
+    pub rope_sin: &'a [f32],
+    /// Row-major paged block tables (`[batch * max_blocks_per_seq]`, `-1` pad).
+    pub block_tables: &'a [i32],
+    /// Per-sequence KV length (`[batch]`).
+    pub kv_lens: &'a [i32],
+}
+
+/// Backend-specific captured-graph dispatcher for batched decode.
+///
+/// CPU and other graph-less backends have none ([`Backend::make_decode_graph_runner`]
+/// returns `None`); CUDA wraps a per-bucket capture/replay cache. The engine
+/// drives it once per decode step.
+pub trait DecodeGraphDispatch: Send {
+    /// Run a decode forward of `batch_size`:
+    /// - **bucket cache hit** → replay the captured graph (`fwd` is NOT called);
+    /// - **bucket cold** → capture `fwd` into a graph, then launch it once;
+    /// - **non-bucket size** → run `fwd` directly (uncaptured fallback).
+    ///
+    /// `fwd` must issue only capture-safe work (no host→device copies, stable
+    /// device pointers) — i.e. the pre-staged `Model::compute_decode`.
+    fn dispatch(&mut self, batch_size: u32, fwd: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+
+    /// Drop all captured graphs. Called by the engine when the backend's
+    /// [`Backend::decode_capture_epoch`] changes (a baked device pointer moved).
+    fn invalidate_all(&mut self);
+}
+
 pub trait Backend: Send + Sync + 'static {
     type Tensor: Tensor;
 
@@ -124,12 +167,7 @@ pub trait Backend: Send + Sync + 'static {
     /// Element-wise add, writing into a caller-provided output buffer.
     /// Out shape + dtype must match both inputs.
     /// See [`Self::matmul_into`] for the capture-stability contract.
-    fn add_into(
-        &self,
-        out: &mut Self::Tensor,
-        a: &Self::Tensor,
-        b: &Self::Tensor,
-    ) -> Result<()> {
+    fn add_into(&self, out: &mut Self::Tensor, a: &Self::Tensor, b: &Self::Tensor) -> Result<()> {
         if a.shape() != b.shape() {
             return Err(crate::ForgeError::ShapeMismatch {
                 expected: a.shape().to_vec(),
@@ -399,12 +437,7 @@ pub trait Backend: Send + Sync + 'static {
         self.mul(&activated, up)
     }
 
-    fn rms_norm(
-        &self,
-        x: &Self::Tensor,
-        weight: &Self::Tensor,
-        eps: f32,
-    ) -> Result<Self::Tensor>;
+    fn rms_norm(&self, x: &Self::Tensor, weight: &Self::Tensor, eps: f32) -> Result<Self::Tensor>;
 
     /// Fused residual addition + RMSNorm.
     /// Returns (normalized, updated_residual) where:
@@ -842,8 +875,11 @@ pub trait Backend: Send + Sync + 'static {
                     )));
                 }
             }
-            let block_ids: Vec<usize> =
-                row.iter().take(blocks_needed).map(|&id| id as usize).collect();
+            let block_ids: Vec<usize> = row
+                .iter()
+                .take(blocks_needed)
+                .map(|&id| id as usize)
+                .collect();
             k_caches.push(self.paged_gather_kv(k_pool, &block_ids, kv_len)?);
             v_caches.push(self.paged_gather_kv(v_pool, &block_ids, kv_len)?);
         }
@@ -1042,5 +1078,61 @@ pub trait Backend: Send + Sync + 'static {
             }
         }
         self.copy_from_host_f32(&result, &[seq_len, num_heads * head_dim])
+    }
+
+    /// Stage one decode step's per-step inputs (token ids, RoPE freqs, paged
+    /// block tables, KV lengths) into persistent device scratch buffers, so a
+    /// replayed captured [`Model::compute_decode`](crate::Model::compute_decode)
+    /// graph re-reads fresh data. Runs every decode step, OUTSIDE any captured
+    /// region.
+    ///
+    /// Default: no-op — backends without graph capture (CPU) read these inputs
+    /// directly during compute, so nothing needs pre-staging.
+    fn stage_decode_inputs(&self, _inputs: &DecodeStageInputs) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stage the per-step KV-write slot mapping. Capture-safe backends upload
+    /// it to a persistent device scratch (call OUTSIDE the captured region);
+    /// the captured [`Self::scatter_kv`] then reads that scratch. Returns the
+    /// staged length.
+    ///
+    /// Default: no-op store — the host-fallback [`Self::scatter_kv`] uses the
+    /// `slot_mapping` slice it is handed directly.
+    fn stage_slot_mapping(&self, slot_mapping: &[i32]) -> Result<usize> {
+        Ok(slot_mapping.len())
+    }
+
+    /// Capture-safe decode KV write: scatter the first `n_rows` rows of `src`
+    /// into `pool` (`[num_blocks, block_size, kv_dim]`) at the given slots.
+    ///
+    /// `slot_mapping` is the host-side mapping consumed by the default impl;
+    /// capture-safe backends (CUDA) ignore it and read the device scratch
+    /// previously filled by [`Self::stage_slot_mapping`], so the scatter is a
+    /// pure kernel launch with no baked host pointer.
+    fn scatter_kv(
+        &self,
+        pool: &mut Self::Tensor,
+        src: &Self::Tensor,
+        slot_mapping: &[i32],
+        n_rows: usize,
+    ) -> Result<()> {
+        self.paged_write_kv(pool, src, &slot_mapping[..n_rows])
+    }
+
+    /// Build a captured-graph decode dispatcher for the given batch-size
+    /// `buckets`, or `None` if this backend has no CUDA-Graph support
+    /// (CPU). Default: `None` — the engine then always runs the eager
+    /// decode path.
+    fn make_decode_graph_runner(&self, _buckets: &[u32]) -> Option<Box<dyn DecodeGraphDispatch>> {
+        None
+    }
+
+    /// Monotonic epoch that bumps whenever a persistent device pointer a
+    /// captured decode graph could have baked may have moved (a scratch or
+    /// pool reallocated on grow). The engine invalidates captured graphs
+    /// when this value changes. Default: `0` (never invalidates).
+    fn decode_capture_epoch(&self) -> u64 {
+        0
     }
 }
