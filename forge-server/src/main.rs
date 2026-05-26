@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use forge_backend_cpu::CpuBackend;
@@ -64,6 +64,37 @@ struct Cli {
     /// Total number of KV cache blocks (paged cache only)
     #[arg(long, default_value = "2048")]
     num_blocks: usize,
+
+    /// Enable CUDA-Graph capture for batched decode (CUDA + paged cache only;
+    /// a no-op otherwise). Off by default.
+    #[arg(long, default_value = "false")]
+    cuda_graph: bool,
+
+    /// Comma-separated batch-size buckets to capture decode graphs for.
+    #[arg(long, default_value = "1,2,4,8,16,32")]
+    cuda_graph_buckets: String,
+}
+
+/// Parse a comma-separated list of positive batch-size buckets.
+fn parse_buckets(s: &str) -> anyhow::Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let b: u32 = part
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid bucket '{part}' in --cuda-graph-buckets"))?;
+        if b == 0 {
+            anyhow::bail!("--cuda-graph-buckets entries must be >= 1");
+        }
+        out.push(b);
+    }
+    if out.is_empty() {
+        anyhow::bail!("--cuda-graph-buckets must list at least one bucket");
+    }
+    Ok(out)
 }
 
 #[tokio::main]
@@ -161,7 +192,10 @@ async fn run_server<B: Backend + Clone>(
                     model_config.num_hidden_layers,
                     cli.max_batch_size,
                 );
-                info!("Naive KV cache (CPU-side, max {} sequences)", cli.max_batch_size);
+                info!(
+                    "Naive KV cache (CPU-side, max {} sequences)",
+                    cli.max_batch_size
+                );
                 Box::new(cache)
             }
             other => anyhow::bail!("Unknown kv-cache type: {other}. Use 'naive' or 'paged'."),
@@ -184,14 +218,21 @@ async fn run_server<B: Backend + Clone>(
     let decode_fn: std::sync::Arc<dyn Fn(&[u32]) -> Option<String> + Send + Sync> =
         std::sync::Arc::new(move |ids: &[u32]| decode_tokenizer.decode(ids).ok());
 
-    let mut engine = Engine::new(
-        model,
-        backend,
-        Box::new(scheduler),
-        kv_cache,
-        request_rx,
-    )
-    .with_decode_fn(decode_fn);
+    let mut engine = Engine::new(model, backend, Box::new(scheduler), kv_cache, request_rx)
+        .with_decode_fn(decode_fn);
+
+    // CUDA-Graph decode capture: only meaningful on a CUDA backend with the
+    // paged cache. The backend reports no graph support otherwise, so
+    // `with_cuda_graph` degrades to the eager path (with a warning).
+    if cli.cuda_graph {
+        if cli.kv_cache != "paged" {
+            warn!("--cuda-graph requires --kv-cache paged; staying on the eager decode path");
+        } else {
+            let buckets = parse_buckets(&cli.cuda_graph_buckets)?;
+            info!("CUDA graph decode enabled; buckets = {buckets:?}");
+            engine = engine.with_cuda_graph(buckets);
+        }
+    }
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
@@ -214,9 +255,7 @@ async fn run_server<B: Backend + Clone>(
     let token_vocab = {
         let vocab_size = model_config.vocab_size;
         info!("Building token vocabulary for structured output ({vocab_size} tokens)...");
-        let vocab = TokenVocab::from_decode_fn(vocab_size, |id| {
-            tokenizer.decode(&[id]).ok()
-        });
+        let vocab = TokenVocab::from_decode_fn(vocab_size, |id| tokenizer.decode(&[id]).ok());
         info!("Token vocabulary built");
         Some(Arc::new(vocab))
     };

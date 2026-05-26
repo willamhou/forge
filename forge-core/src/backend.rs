@@ -1,6 +1,75 @@
 use crate::tensor::Tensor;
 use crate::{DType, Result};
 
+/// Counter-based uniform in (0, 1) keyed on `(seed, step, row, col)`, bit-for-bit
+/// identical to `forge_uniform` in `forge-kernels/src/sampling.rs` so the CPU
+/// default and CUDA `sample_gumbel` paths draw the same numbers.
+fn forge_uniform(seed: u64, step: u32, row: u32, col: u32) -> f32 {
+    let mut x = seed
+        ^ (step as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (((row as u64) << 32) | (col as u64));
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^= x >> 31;
+    let hi = (x >> 40) as u32; // top 24 bits
+    (hi as f32 + 0.5) * (1.0 / 16_777_216.0)
+}
+
+/// Gumbel noise `-log(-log u)` for the Gumbel-max sampling trick. `u` is
+/// clamped into the open interval (same clamp as `forge_gumbel` in
+/// `forge-kernels`): at the top of the range the f32 uniform can round to
+/// exactly 1.0, which would make the noise `+inf` and pin that token.
+fn gumbel_noise(seed: u64, step: u32, row: u32, col: u32) -> f32 {
+    let u = forge_uniform(seed, step, row, col)
+        .max(1.0e-7_f32)
+        .min(1.0_f32 - 1.0e-7_f32);
+    -(-(u.ln())).ln()
+}
+
+/// Per-step decode inputs the engine stages into backend-persistent scratch
+/// buffers before a captured/replayed decode forward (see
+/// [`Backend::stage_decode_inputs`]). On replay the captured graph re-reads
+/// these scratches, so they must hold the *current* step's data — staging
+/// runs every step, outside the captured region.
+///
+/// All slices are host-side; the backend uploads them to stable device
+/// addresses. `slot_mapping` is staged separately via
+/// [`Backend::stage_slot_mapping`] because the KV scatter consumes it directly.
+pub struct DecodeStageInputs<'a> {
+    /// Flattened token ids, one per sequence (`[batch]`).
+    pub token_indices: &'a [u32],
+    /// Gathered RoPE cos table rows for this step's positions
+    /// (`[batch * head_dim/2]`).
+    pub rope_cos: &'a [f32],
+    /// Gathered RoPE sin table rows, same shape as `rope_cos`.
+    pub rope_sin: &'a [f32],
+    /// Row-major paged block tables (`[batch * max_blocks_per_seq]`, `-1` pad).
+    pub block_tables: &'a [i32],
+    /// Per-sequence KV length (`[batch]`).
+    pub kv_lens: &'a [i32],
+}
+
+/// Backend-specific captured-graph dispatcher for batched decode.
+///
+/// CPU and other graph-less backends have none ([`Backend::make_decode_graph_runner`]
+/// returns `None`); CUDA wraps a per-bucket capture/replay cache. The engine
+/// drives it once per decode step.
+pub trait DecodeGraphDispatch: Send {
+    /// Run a decode forward of `batch_size`:
+    /// - **bucket cache hit** → replay the captured graph (`fwd` is NOT called);
+    /// - **bucket cold** → capture `fwd` into a graph, then launch it once;
+    /// - **non-bucket size** → run `fwd` directly (uncaptured fallback).
+    ///
+    /// `fwd` must issue only capture-safe work (no host→device copies, stable
+    /// device pointers) — i.e. the pre-staged `Model::compute_decode`.
+    fn dispatch(&mut self, batch_size: u32, fwd: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+
+    /// Drop all captured graphs. Called by the engine when the backend's
+    /// [`Backend::decode_capture_epoch`] changes (a baked device pointer moved).
+    fn invalidate_all(&mut self);
+}
+
 pub trait Backend: Send + Sync + 'static {
     type Tensor: Tensor;
 
@@ -23,6 +92,55 @@ pub trait Backend: Send + Sync + 'static {
     // Core ops
     fn matmul(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
     fn add(&self, a: &Self::Tensor, b: &Self::Tensor) -> Result<Self::Tensor>;
+
+    /// Broadcast bias add: `out[r, c] = x[r, c] + bias[c]`.
+    ///
+    /// `x` is `[rows, cols]` (2D), `bias` is `[cols]`. Used for the QKV
+    /// projection bias in Qwen2-family models (Llama has no QKV bias).
+    /// Default impl round-trips through host f32; GPU backends override with
+    /// a broadcast kernel.
+    fn add_bias(&self, x: &Self::Tensor, bias: &Self::Tensor) -> Result<Self::Tensor> {
+        let shape = x.shape();
+        if shape.len() != 2 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "add_bias: x must be 2D [rows, cols]".into(),
+            ));
+        }
+        let cols = shape[1];
+        if bias.shape() != [cols] {
+            return Err(crate::ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: bias.shape().to_vec(),
+            });
+        }
+        if x.dtype() != crate::DType::F32 {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "add_bias default impl is F32-only (got {:?}); backend must override",
+                x.dtype()
+            )));
+        }
+        let mut data = self.copy_to_host_f32(x)?;
+        let bias_data = self.copy_to_host_f32(bias)?;
+        let rows = shape[0];
+        for r in 0..rows {
+            for c in 0..cols {
+                data[r * cols + c] += bias_data[c];
+            }
+        }
+        self.copy_from_host_f32(&data, shape)
+    }
+
+    /// In-place broadcast bias add: `buf[r, c] += bias[c]`. Used by the
+    /// capture-safe decode path for QKV bias (Qwen2) — the bias is a static
+    /// weight, so applying it in place keeps the buffer's device pointer
+    /// stable. Default: allocate via [`Self::add_bias`] then copy back with
+    /// `reshape_into` (NOT capture-safe — capture backends must override with a
+    /// true in-place kernel). CUDA does.
+    fn add_bias_into(&self, buf: &mut Self::Tensor, bias: &Self::Tensor) -> Result<()> {
+        let shape = buf.shape().to_vec();
+        let biased = self.add_bias(buf, bias)?;
+        self.reshape_into(buf, &biased, &shape)
+    }
 
     /// Matrix multiply, writing into a caller-provided output buffer.
     ///
@@ -87,12 +205,7 @@ pub trait Backend: Send + Sync + 'static {
     /// Element-wise add, writing into a caller-provided output buffer.
     /// Out shape + dtype must match both inputs.
     /// See [`Self::matmul_into`] for the capture-stability contract.
-    fn add_into(
-        &self,
-        out: &mut Self::Tensor,
-        a: &Self::Tensor,
-        b: &Self::Tensor,
-    ) -> Result<()> {
+    fn add_into(&self, out: &mut Self::Tensor, a: &Self::Tensor, b: &Self::Tensor) -> Result<()> {
         if a.shape() != b.shape() {
             return Err(crate::ForgeError::ShapeMismatch {
                 expected: a.shape().to_vec(),
@@ -362,12 +475,7 @@ pub trait Backend: Send + Sync + 'static {
         self.mul(&activated, up)
     }
 
-    fn rms_norm(
-        &self,
-        x: &Self::Tensor,
-        weight: &Self::Tensor,
-        eps: f32,
-    ) -> Result<Self::Tensor>;
+    fn rms_norm(&self, x: &Self::Tensor, weight: &Self::Tensor, eps: f32) -> Result<Self::Tensor>;
 
     /// Fused residual addition + RMSNorm.
     /// Returns (normalized, updated_residual) where:
@@ -757,6 +865,11 @@ pub trait Backend: Send + Sync + 'static {
                 v_pool.shape()
             )));
         }
+        if num_kv_heads == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "paged_attention: num_kv_heads must be > 0".into(),
+            ));
+        }
         let kv_dim_expected = num_kv_heads * head_dim;
         if pool_shape[2] != kv_dim_expected {
             return Err(crate::ForgeError::InvalidArgument(format!(
@@ -800,8 +913,11 @@ pub trait Backend: Send + Sync + 'static {
                     )));
                 }
             }
-            let block_ids: Vec<usize> =
-                row.iter().take(blocks_needed).map(|&id| id as usize).collect();
+            let block_ids: Vec<usize> = row
+                .iter()
+                .take(blocks_needed)
+                .map(|&id| id as usize)
+                .collect();
             k_caches.push(self.paged_gather_kv(k_pool, &block_ids, kv_len)?);
             v_caches.push(self.paged_gather_kv(v_pool, &block_ids, kv_len)?);
         }
@@ -1000,5 +1116,297 @@ pub trait Backend: Send + Sync + 'static {
             }
         }
         self.copy_from_host_f32(&result, &[seq_len, num_heads * head_dim])
+    }
+
+    /// Per-row argmax of `[rows, cols]` (or `[cols]`) logits → one token id per
+    /// row. This is greedy decode. Tie-break: the HIGHEST index among equal
+    /// maxima wins, matching the CPU sampler's `Iterator::max_by` (which
+    /// returns the last maximum), so the GPU path is bit-for-bit identical.
+    ///
+    /// Default: copy to host and reduce on CPU. Capture-capable backends
+    /// (CUDA) override this with an on-device reduction, so only the `rows`
+    /// resulting ids cross PCIe instead of the full `[rows, cols]` logits.
+    fn argmax(&self, logits: &Self::Tensor) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "argmax: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "argmax: empty logits (cols == 0)".into(),
+            ));
+        }
+        let host = self.copy_to_host_f32(logits)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let mut best = f32::NEG_INFINITY;
+            let mut best_i = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                // `>=` keeps the last (highest-index) maximum, matching `max_by`.
+                if v >= best {
+                    best = v;
+                    best_i = i;
+                }
+            }
+            out.push(best_i as u32);
+        }
+        Ok(out)
+    }
+
+    /// Per-row multinomial sample from `softmax(logits / temperature)` via the
+    /// Gumbel-max trick: `argmax_i(logits_i / T + g_i)` with
+    /// `g_i = -log(-log u_i)` and `u_i` a counter-based uniform keyed on
+    /// `(seed, step, row, col)`. This is the on-device draw used by vLLM/SGLang;
+    /// it is reproducible run-to-run for a fixed `(seed, step)` on the same
+    /// backend, but does NOT reproduce a CPU `StdRng` sequence.
+    ///
+    /// `temperature` must be > 0 (greedy/`T <= 0` callers use [`Self::argmax`]).
+    /// Default: copy to host and reduce on CPU with the identical RNG, so the
+    /// CPU and CUDA paths agree; CUDA overrides with an on-device kernel.
+    fn sample_gumbel(
+        &self,
+        logits: &Self::Tensor,
+        temperature: f32,
+        seed: u64,
+        step: u32,
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "sample_gumbel: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "sample_gumbel: empty logits (cols == 0)".into(),
+            ));
+        }
+        if temperature <= 0.0 || temperature.is_nan() {
+            return Err(crate::ForgeError::InvalidArgument(
+                "sample_gumbel: temperature must be > 0 (use argmax for greedy)".into(),
+            ));
+        }
+        let inv_temp = 1.0 / temperature;
+        let host = self.copy_to_host_f32(logits)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let mut best = f32::NEG_INFINITY;
+            let mut best_i = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                let key = v * inv_temp + gumbel_noise(seed, step, r as u32, i as u32);
+                if key >= best {
+                    best = key;
+                    best_i = i;
+                }
+            }
+            out.push(best_i as u32);
+        }
+        Ok(out)
+    }
+
+    /// Per-row sampling with per-sequence parameters: row `r` decodes greedily
+    /// (argmax) when `temps[r] <= 0`, else draws via Gumbel-max at that row's
+    /// temperature/seed/step. One call handles a decode batch mixing greedy and
+    /// sampled sequences. `temps`, `seeds`, `steps` all have `rows` entries.
+    /// Returns one token id per row; only those ids cross PCIe.
+    ///
+    /// Default: copy to host and reduce on CPU with the identical RNG, so the
+    /// CPU and CUDA paths agree; CUDA overrides with an on-device kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn sample(
+        &self,
+        logits: &Self::Tensor,
+        temps: &[f32],
+        min_ps: &[f32],
+        top_ks: &[u32],
+        top_ps: &[f32],
+        seeds: &[u64],
+        steps: &[u32],
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "sample: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "sample: empty logits (cols == 0)".into(),
+            ));
+        }
+        if temps.len() != rows
+            || min_ps.len() != rows
+            || top_ks.len() != rows
+            || top_ps.len() != rows
+            || seeds.len() != rows
+            || steps.len() != rows
+        {
+            return Err(crate::ForgeError::InvalidArgument(format!(
+                "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
+                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
+            )));
+        }
+        let host = self.copy_to_host_f32(logits)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let temp = temps[r];
+            let do_sample = temp > 0.0;
+            let inv_temp = if do_sample { 1.0 / temp } else { 0.0 };
+            let top_k = top_ks[r] as usize;
+            let top_p = top_ps[r];
+            let do_top_k = do_sample && top_k > 0 && top_k < cols;
+            let do_top_p = do_sample && top_p < 1.0;
+
+            // All filters collapse to a single scaled-logit threshold (see the
+            // CUDA `sample_perrow` kernel — identical algorithm so they agree).
+            let mut thresh = f32::NEG_INFINITY;
+            if do_sample && (min_ps[r] > 0.0 || do_top_k || do_top_p) {
+                let z_max = row
+                    .iter()
+                    .map(|&v| v * inv_temp)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if min_ps[r] > 0.0 {
+                    thresh = z_max + min_ps[r].ln();
+                }
+                if do_top_k || do_top_p {
+                    // Floor the bisection lower bound at the f32 exp-underflow
+                    // boundary: tokens below z_max-88 contribute 0 mass in f32
+                    // anyway, and this keeps `mid` finite even if a logit is
+                    // -inf (which would otherwise collapse the bisection).
+                    let z_min = row
+                        .iter()
+                        .map(|&v| v * inv_temp)
+                        .fold(f32::INFINITY, f32::min)
+                        .max(z_max - 88.0);
+                    let z_total: f32 = row.iter().map(|&v| (v * inv_temp - z_max).exp()).sum();
+                    if do_top_k {
+                        let (mut lo, mut hi) = (z_min, z_max);
+                        for _ in 0..24 {
+                            let mid = 0.5 * (lo + hi);
+                            let cnt = row.iter().filter(|&&v| v * inv_temp >= mid).count();
+                            if cnt >= top_k {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        thresh = thresh.max(lo);
+                    }
+                    if do_top_p {
+                        let (mut lo, mut hi) = (z_min, z_max);
+                        let target = top_p * z_total;
+                        for _ in 0..24 {
+                            let mid = 0.5 * (lo + hi);
+                            let mass: f32 = row
+                                .iter()
+                                .map(|&v| v * inv_temp)
+                                .filter(|&z| z >= mid)
+                                .map(|z| (z - z_max).exp())
+                                .sum();
+                            if mass >= target {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        thresh = thresh.max(lo);
+                    }
+                }
+            }
+
+            let mut best = f32::NEG_INFINITY;
+            let mut best_i = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                let key = if do_sample {
+                    let z = v * inv_temp;
+                    if z >= thresh {
+                        z + gumbel_noise(seeds[r], steps[r], r as u32, i as u32)
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                } else {
+                    v
+                };
+                if key >= best {
+                    best = key;
+                    best_i = i;
+                }
+            }
+            out.push(best_i as u32);
+        }
+        Ok(out)
+    }
+
+    /// Stage one decode step's per-step inputs (token ids, RoPE freqs, paged
+    /// block tables, KV lengths) into persistent device scratch buffers, so a
+    /// replayed captured [`Model::compute_decode`](crate::Model::compute_decode)
+    /// graph re-reads fresh data. Runs every decode step, OUTSIDE any captured
+    /// region.
+    ///
+    /// Default: no-op — backends without graph capture (CPU) read these inputs
+    /// directly during compute, so nothing needs pre-staging.
+    fn stage_decode_inputs(&self, _inputs: &DecodeStageInputs) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stage the per-step KV-write slot mapping. Capture-safe backends upload
+    /// it to a persistent device scratch (call OUTSIDE the captured region);
+    /// the captured [`Self::scatter_kv`] then reads that scratch. Returns the
+    /// staged length.
+    ///
+    /// Default: no-op store — the host-fallback [`Self::scatter_kv`] uses the
+    /// `slot_mapping` slice it is handed directly.
+    fn stage_slot_mapping(&self, slot_mapping: &[i32]) -> Result<usize> {
+        Ok(slot_mapping.len())
+    }
+
+    /// Capture-safe decode KV write: scatter the first `n_rows` rows of `src`
+    /// into `pool` (`[num_blocks, block_size, kv_dim]`) at the given slots.
+    ///
+    /// `slot_mapping` is the host-side mapping consumed by the default impl;
+    /// capture-safe backends (CUDA) ignore it and read the device scratch
+    /// previously filled by [`Self::stage_slot_mapping`], so the scatter is a
+    /// pure kernel launch with no baked host pointer.
+    fn scatter_kv(
+        &self,
+        pool: &mut Self::Tensor,
+        src: &Self::Tensor,
+        slot_mapping: &[i32],
+        n_rows: usize,
+    ) -> Result<()> {
+        self.paged_write_kv(pool, src, &slot_mapping[..n_rows])
+    }
+
+    /// Build a captured-graph decode dispatcher for the given batch-size
+    /// `buckets`, or `None` if this backend has no CUDA-Graph support
+    /// (CPU). Default: `None` — the engine then always runs the eager
+    /// decode path.
+    fn make_decode_graph_runner(&self, _buckets: &[u32]) -> Option<Box<dyn DecodeGraphDispatch>> {
+        None
+    }
+
+    /// Monotonic epoch that bumps whenever a persistent device pointer a
+    /// captured decode graph could have baked may have moved (a scratch or
+    /// pool reallocated on grow). The engine invalidates captured graphs
+    /// when this value changes. Default: `0` (never invalidates).
+    fn decode_capture_epoch(&self) -> u64 {
+        0
     }
 }

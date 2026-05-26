@@ -34,3 +34,11 @@ tokenizers = "0.21"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[[example]]
+name = "dump_logits"
+required-features = ["cuda"]
+
+[[example]]
+name = "graph_decode_spike"
+required-features = ["cuda"]

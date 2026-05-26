@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use forge_core::{
-    Backend, FinishReason, InferenceRequest, KvCache, Model, ModelInput, Result, ScheduledSeq,
-    Scheduler, SeqMetadata,
+    Backend, DecodeGraphDispatch, FinishReason, InferenceRequest, KvCache, Model, ModelInput,
+    Result, ScheduledSeq, Scheduler, SeqMetadata,
 };
 
 use crate::constraints::fsm::FsmConstraint;
@@ -48,6 +48,14 @@ struct SeqConstraint {
     state: u32,
 }
 
+/// Result of a batched decode forward: either the per-sequence token ids
+/// (device-argmax fast path, only N ids leave the GPU) or the full host
+/// `[N, vocab_size]` logits (CPU sampler path).
+enum DecodeOut {
+    Ids(Vec<u32>),
+    Logits(Vec<f32>),
+}
+
 /// Optional decode function for stop_strings checking.
 /// Takes a slice of token IDs and returns the decoded text.
 pub type DecodeFn = Arc<dyn Fn(&[u32]) -> Option<String> + Send + Sync>;
@@ -71,6 +79,14 @@ pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     /// Tokens are held here until we confirm they don't form part of a
     /// stop string, then flushed to the event channel.
     stop_buffers: HashMap<u64, Vec<u32>>,
+    /// Optional CUDA-Graph decode dispatcher (None on CPU / when disabled).
+    decode_runner: Option<Box<dyn DecodeGraphDispatch>>,
+    /// Configured CUDA-Graph batch-size buckets (sorted, deduped).
+    decode_buckets: Vec<u32>,
+    /// Per-bucket persistent decode state (allocated lazily on first use).
+    decode_states: HashMap<u32, M::DecodeState>,
+    /// Last observed backend capture epoch; a change invalidates all graphs.
+    last_capture_epoch: u64,
 }
 
 impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
@@ -92,6 +108,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             constraints: HashMap::new(),
             decode_fn: None,
             stop_buffers: HashMap::new(),
+            decode_runner: None,
+            decode_buckets: Vec::new(),
+            decode_states: HashMap::new(),
+            last_capture_epoch: 0,
         }
     }
 
@@ -99,6 +119,34 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     pub fn with_decode_fn(mut self, f: DecodeFn) -> Self {
         self.decode_fn = Some(f);
         self
+    }
+
+    /// Enable CUDA-Graph decode capture for the given batch-size `buckets`.
+    ///
+    /// No-op (logs a warning, stays on the eager path) when the backend has no
+    /// graph support — `Backend::make_decode_graph_runner` returns `None` for
+    /// CPU and for naive (non-paged) KV caches. The default is off; the server
+    /// opts in via `--cuda-graph`.
+    pub fn with_cuda_graph(mut self, mut buckets: Vec<u32>) -> Self {
+        buckets.retain(|&b| b > 0);
+        buckets.sort_unstable();
+        buckets.dedup();
+        match self.backend.make_decode_graph_runner(&buckets) {
+            Some(runner) => {
+                self.decode_runner = Some(runner);
+                self.decode_buckets = buckets;
+                self.last_capture_epoch = self.backend.decode_capture_epoch();
+            }
+            None => {
+                warn!("CUDA graph requested but backend has no graph support — staying eager");
+            }
+        }
+        self
+    }
+
+    /// True if `batch_size` exactly matches a configured CUDA-Graph bucket.
+    fn is_decode_bucket(&self, batch_size: u32) -> bool {
+        self.decode_buckets.binary_search(&batch_size).is_ok()
     }
 
     /// Main engine loop. Runs until the request channel is closed.
@@ -200,7 +248,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .filter(|s| !failed_seq_ids.contains(&s.seq_id))
                 .collect();
 
-            if decode_seqs.len() > 1 {
+            // Route through the batched path when graph capture is on (so
+            // batch=1 decode also benefits) or whenever there's more than one
+            // decode sequence. Single-sequence decode without graph capture
+            // stays on the simpler `process_sequence` path.
+            let route_batched =
+                !decode_seqs.is_empty() && (self.decode_runner.is_some() || decode_seqs.len() > 1);
+
+            if route_batched {
                 if let Err(e) = self.process_decode_batch(&decode_seqs) {
                     // Forward pass failed — clean up all sequences in the batch
                     error!(error = %e, "batch decode forward failed");
@@ -238,6 +293,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     }
                 }
             }
+
+            // Yield to the runtime after each scheduling step. The per-token
+            // path is fully synchronous (forward + blocking `synchronize` +
+            // `try_send`) and never awaits, so without this the loop monopolises
+            // its worker and the SSE handler task isn't polled until generation
+            // ends — making streaming clients receive every token at once. One
+            // cooperative yield per step lets the handler drain events live.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -311,8 +374,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // finish immediately without running the forward pass.
         let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
         if generated.len() >= seq.sampling_params.max_tokens {
-            self.scheduler
-                .finish(seq.seq_id, FinishReason::MaxTokens)?;
+            self.scheduler.finish(seq.seq_id, FinishReason::MaxTokens)?;
             self.kv_cache.free(seq.seq_id)?;
             self.send_event(
                 seq.seq_id,
@@ -366,8 +428,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         for seq in seqs {
             let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
             if generated.len() >= seq.sampling_params.max_tokens {
-                self.scheduler
-                    .finish(seq.seq_id, FinishReason::MaxTokens)?;
+                self.scheduler.finish(seq.seq_id, FinishReason::MaxTokens)?;
                 self.kv_cache.free(seq.seq_id)?;
                 self.send_event(
                     seq.seq_id,
@@ -390,19 +451,139 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
 
         // Build batched ModelInput (N sequences, 1 token each)
         let input = self.build_batch_input(&active_seqs);
+        let n = active_seqs.len() as u32;
 
-        // Single forward pass for all decode sequences
-        let output = self.model.forward(&input, &mut *self.kv_cache)?;
-        self.backend.synchronize()?;
+        // Device-side sampling plan. Greedy (temp ≤ 0) + unconstrained seqs use
+        // argmax; temp > 0 seqs without top-k/p/min-p use on-device Gumbel-max.
+        // Either way only N token ids leave the GPU. Any seq needing the CPU
+        // sampler (top-k/p/min-p, penalties, FSM mask) forces the full
+        // host-logits path for the whole batch.
+        let all_argmax = active_seqs.iter().all(|s| self.decode_argmax_eligible(s));
+        let all_device = all_argmax
+            || active_seqs
+                .iter()
+                .all(|s| self.decode_argmax_eligible(s) || self.decode_gumbel_eligible(s));
 
-        // Copy logits to host: [N, vocab_size]
-        let logits_host = self.backend.copy_to_host_f32(&output.logits)?;
+        // Per-row sampling params, built once (they don't depend on the logits).
+        // Only needed for the mixed greedy/Gumbel `sample` path; the all-argmax
+        // path uploads nothing.
+        type SampleParams = (Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>, Vec<u64>, Vec<u32>);
+        let sample_params: Option<SampleParams> = if all_device && !all_argmax {
+            let mut temps = Vec::with_capacity(active_seqs.len());
+            let mut min_ps = Vec::with_capacity(active_seqs.len());
+            let mut top_ks = Vec::with_capacity(active_seqs.len());
+            let mut top_ps = Vec::with_capacity(active_seqs.len());
+            let mut seeds = Vec::with_capacity(active_seqs.len());
+            let mut steps = Vec::with_capacity(active_seqs.len());
+            for s in &active_seqs {
+                let p = &s.sampling_params;
+                temps.push(p.temperature);
+                min_ps.push(p.min_p.unwrap_or(0.0));
+                top_ks.push(p.top_k.unwrap_or(0) as u32);
+                top_ps.push(p.top_p);
+                // Explicit per-request seed → reproducible. No seed → a fresh
+                // random seed each step, so unseeded sampling stays stochastic
+                // (matches the CPU sampler's thread_rng default; deriving from
+                // seq_id would make it deterministic — a behavioral regression).
+                seeds.push(p.seed.unwrap_or_else(rand::random));
+                steps.push(self.get_generated_count(s.seq_id) as u32);
+            }
+            Some((temps, min_ps, top_ks, top_ps, seeds, steps))
+        } else {
+            None
+        };
+
+        // Run the decode forward via the CUDA-Graph capture/replay path
+        // (bucketed batch sizes) or the eager forward, then produce either the
+        // per-seq token ids (fast path) or the host [N, vocab_size] logits.
+        // Only capture/replay when the model supports the capture-safe decode
+        // path; otherwise (e.g. QKV-bias models) fall back to eager `forward`,
+        // which still feeds the device-sampling fast path below.
+        let use_graph = self.decode_runner.is_some()
+            && self.is_decode_bucket(n)
+            && self.model.supports_capture_decode();
+        let decode_out: DecodeOut = if use_graph {
+            // Lazily allocate this bucket's persistent decode state.
+            if !self.decode_states.contains_key(&n) {
+                let st = self.model.make_decode_state(n as usize)?;
+                self.decode_states.insert(n, st);
+            }
+
+            // Stage this step's inputs into persistent scratch (outside any
+            // captured region) so a replayed graph reads fresh data.
+            {
+                let state = self.decode_states.get_mut(&n).unwrap();
+                self.model
+                    .stage_decode(&input, &mut *self.kv_cache, state)?;
+            }
+
+            // Capture-epoch check AFTER staging: staging is what grows the
+            // scratch/pool buffers, so any device/host pointer a captured graph
+            // baked may have moved during this very step. Checking here (rather
+            // than before `stage_decode`) guarantees a staging-time grow drops
+            // the stale graphs before `dispatch` could replay one.
+            let epoch = self.backend.decode_capture_epoch();
+            if epoch != self.last_capture_epoch {
+                if let Some(r) = self.decode_runner.as_mut() {
+                    r.invalidate_all();
+                }
+                self.last_capture_epoch = epoch;
+            }
+
+            // Capture-or-replay the pure-kernel compute. Disjoint-field borrows
+            // keep the dispatcher and the closure's captures separate.
+            {
+                let model = &self.model;
+                let kv = &mut *self.kv_cache;
+                let state = self.decode_states.get_mut(&n).unwrap();
+                let runner = self
+                    .decode_runner
+                    .as_mut()
+                    .expect("decode_runner is Some in the graph branch");
+                let mut fwd = || model.compute_decode(kv, state);
+                runner.dispatch(n, &mut fwd)?;
+            }
+            self.backend.synchronize()?;
+
+            let state = self.decode_states.get(&n).unwrap();
+            let logits = self.model.decode_logits(state);
+            if all_argmax {
+                DecodeOut::Ids(self.backend.argmax(logits)?)
+            } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
+                DecodeOut::Ids(self.backend.sample(logits, temps, min_ps, top_ks, top_ps, seeds, steps)?)
+            } else {
+                DecodeOut::Logits(self.backend.copy_to_host_f32(logits)?)
+            }
+        } else {
+            let output = self.model.forward(&input, &mut *self.kv_cache)?;
+            self.backend.synchronize()?;
+            if all_argmax {
+                DecodeOut::Ids(self.backend.argmax(&output.logits)?)
+            } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
+                DecodeOut::Ids(self.backend.sample(&output.logits, temps, min_ps, top_ks, top_ps, seeds, steps)?)
+            } else {
+                DecodeOut::Logits(self.backend.copy_to_host_f32(&output.logits)?)
+            }
+        };
         let vocab_size = self.model.config().vocab_size;
 
-        // Per-sequence sampling
+        // Per-sequence emit. The fast path skips the sampler entirely (eligible
+        // seqs have no FSM, so `emit_token` handles append/stop/finish); the
+        // full path runs the CPU sampler over each seq's logits slice.
         for (i, seq) in active_seqs.iter().enumerate() {
-            let seq_logits = &logits_host[i * vocab_size..(i + 1) * vocab_size];
-            if let Err(e) = self.sample_and_emit(seq, seq_logits) {
+            let res = match &decode_out {
+                DecodeOut::Ids(ids) => {
+                    let token_id = ids[i];
+                    match self.scheduler.get_generated_tokens(seq.seq_id) {
+                        Ok(generated) => self.emit_token(seq, token_id, &generated),
+                        Err(e) => Err(e),
+                    }
+                }
+                DecodeOut::Logits(host) => {
+                    self.sample_and_emit(seq, &host[i * vocab_size..(i + 1) * vocab_size])
+                }
+            };
+            if let Err(e) = res {
                 error!(seq_id = seq.seq_id, error = %e, "sampling failed in batch");
                 self.send_event(
                     seq.seq_id,
@@ -422,6 +603,33 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         Ok(())
     }
 
+    /// Whether `seq` can be decoded with a pure device-side argmax: greedy
+    /// (temperature ≤ 0), no penalties (which would reshape the logits), and no
+    /// FSM constraint (which masks logits before sampling). top-k/top-p/min-p
+    /// are irrelevant under greedy. These seqs need only the argmax token id,
+    /// never the full host logits.
+    fn decode_argmax_eligible(&self, seq: &ScheduledSeq) -> bool {
+        let p = &seq.sampling_params;
+        p.temperature <= 0.0
+            && p.repetition_penalty == 1.0
+            && p.presence_penalty == 0.0
+            && p.frequency_penalty == 0.0
+            && !self.constraints.contains_key(&seq.seq_id)
+    }
+
+    /// Whether `seq` can be sampled with on-device Gumbel-max: temperature > 0,
+    /// no penalties (which need the token history on host), and no FSM
+    /// constraint. The device `sample` op handles temperature, min-p, top-k and
+    /// top-p; only penalties and FSM masking still require the host path.
+    fn decode_gumbel_eligible(&self, seq: &ScheduledSeq) -> bool {
+        let p = &seq.sampling_params;
+        p.temperature > 0.0
+            && p.repetition_penalty == 1.0
+            && p.presence_penalty == 0.0
+            && p.frequency_penalty == 0.0
+            && !self.constraints.contains_key(&seq.seq_id)
+    }
+
     /// Sample a token from logits, advance FSM, handle stop conditions, emit events.
     ///
     /// Shared by `process_sequence` (single) and `process_decode_batch` (batched).
@@ -437,11 +645,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // If FSM is in a terminal state with no allowed tokens, finish cleanly
         // instead of sampling (which would pick an arbitrary token and fail).
         if let Some((fsm, state)) = constraint_ref {
-            let no_tokens = fsm
-                .allowed_tokens(state)
-                .is_none_or(|t| t.is_empty());
+            let no_tokens = fsm.allowed_tokens(state).is_none_or(|t| t.is_empty());
             if no_tokens && fsm.is_final_state(state) {
-                self.scheduler.finish(seq.seq_id, FinishReason::StopString)?;
+                self.scheduler
+                    .finish(seq.seq_id, FinishReason::StopString)?;
                 self.kv_cache.free(seq.seq_id)?;
                 self.send_event(
                     seq.seq_id,
@@ -485,7 +692,15 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .sample_single(last_logits, &seq.sampling_params, &generated)?
         };
 
-        let token_id = result.token_id;
+        self.emit_token(seq, result.token_id, &generated)
+    }
+
+    /// Append `token_id` to `seq`, advance any FSM constraint, run stop /
+    /// EOS / max-token checks, and emit the resulting events. Shared by the
+    /// host sampler path ([`Self::sample_and_emit`]) and the device-argmax
+    /// fast path in [`Self::process_decode_batch`]. `generated` is the
+    /// sequence's tokens BEFORE this one.
+    fn emit_token(&mut self, seq: &ScheduledSeq, token_id: u32, generated: &[u32]) -> Result<()> {
         self.scheduler.append_token(seq.seq_id, token_id)?;
 
         // Advance FSM state if constraint is active.
@@ -494,7 +709,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let mut fsm_finished = false;
         let mut fsm_abort: Option<(u32, u32)> = None; // (fsm_state, token_id)
         if let Some(seq_constraint) = self.constraints.get_mut(&seq.seq_id) {
-            match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
+            match seq_constraint
+                .fsm
+                .next_state(seq_constraint.state, token_id)
+            {
                 Some(next) => {
                     seq_constraint.state = next;
                     if seq_constraint.fsm.is_final_state(next) {
@@ -557,7 +775,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .push(token_id);
 
             self.decode_fn.as_ref().and_then(|decode| {
-                let mut all_tokens = generated.clone();
+                let mut all_tokens = generated.to_vec();
                 all_tokens.push(token_id);
                 let text = decode(&all_tokens)?;
                 seq.sampling_params
@@ -579,13 +797,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             let flush_all = should_finish;
             let prefix_match = if !flush_all {
                 self.decode_fn.as_ref().and_then(|decode| {
-                    let mut all_tokens = generated.clone();
+                    let mut all_tokens = generated.to_vec();
                     all_tokens.push(token_id);
                     let text = decode(&all_tokens)?;
                     let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
-                        s.char_indices().skip(1).any(|(byte_pos, _)| {
-                            text.ends_with(&s[..byte_pos])
-                        }) || text.ends_with(s)
+                        s.char_indices()
+                            .skip(1)
+                            .any(|(byte_pos, _)| text.ends_with(&s[..byte_pos]))
+                            || text.ends_with(s)
                     });
                     Some(is_prefix)
                 })

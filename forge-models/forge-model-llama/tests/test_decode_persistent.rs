@@ -1,17 +1,17 @@
-//! Parity: `LlamaModel::forward_into` (persistent-buffer path) must
-//! produce identical logits to `LlamaModel::forward` (alloc path) when
+//! Parity: the capture-safe decode path (`stage_decode` + `compute_decode`)
+//! must produce identical logits to `LlamaModel::forward` (alloc path) when
 //! given the same model, same KV cache state, and same decode input.
 //!
 //! Uses the tiny F32 Llama from test_batch_forward.rs + test_decode_paged.rs.
-//! PagedKvCache only — naive caches are explicitly unsupported by
-//! forward_into.
+//! PagedKvCache only — naive caches are explicitly unsupported by the
+//! capture-safe path.
 
 use forge_backend_cpu::CpuBackend;
 use forge_core::{Backend, DType, KvCache, Model, ModelConfig, ModelInput, SeqMetadata, Tensor};
 use forge_kvcache::paged_cache::PagedKvCache;
+use forge_model_llama::LlamaModel;
 use forge_model_llama::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
 use forge_model_llama::rope::RopeFreqs;
-use forge_model_llama::{LlamaModel, LlamaPersistentBuffers};
 
 fn tiny_config() -> ModelConfig {
     ModelConfig {
@@ -133,7 +133,7 @@ fn build_decode_input() -> ModelInput {
 }
 
 #[test]
-fn forward_into_matches_forward() {
+fn compute_decode_matches_forward() {
     let backend = CpuBackend::new();
     let model = build_tiny_model(&backend);
     let config = tiny_config();
@@ -155,7 +155,7 @@ fn forward_into_matches_forward() {
     let out_alloc = model.forward(&decode_input, &mut kv_alloc).unwrap();
     let logits_alloc = backend.copy_to_host_f32(&out_alloc.logits).unwrap();
 
-    // ── Run 2: persistent-buffer path via forward_into() ─────────
+    // ── Run 2: capture-safe path via stage_decode + compute_decode ─
     let mut kv_persistent = PagedKvCache::new(
         backend.clone(),
         16,
@@ -170,12 +170,16 @@ fn forward_into_matches_forward() {
     prefill(&model, &mut kv_persistent, 2, &[1, 3]);
 
     let batch_size = decode_input.seq_metadata.len();
-    let mut buffers =
-        LlamaPersistentBuffers::new_uniform(&backend, &config, batch_size).unwrap();
+    let mut state = model.make_decode_state(batch_size).unwrap();
     model
-        .forward_into(&decode_input, &mut kv_persistent, &mut buffers)
+        .stage_decode(&decode_input, &mut kv_persistent, &mut state)
         .unwrap();
-    let logits_persistent = backend.copy_to_host_f32(&buffers.logits).unwrap();
+    model
+        .compute_decode(&mut kv_persistent, &mut state)
+        .unwrap();
+    let logits_persistent = backend
+        .copy_to_host_f32(model.decode_logits(&state))
+        .unwrap();
 
     // ── Compare ──────────────────────────────────────────────────
     assert_eq!(logits_alloc.len(), logits_persistent.len());
@@ -203,7 +207,7 @@ fn forward_into_matches_forward() {
     assert_eq!(argmax(&logits_alloc[..v]), argmax(&logits_persistent[..v]));
     assert_eq!(argmax(&logits_alloc[v..]), argmax(&logits_persistent[v..]));
 
-    // ── Reuse buffers: a second forward_into into the SAME buffers
+    // ── Reuse state: a second stage+compute into the SAME state
     //    with identical inputs must produce identical results ─────
     let mut kv_persistent2 = PagedKvCache::new(
         backend.clone(),
@@ -218,17 +222,25 @@ fn forward_into_matches_forward() {
     prefill(&model, &mut kv_persistent2, 1, &[0, 1, 2]);
     prefill(&model, &mut kv_persistent2, 2, &[1, 3]);
     model
-        .forward_into(&decode_input, &mut kv_persistent2, &mut buffers)
+        .stage_decode(&decode_input, &mut kv_persistent2, &mut state)
         .unwrap();
-    let logits_reuse = backend.copy_to_host_f32(&buffers.logits).unwrap();
+    model
+        .compute_decode(&mut kv_persistent2, &mut state)
+        .unwrap();
+    let logits_reuse = backend
+        .copy_to_host_f32(model.decode_logits(&state))
+        .unwrap();
     assert_eq!(logits_persistent, logits_reuse);
 
-    // Verify buffers.logits has the expected shape.
-    assert_eq!(buffers.logits.shape(), &[batch_size, config.vocab_size]);
+    // Verify logits have the expected shape.
+    assert_eq!(
+        model.decode_logits(&state).shape(),
+        &[batch_size, config.vocab_size]
+    );
 }
 
 #[test]
-fn forward_into_rejects_wrong_batch_size() {
+fn stage_decode_rejects_wrong_batch_size() {
     let backend = CpuBackend::new();
     let model = build_tiny_model(&backend);
     let config = tiny_config();
@@ -247,15 +259,15 @@ fn forward_into_rejects_wrong_batch_size() {
     prefill(&model, &mut kv, 2, &[1, 3]);
     let decode_input = build_decode_input(); // batch = 2
 
-    // Buffers sized for batch=4, input has batch=2 → reject.
-    let mut wrong_buffers = LlamaPersistentBuffers::new_uniform(&backend, &config, 4).unwrap();
+    // State sized for batch=4, input has batch=2 → reject.
+    let mut wrong_state = model.make_decode_state(4).unwrap();
     let _ = model
-        .forward_into(&decode_input, &mut kv, &mut wrong_buffers)
+        .stage_decode(&decode_input, &mut kv, &mut wrong_state)
         .expect_err("batch_size mismatch must error");
 }
 
 #[test]
-fn forward_into_rejects_prefill() {
+fn stage_decode_rejects_prefill() {
     let backend = CpuBackend::new();
     let model = build_tiny_model(&backend);
     let config = tiny_config();
@@ -270,7 +282,7 @@ fn forward_into_rejects_prefill() {
     )
     .unwrap();
     kv.allocate(1, 2).unwrap();
-    let mut buffers = LlamaPersistentBuffers::new_uniform(&backend, &config, 1).unwrap();
+    let mut state = model.make_decode_state(1).unwrap();
     let prefill_input = ModelInput {
         token_ids: vec![vec![0, 1]],
         positions: vec![vec![0, 1]],
@@ -282,6 +294,6 @@ fn forward_into_rejects_prefill() {
         }],
     };
     let _ = model
-        .forward_into(&prefill_input, &mut kv, &mut buffers)
+        .stage_decode(&prefill_input, &mut kv, &mut state)
         .expect_err("prefill must be rejected");
 }

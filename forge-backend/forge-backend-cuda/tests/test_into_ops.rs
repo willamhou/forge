@@ -474,4 +474,53 @@ fn into_variants_match_alloc_variants() {
             );
         }
     }
+
+    // ── add_bias: broadcast bias[c] over rows of x[r,c] (Qwen2 QKV bias) ──
+    let bias_rows = 3;
+    let bias_cols = 5;
+    let bx_data: Vec<f32> = (0..bias_rows * bias_cols).map(|i| i as f32 * 0.5).collect();
+    let bias_data: Vec<f32> = vec![1.0, -2.0, 0.25, 10.0, -0.5];
+    let bx = backend
+        .copy_from_host_f32(&bx_data, &[bias_rows, bias_cols])
+        .unwrap();
+    let bias = backend.copy_from_host_f32(&bias_data, &[bias_cols]).unwrap();
+
+    // F32
+    let biased = backend.add_bias(&bx, &bias).unwrap();
+    backend.synchronize().unwrap();
+    let biased_host = backend.copy_to_host_f32(&biased).unwrap();
+    for r in 0..bias_rows {
+        for c in 0..bias_cols {
+            let want = bx_data[r * bias_cols + c] + bias_data[c];
+            let got = biased_host[r * bias_cols + c];
+            assert!(
+                (got - want).abs() < 1e-5,
+                "add_bias F32 diverges at [{r}][{c}]: got {got} want {want}"
+            );
+        }
+    }
+
+    // F16
+    let bx_f16 = backend.cast(&bx, DType::F16).unwrap();
+    let bias_f16 = backend.cast(&bias, DType::F16).unwrap();
+    let biased_f16 = backend.add_bias(&bx_f16, &bias_f16).unwrap();
+    backend.synchronize().unwrap();
+    let biased_f16_f32 = backend.cast(&biased_f16, DType::F32).unwrap();
+    let biased_f16_host = backend.copy_to_host_f32(&biased_f16_f32).unwrap();
+    for r in 0..bias_rows {
+        for c in 0..bias_cols {
+            let want = bx_data[r * bias_cols + c] + bias_data[c];
+            let got = biased_f16_host[r * bias_cols + c];
+            assert!(
+                (got - want).abs() < 1e-2,
+                "add_bias F16 diverges at [{r}][{c}]: got {got} want {want}"
+            );
+        }
+    }
+
+    // Wrong bias length rejected.
+    let wrong_bias = backend.copy_from_host_f32(&[0.0; 4], &[4]).unwrap();
+    let _ = backend
+        .add_bias(&bx, &wrong_bias)
+        .expect_err("add_bias wrong bias length should fail");
 }

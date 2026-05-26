@@ -27,11 +27,14 @@ pub fn load_llama_model<B: Backend + Clone>(
     let norm_weight = loader.load_tensor("model.norm.weight", backend)?;
     let norm = RMSNorm::new(norm_weight, config.rms_norm_eps);
 
-    // lm_head may share weights with embed_tokens (tied embeddings).
+    // lm_head may share weights with embed_tokens (tied embeddings, e.g. Qwen2
+    // small / TinyLlama-variants). Check existence rather than Err-as-absent so
+    // a real load failure on a present lm_head.weight propagates.
     // lm_head is [vocab_size, hidden_size] -> transpose to [hidden_size, vocab_size]
-    let lm_head_raw = match loader.load_tensor("lm_head.weight", backend) {
-        Ok(t) => t,
-        Err(_) => loader.load_tensor("model.embed_tokens.weight", backend)?,
+    let lm_head_raw = if loader.contains("lm_head.weight") {
+        loader.load_tensor("lm_head.weight", backend)?
+    } else {
+        loader.load_tensor("model.embed_tokens.weight", backend)?
     };
     let lm_head = backend.transpose(&lm_head_raw, 0, 1)?;
 
@@ -78,7 +81,24 @@ fn load_decoder_layer<B: Backend>(
     let wv_t = backend.transpose(&wv, 0, 1)?; // [kv_proj, hidden]
     let cat_t = backend.cat(&[&wq_t, &wk_t, &wv_t], 0)?; // [q+2*kv, hidden]
     let wqkv = backend.transpose(&cat_t, 0, 1)?; // [hidden, q+2*kv]
-    let attn = LlamaAttention::new(wqkv, wo, config);
+
+    // Optional QKV bias (Qwen2-family). If q_proj.bias is present, all three
+    // (q/k/v) are; concatenate into a single [q+2*kv] bias vector matching the
+    // wqkv column layout. Biases are 1D so no transpose needed — just cat.
+    //
+    // Check existence (not Err-as-absent): a real load failure on a present
+    // bias tensor must propagate, not silently downgrade to Llama-no-bias
+    // (which would corrupt Qwen attention).
+    let q_bias_name = format!("{prefix}.self_attn.q_proj.bias");
+    let qkv_bias = if loader.contains(&q_bias_name) {
+        let q_bias = loader.load_tensor(&q_bias_name, backend)?;
+        let k_bias = loader.load_tensor(&format!("{prefix}.self_attn.k_proj.bias"), backend)?;
+        let v_bias = loader.load_tensor(&format!("{prefix}.self_attn.v_proj.bias"), backend)?;
+        Some(backend.cat(&[&q_bias, &k_bias, &v_bias], 0)?)
+    } else {
+        None // Llama: no QKV bias
+    };
+    let attn = LlamaAttention::new_with_bias(wqkv, qkv_bias, wo, config);
 
     // MLP weights (transposed at load)
     let gate_proj = load_linear(loader, &format!("{prefix}.mlp.gate_proj.weight"), backend)?;

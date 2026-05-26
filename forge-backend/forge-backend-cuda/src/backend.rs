@@ -7,12 +7,17 @@ use cudarc::driver::{
     PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
-use forge_core::{Backend, DType, ForgeError, Result, Tensor};
+use forge_core::{
+    Backend, DType, DecodeGraphDispatch, DecodeStageInputs, ForgeError, Result, Tensor,
+};
 
+use crate::decode_graph::DecodeGraphRunner;
 use crate::tensor::CudaTensor;
 
 struct KernelFunctions {
     add_f32: CudaFunction,
+    add_bias_f32: CudaFunction,
+    add_bias_inplace_f32: CudaFunction,
     mul_f32: CudaFunction,
     mul_scalar_f32: CudaFunction,
     silu_f32: CudaFunction,
@@ -25,6 +30,8 @@ struct KernelFunctions {
     transpose_f32: CudaFunction,
     // FP16 variants
     add_f16: CudaFunction,
+    add_bias_f16: CudaFunction,
+    add_bias_inplace_f16: CudaFunction,
     mul_f16: CudaFunction,
     mul_scalar_f16: CudaFunction,
     silu_f16: CudaFunction,
@@ -52,6 +59,16 @@ struct KernelFunctions {
     // Paged attention (decode)
     paged_attention_f32: CudaFunction,
     paged_attention_f16: CudaFunction,
+
+    scatter_kv_f32: CudaFunction,
+    scatter_kv_f16: CudaFunction,
+    // Sampling
+    argmax_f32: CudaFunction,
+    argmax_f16: CudaFunction,
+    sample_gumbel_f32: CudaFunction,
+    sample_gumbel_f16: CudaFunction,
+    sample_perrow_f32: CudaFunction,
+    sample_perrow_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -83,6 +100,11 @@ pub struct CudaBackend {
     rope_cos: Arc<Mutex<F32Scratch>>,
     /// Persistent device scratch for RoPE's f32 sin table. See `rope_cos`.
     rope_sin: Arc<Mutex<F32Scratch>>,
+    /// Persistent device scratch for the KV-scatter slot_mapping (i32). Lets
+    /// `scatter_kv` read write destinations from a stable device pointer so the
+    /// op can be recorded in a captured graph (the old `paged_write_kv`
+    /// host-loop bakes destinations into memcpy nodes — not replay-safe).
+    scatter_slot_mapping: Arc<Mutex<I32Scratch>>,
 }
 
 /// Monotonically-growing i32 device buffer. `version` increments on every
@@ -91,6 +113,13 @@ pub struct CudaBackend {
 struct I32Scratch {
     buf: CudaSlice<i32>,
     version: u64,
+    /// Persistent HOST mirror used as the `memcpy_htod` source. A captured
+    /// graph bakes the host source pointer of an H2D copy; sourcing from this
+    /// stable backend-owned buffer (instead of a per-call Vec that drops when
+    /// the caller returns) keeps that pointer valid across capture + replay.
+    /// Sized to match `buf`; never shrinks, so the pointer is stable once
+    /// warmed to the steady-state size.
+    host: Vec<i32>,
 }
 
 /// u32 sibling of `I32Scratch` — for kernels that read indices as u32
@@ -98,6 +127,7 @@ struct I32Scratch {
 struct U32Scratch {
     buf: CudaSlice<u32>,
     version: u64,
+    host: Vec<u32>,
 }
 
 /// f32 sibling of `I32Scratch` — for kernels that need a small per-call
@@ -105,6 +135,7 @@ struct U32Scratch {
 struct F32Scratch {
     buf: CudaSlice<f32>,
     version: u64,
+    host: Vec<f32>,
 }
 
 impl CudaBackend {
@@ -126,12 +157,12 @@ impl CudaBackend {
         let stream = ctx
             .new_stream()
             .map_err(|e| ForgeError::Cuda(format!("new_stream: {e}")))?;
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|e| ForgeError::Cuda(format!("cublas: {e}")))?;
+        let blas =
+            CudaBlas::new(stream.clone()).map_err(|e| ForgeError::Cuda(format!("cublas: {e}")))?;
 
         // Compile F32 kernels (concatenate all module sources)
         let f32_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F32_SRC,
             forge_kernels::norm::F32_SRC,
             forge_kernels::positional::F32_SRC,
@@ -139,16 +170,17 @@ impl CudaBackend {
             forge_kernels::attention::F32_SRC,
             forge_kernels::decode_attention::F32_SRC,
             forge_kernels::paged_attention::F32_SRC,
+            forge_kernels::sampling::F32_SRC,
         );
-        let ptx_f32 = compile_ptx(&f32_src)
-            .map_err(|e| ForgeError::Cuda(format!("nvrtc f32: {e}")))?;
+        let ptx_f32 =
+            compile_ptx(&f32_src).map_err(|e| ForgeError::Cuda(format!("nvrtc f32: {e}")))?;
         let module_f32 = ctx
             .load_module(ptx_f32)
             .map_err(|e| ForgeError::Cuda(format!("module load f32: {e}")))?;
 
         // Compile F16 kernels — requires cuda_fp16.h from CUDA toolkit
         let f16_src = format!(
-            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F16_SRC,
             forge_kernels::norm::F16_SRC,
             forge_kernels::positional::F16_SRC,
@@ -156,6 +188,7 @@ impl CudaBackend {
             forge_kernels::attention::F16_SRC,
             forge_kernels::decode_attention::F16_SRC,
             forge_kernels::paged_attention::F16_SRC,
+            forge_kernels::sampling::F16_SRC,
         );
         let cuda_include = Self::find_cuda_include()?;
         let ptx_f16 = cudarc::nvrtc::compile_ptx_with_opts(
@@ -184,6 +217,8 @@ impl CudaBackend {
 
         let kernels = KernelFunctions {
             add_f32: load_f32("add_f32")?,
+            add_bias_f32: load_f32("add_bias_f32")?,
+            add_bias_inplace_f32: load_f32("add_bias_inplace_f32")?,
             mul_f32: load_f32("mul_f32")?,
             mul_scalar_f32: load_f32("mul_scalar_f32")?,
             silu_f32: load_f32("silu_f32")?,
@@ -197,6 +232,8 @@ impl CudaBackend {
             split_qkv_f32: load_f32("split_qkv_f32")?,
             // F16 kernels
             add_f16: load_f16("add_f16")?,
+            add_bias_f16: load_f16("add_bias_f16")?,
+            add_bias_inplace_f16: load_f16("add_bias_inplace_f16")?,
             mul_f16: load_f16("mul_f16")?,
             mul_scalar_f16: load_f16("mul_scalar_f16")?,
             silu_f16: load_f16("silu_f16")?,
@@ -223,6 +260,14 @@ impl CudaBackend {
             // Paged attention (decode)
             paged_attention_f32: load_f32("paged_attention_f32")?,
             paged_attention_f16: load_f16("paged_attention_f16")?,
+            scatter_kv_f32: load_f32("scatter_kv_f32")?,
+            scatter_kv_f16: load_f16("scatter_kv_f16")?,
+            argmax_f32: load_f32("argmax_f32")?,
+            argmax_f16: load_f16("argmax_f16")?,
+            sample_gumbel_f32: load_f32("sample_gumbel_f32")?,
+            sample_gumbel_f16: load_f16("sample_gumbel_f16")?,
+            sample_perrow_f32: load_f32("sample_perrow_f32")?,
+            sample_perrow_f16: load_f16("sample_perrow_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -242,6 +287,9 @@ impl CudaBackend {
         let rope_sin_buf = stream
             .alloc_zeros::<f32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc rope_sin: {e}")))?;
+        let slot_mapping_buf = stream
+            .alloc_zeros::<i32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc scatter_slot_mapping: {e}")))?;
 
         Ok(Self {
             ctx,
@@ -250,25 +298,39 @@ impl CudaBackend {
             kernels: Arc::new(kernels),
             _module_f32: module_f32,
             _module_f16: module_f16,
+            // Host mirrors are sized to match their device buffers (invariant:
+            // `host.len() == buf.len()`), so `upload_*` never resizes the host
+            // on the hot path — only `ensure_*` grows both together (bumping
+            // `version`), keeping the captured H2D source pointer stable.
             paged_block_tables: Arc::new(Mutex::new(I32Scratch {
                 buf: block_tables,
                 version: 0,
+                host: vec![0i32; initial_scratch_cap],
             })),
             paged_kv_lens: Arc::new(Mutex::new(I32Scratch {
                 buf: kv_lens,
                 version: 0,
+                host: vec![0i32; initial_scratch_cap],
             })),
             embedding_indices: Arc::new(Mutex::new(U32Scratch {
                 buf: emb_indices,
                 version: 0,
+                host: vec![0u32; initial_scratch_cap],
             })),
             rope_cos: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_cos_buf,
                 version: 0,
+                host: vec![0.0f32; initial_scratch_cap],
             })),
             rope_sin: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_sin_buf,
                 version: 0,
+                host: vec![0.0f32; initial_scratch_cap],
+            })),
+            scatter_slot_mapping: Arc::new(Mutex::new(I32Scratch {
+                buf: slot_mapping_buf,
+                version: 0,
+                host: vec![0i32; initial_scratch_cap],
             })),
         })
     }
@@ -302,18 +364,17 @@ impl CudaBackend {
             .lock()
             .map(|g| g.version)
             .unwrap_or(0);
-        let kv = self
-            .paged_kv_lens
-            .lock()
-            .map(|g| g.version)
-            .unwrap_or(0);
+        let kv = self.paged_kv_lens.lock().map(|g| g.version).unwrap_or(0);
         (bt, kv)
     }
 
     /// Version of the embedding indices scratch (bumps on grow). See
     /// `paged_scratch_versions` for the consumer semantics.
     pub fn embedding_scratch_version(&self) -> u64 {
-        self.embedding_indices.lock().map(|g| g.version).unwrap_or(0)
+        self.embedding_indices
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
     }
 
     /// `(rope_cos_version, rope_sin_version)`.
@@ -321,6 +382,183 @@ impl CudaBackend {
         let c = self.rope_cos.lock().map(|g| g.version).unwrap_or(0);
         let s = self.rope_sin.lock().map(|g| g.version).unwrap_or(0);
         (c, s)
+    }
+
+    /// Version of the scatter slot_mapping scratch (bumps on grow).
+    pub fn scatter_slot_mapping_version(&self) -> u64 {
+        self.scatter_slot_mapping
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
+    }
+
+    /// Upload `slot_mapping` into the persistent device scratch. This is the
+    /// capture-UNSAFE half of the KV scatter (a `memcpy_htod`) and must run
+    /// OUTSIDE any captured region — call it in the stage phase, before
+    /// `graph.launch`. The captured `scatter_kv` then reads the staged buffer.
+    ///
+    /// Returns the staged length (= `slot_mapping.len()`), which the caller
+    /// passes to `scatter_kv` as `n_rows`.
+    pub fn stage_slot_mapping(&self, slot_mapping: &[i32]) -> Result<usize> {
+        let mut scratch = self
+            .scatter_slot_mapping
+            .lock()
+            .map_err(|_| ForgeError::Cuda("scatter_slot_mapping mutex poisoned".into()))?;
+        self.ensure_i32_scratch(&mut scratch, slot_mapping.len().max(1))?;
+        if !slot_mapping.is_empty() {
+            self.stream
+                .memcpy_htod(slot_mapping, &mut scratch.buf)
+                .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        }
+        Ok(slot_mapping.len())
+    }
+
+    /// Upload one decode step's per-step inputs (token ids, RoPE cos/sin,
+    /// paged block tables, KV lengths) into their persistent device scratches
+    /// (each via the host-mirror `upload_*` path, so the captured `memcpy_htod`
+    /// nodes keep a stable host source pointer). Capture-UNSAFE — call OUTSIDE
+    /// any captured region; the captured `compute_decode` then re-reads these
+    /// scratches on replay.
+    pub fn stage_decode_inputs_impl(
+        &self,
+        token_indices: &[u32],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+        block_tables: &[i32],
+        kv_lens: &[i32],
+    ) -> Result<()> {
+        {
+            let mut s = self
+                .embedding_indices
+                .lock()
+                .map_err(|_| ForgeError::Cuda("embedding_indices mutex poisoned".into()))?;
+            self.upload_u32_scratch(&mut s, token_indices)?;
+        }
+        {
+            let mut s = self
+                .rope_cos
+                .lock()
+                .map_err(|_| ForgeError::Cuda("rope_cos mutex poisoned".into()))?;
+            self.upload_f32_scratch(&mut s, rope_cos)?;
+        }
+        {
+            let mut s = self
+                .rope_sin
+                .lock()
+                .map_err(|_| ForgeError::Cuda("rope_sin mutex poisoned".into()))?;
+            self.upload_f32_scratch(&mut s, rope_sin)?;
+        }
+        {
+            let mut s = self
+                .paged_block_tables
+                .lock()
+                .map_err(|_| ForgeError::Cuda("paged_block_tables mutex poisoned".into()))?;
+            self.upload_i32_scratch(&mut s, block_tables)?;
+        }
+        {
+            let mut s = self
+                .paged_kv_lens
+                .lock()
+                .map_err(|_| ForgeError::Cuda("paged_kv_lens mutex poisoned".into()))?;
+            self.upload_i32_scratch(&mut s, kv_lens)?;
+        }
+        Ok(())
+    }
+
+    /// Capture-safe KV scatter: writes the first `n_rows` rows of `src` into
+    /// `pool` at the slots previously uploaded via `stage_slot_mapping`. Pure
+    /// kernel launch (reads the device slot_mapping scratch) — no host upload,
+    /// so it can be recorded inside a captured CUDA Graph.
+    ///
+    /// `pool` is rank-3 `[num_blocks, block_size, kv_dim]`; `src` is
+    /// `[>= n_rows, kv_dim]`. Bounds are enforced defensively in-kernel
+    /// (OOB/negative slots are skipped); the host should have validated during
+    /// staging.
+    pub fn scatter_kv(&self, pool: &mut CudaTensor, src: &CudaTensor, n_rows: usize) -> Result<()> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        if pool.dtype() != src.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: pool/src dtype mismatch ({:?} vs {:?})",
+                pool.dtype(),
+                src.dtype()
+            )));
+        }
+        let pool_shape = pool.shape().to_vec();
+        if pool_shape.len() != 3 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: pool must be rank-3 [num_blocks, block_size, kv_dim], got {pool_shape:?}"
+            )));
+        }
+        let block_size = pool_shape[1];
+        let kv_dim = pool_shape[2];
+        let total_slots = pool_shape[0] * block_size;
+        let src_rows = src.shape().first().copied().unwrap_or(0);
+        if src_rows < n_rows {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: src has {src_rows} rows but n_rows={n_rows}"
+            )));
+        }
+
+        let scratch = self
+            .scatter_slot_mapping
+            .lock()
+            .map_err(|_| ForgeError::Cuda("scatter_slot_mapping mutex poisoned".into()))?;
+        if scratch.buf.len() < n_rows {
+            return Err(ForgeError::InvalidArgument(format!(
+                "scatter_kv: slot_mapping scratch holds {} entries but n_rows={n_rows} (call stage_slot_mapping first)",
+                scratch.buf.len()
+            )));
+        }
+        let slot_dev = &scratch.buf;
+
+        let n_rows_u32 = n_rows as u32;
+        let kv_dim_u32 = kv_dim as u32;
+        let total_slots_u32 = total_slots as u32;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (256.min(kv_dim as u32).max(1), 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        match pool.dtype() {
+            DType::F32 => {
+                let p = pool.f32_slice_mut()?;
+                let s = src.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.scatter_kv_f32);
+                builder.arg(p);
+                builder.arg(s);
+                builder.arg(slot_dev);
+                builder.arg(&n_rows_u32);
+                builder.arg(&kv_dim_u32);
+                builder.arg(&total_slots_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+                Ok(())
+            }
+            DType::F16 => {
+                let p = pool.f16_slice_mut()?;
+                let s = src.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.scatter_kv_f16);
+                builder.arg(p);
+                builder.arg(s);
+                builder.arg(slot_dev);
+                builder.arg(&n_rows_u32);
+                builder.arg(&kv_dim_u32);
+                builder.arg(&total_slots_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+                Ok(())
+            }
+            other => Err(ForgeError::UnsupportedDtype(other)),
+        }
     }
 
     /// Grow `scratch` if its capacity is below `needed`. Bumps `version` on
@@ -333,6 +571,11 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<i32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow i32 scratch: {e}")))?;
+            // Grow the HOST mirror in lockstep: a captured graph bakes the
+            // mirror's pointer as its H2D source, so the mirror must only move
+            // when `version` bumps (else a bucket-size change reallocs the host
+            // Vec without invalidating captures → replay reads freed memory).
+            scratch.host.resize(new_cap, 0);
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
@@ -346,6 +589,8 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<u32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow u32 scratch: {e}")))?;
+            // Host mirror grows with the device buffer — see ensure_i32_scratch.
+            scratch.host.resize(new_cap, 0);
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
@@ -359,9 +604,50 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<f32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow f32 scratch: {e}")))?;
+            // Host mirror grows with the device buffer — see ensure_i32_scratch.
+            scratch.host.resize(new_cap, 0.0);
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
+    }
+
+    /// Upload `src` into `scratch`'s device buffer, sourcing the `memcpy_htod`
+    /// from the scratch's persistent HOST mirror (not `src` directly). A
+    /// captured CUDA Graph bakes the H2D source pointer; the mirror is a
+    /// stable backend-owned buffer, so the baked pointer stays valid across
+    /// capture + replay even after the caller's `src` Vec is dropped. See the
+    /// `I32Scratch::host` doc. The mirror never shrinks → pointer is stable
+    /// once warmed to steady-state size (a `grow` bumps `version`, which the
+    /// capture cache uses to invalidate).
+    fn upload_i32_scratch(&self, scratch: &mut I32Scratch, src: &[i32]) -> Result<()> {
+        // `ensure_*` grows the host mirror with the device buffer (bumping
+        // `version`), so the mirror is always large enough here — never resize
+        // it on this path, which would move the pointer without a version bump.
+        self.ensure_i32_scratch(scratch, src.len().max(1))?;
+        scratch.host[..src.len()].copy_from_slice(src);
+        self.stream
+            .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// u32 sibling of `upload_i32_scratch`.
+    fn upload_u32_scratch(&self, scratch: &mut U32Scratch, src: &[u32]) -> Result<()> {
+        // See upload_i32_scratch: the mirror is pre-sized by `ensure_*`.
+        self.ensure_u32_scratch(scratch, src.len().max(1))?;
+        scratch.host[..src.len()].copy_from_slice(src);
+        self.stream
+            .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// f32 sibling of `upload_i32_scratch`.
+    fn upload_f32_scratch(&self, scratch: &mut F32Scratch, src: &[f32]) -> Result<()> {
+        // See upload_i32_scratch: the mirror is pre-sized by `ensure_*`.
+        self.ensure_f32_scratch(scratch, src.len().max(1))?;
+        scratch.host[..src.len()].copy_from_slice(src);
+        self.stream
+            .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
     }
 
     /// Inherent implementation of paged_attention_into. The `Backend` trait
@@ -401,6 +687,11 @@ impl CudaBackend {
                 "paged_attention_into: k_pool/v_pool shape mismatch ({pool_shape:?} vs {:?})",
                 v_pool.shape()
             )));
+        }
+        if num_kv_heads == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "paged_attention_into: num_kv_heads must be > 0".into(),
+            ));
         }
         let kv_dim_expected = num_kv_heads * head_dim;
         if pool_shape[2] != kv_dim_expected {
@@ -490,19 +781,13 @@ impl CudaBackend {
             .paged_block_tables
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_block_tables mutex poisoned".into()))?;
-        self.ensure_i32_scratch(&mut bt_scratch, block_tables.len())?;
-        self.stream
-            .memcpy_htod(block_tables, &mut bt_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_i32_scratch(&mut bt_scratch, block_tables)?;
 
         let mut kv_scratch = self
             .paged_kv_lens
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_kv_lens mutex poisoned".into()))?;
-        self.ensure_i32_scratch(&mut kv_scratch, kv_lens.len())?;
-        self.stream
-            .memcpy_htod(kv_lens, &mut kv_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_i32_scratch(&mut kv_scratch, kv_lens)?;
 
         let block_tables_dev = &bt_scratch.buf;
         let kv_lens_dev = &kv_scratch.buf;
@@ -792,12 +1077,7 @@ impl Backend for CudaBackend {
     /// Same gemm logic as `matmul`, just doesn't allocate the output.
     /// Used by the engine's persistent-buffer / CUDA-Graph capture path
     /// so the captured kernel's output pointer is stable across replays.
-    fn matmul_into(
-        &self,
-        out: &mut CudaTensor,
-        a: &CudaTensor,
-        b: &CudaTensor,
-    ) -> Result<()> {
+    fn matmul_into(&self, out: &mut CudaTensor, a: &CudaTensor, b: &CudaTensor) -> Result<()> {
         let a_shape = a.shape();
         let b_shape = b.shape();
         if a_shape.len() != 2 || b_shape.len() != 2 {
@@ -907,13 +1187,141 @@ impl Backend for CudaBackend {
         Ok(out)
     }
 
+    /// Broadcast bias add: `out[r,c] = x[r,c] + bias[c]`. x is `[rows, cols]`,
+    /// bias is `[cols]`. Used for Qwen2 QKV projection bias.
+    fn add_bias(&self, x: &CudaTensor, bias: &CudaTensor) -> Result<CudaTensor> {
+        let shape = x.shape();
+        if shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "add_bias: x must be 2D [rows, cols]".into(),
+            ));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        if bias.shape() != [cols] {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: bias.shape().to_vec(),
+            });
+        }
+        if x.dtype() != bias.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "add_bias: x dtype {:?} != bias dtype {:?}",
+                x.dtype(),
+                bias.dtype()
+            )));
+        }
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let n = (rows * cols) as u32;
+        let mut out = self.allocate_zeros(shape, x.dtype())?;
+
+        match x.dtype() {
+            DType::F32 => {
+                let x_s = x.f32_slice()?;
+                let b_s = bias.f32_slice()?;
+                let o = out.f32_slice_mut()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias_f32);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(b_s);
+                builder.arg(&rows_u);
+                builder.arg(&cols_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let x_s = x.f16_slice()?;
+                let b_s = bias.f16_slice()?;
+                let o = out.f16_slice_mut()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias_f16);
+                builder.arg(o);
+                builder.arg(x_s);
+                builder.arg(b_s);
+                builder.arg(&rows_u);
+                builder.arg(&cols_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+        Ok(out)
+    }
+
+    /// In-place broadcast bias add — `buf[r, c] += bias[c]` — via a dedicated
+    /// kernel (no allocation), so the buffer's device pointer is stable and the
+    /// op is CUDA-Graph-capturable. See [`Backend::add_bias_into`].
+    fn add_bias_into(&self, buf: &mut CudaTensor, bias: &CudaTensor) -> Result<()> {
+        let shape = buf.shape();
+        if shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "add_bias_into: buf must be 2D [rows, cols]".into(),
+            ));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        if bias.shape() != [cols] {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![cols],
+                got: bias.shape().to_vec(),
+            });
+        }
+        if buf.dtype() != bias.dtype() {
+            return Err(ForgeError::InvalidArgument(format!(
+                "add_bias_into: buf dtype {:?} != bias dtype {:?}",
+                buf.dtype(),
+                bias.dtype()
+            )));
+        }
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let n = (rows * cols) as u32;
+        match buf.dtype() {
+            DType::F32 => {
+                let b_s = bias.f32_slice()?;
+                let buf_s = buf.f32_slice_mut()?;
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.add_bias_inplace_f32);
+                builder.arg(buf_s);
+                builder.arg(b_s);
+                builder.arg(&rows_u);
+                builder.arg(&cols_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let b_s = bias.f16_slice()?;
+                let buf_s = buf.f16_slice_mut()?;
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.add_bias_inplace_f16);
+                builder.arg(buf_s);
+                builder.arg(b_s);
+                builder.arg(&rows_u);
+                builder.arg(&cols_u);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(n))
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+        Ok(())
+    }
+
     /// In-place add into a caller-provided buffer. See `matmul_into`.
-    fn add_into(
-        &self,
-        out: &mut CudaTensor,
-        a: &CudaTensor,
-        b: &CudaTensor,
-    ) -> Result<()> {
+    fn add_into(&self, out: &mut CudaTensor, a: &CudaTensor, b: &CudaTensor) -> Result<()> {
         validate_same_shape(a, b)?;
         if out.shape() != a.shape() {
             return Err(ForgeError::ShapeMismatch {
@@ -1139,9 +1547,7 @@ impl Backend for CudaBackend {
                 let g = gate.f16_slice()?;
                 let u = up.f16_slice()?;
                 let o = out.f16_slice_mut()?;
-                let mut builder = self
-                    .stream
-                    .launch_builder(&self.kernels.fused_silu_mul_f16);
+                let mut builder = self.stream.launch_builder(&self.kernels.fused_silu_mul_f16);
                 builder.arg(o);
                 builder.arg(g);
                 builder.arg(u);
@@ -1157,9 +1563,7 @@ impl Backend for CudaBackend {
                 let g = gate.f32_slice()?;
                 let u = up.f32_slice()?;
                 let o = out.f32_slice_mut()?;
-                let mut builder = self
-                    .stream
-                    .launch_builder(&self.kernels.fused_silu_mul_f32);
+                let mut builder = self.stream.launch_builder(&self.kernels.fused_silu_mul_f32);
                 builder.arg(o);
                 builder.arg(g);
                 builder.arg(u);
@@ -1278,7 +1682,14 @@ impl Backend for CudaBackend {
         validate_same_shape(x, residual)?;
         let mut normed = self.allocate_zeros(&x.shape, x.dtype())?;
         let mut residual_out = self.allocate_zeros(&x.shape, x.dtype())?;
-        self.fused_residual_rms_norm_into(&mut normed, &mut residual_out, x, residual, weight, eps)?;
+        self.fused_residual_rms_norm_into(
+            &mut normed,
+            &mut residual_out,
+            x,
+            residual,
+            weight,
+            eps,
+        )?;
         Ok((normed, residual_out))
     }
 
@@ -1461,19 +1872,13 @@ impl Backend for CudaBackend {
             .rope_cos
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_cos mutex poisoned".into()))?;
-        self.ensure_f32_scratch(&mut cos_scratch, expected)?;
-        self.stream
-            .memcpy_htod(cos_host, &mut cos_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_f32_scratch(&mut cos_scratch, cos_host)?;
 
         let mut sin_scratch = self
             .rope_sin
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_sin mutex poisoned".into()))?;
-        self.ensure_f32_scratch(&mut sin_scratch, expected)?;
-        self.stream
-            .memcpy_htod(sin_host, &mut sin_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_f32_scratch(&mut sin_scratch, sin_host)?;
 
         let cos_dev = &cos_scratch.buf;
         let sin_dev = &sin_scratch.buf;
@@ -1700,8 +2105,7 @@ impl Backend for CudaBackend {
             ));
         }
         let embedding_dim = weight_shape[1];
-        let mut out =
-            self.allocate_zeros(&[indices.len(), embedding_dim], weight.dtype())?;
+        let mut out = self.allocate_zeros(&[indices.len(), embedding_dim], weight.dtype())?;
         self.embedding_into(&mut out, weight, indices)?;
         Ok(out)
     }
@@ -1762,10 +2166,7 @@ impl Backend for CudaBackend {
             .embedding_indices
             .lock()
             .map_err(|_| ForgeError::Cuda("embedding_indices mutex poisoned".into()))?;
-        self.ensure_u32_scratch(&mut indices_scratch, num_indices)?;
-        self.stream
-            .memcpy_htod(indices, &mut indices_scratch.buf)
-            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        self.upload_u32_scratch(&mut indices_scratch, indices)?;
         let indices_dev = &indices_scratch.buf;
 
         let launch_cfg = LaunchConfig {
@@ -1833,12 +2234,7 @@ impl Backend for CudaBackend {
 
     /// In-place reshape via `memcpy_dtod` into the caller-provided buffer.
     /// Output device pointer is stable across calls — capture-safe.
-    fn reshape_into(
-        &self,
-        out: &mut CudaTensor,
-        x: &CudaTensor,
-        shape: &[usize],
-    ) -> Result<()> {
+    fn reshape_into(&self, out: &mut CudaTensor, x: &CudaTensor, shape: &[usize]) -> Result<()> {
         let want_numel: usize = shape.iter().product();
         if want_numel != x.len() {
             return Err(ForgeError::ShapeMismatch {
@@ -2286,8 +2682,7 @@ impl Backend for CudaBackend {
             // Match the trait default impl semantics for empty batch.
             return self.allocate(&[0, num_heads * head_dim], q.dtype());
         }
-        let mut out =
-            self.allocate_zeros(&[batch_size, num_heads * head_dim], q.dtype())?;
+        let mut out = self.allocate_zeros(&[batch_size, num_heads * head_dim], q.dtype())?;
         self.paged_attention_into(
             &mut out,
             q,
@@ -2625,8 +3020,9 @@ impl Backend for CudaBackend {
                     .alloc_zeros::<half::f16>(n as usize)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
-                let mut builder =
-                    self.stream.launch_builder(&self.kernels.apply_causal_mask_f16);
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.apply_causal_mask_f16);
                 builder.arg(&mut out);
                 builder.arg(scores.f16_slice()?);
                 builder.arg(&seq_len_u32);
@@ -2645,8 +3041,9 @@ impl Backend for CudaBackend {
                     .alloc_zeros::<f32>(n as usize)
                     .map_err(|e| ForgeError::Cuda(e.to_string()))?;
 
-                let mut builder =
-                    self.stream.launch_builder(&self.kernels.apply_causal_mask_f32);
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.apply_causal_mask_f32);
                 builder.arg(&mut out);
                 builder.arg(scores.f32_slice()?);
                 builder.arg(&seq_len_u32);
@@ -2689,8 +3086,9 @@ impl Backend for CudaBackend {
 
                 for (h_idx, head) in heads.iter().enumerate() {
                     let head_idx_u32 = h_idx as u32;
-                    let mut builder =
-                        self.stream.launch_builder(&self.kernels.interleave_heads_f16);
+                    let mut builder = self
+                        .stream
+                        .launch_builder(&self.kernels.interleave_heads_f16);
                     builder.arg(&mut out);
                     builder.arg(head.f16_slice()?);
                     builder.arg(&seq_len_u32);
@@ -2714,8 +3112,9 @@ impl Backend for CudaBackend {
 
                 for (h_idx, head) in heads.iter().enumerate() {
                     let head_idx_u32 = h_idx as u32;
-                    let mut builder =
-                        self.stream.launch_builder(&self.kernels.interleave_heads_f32);
+                    let mut builder = self
+                        .stream
+                        .launch_builder(&self.kernels.interleave_heads_f32);
                     builder.arg(&mut out);
                     builder.arg(head.f32_slice()?);
                     builder.arg(&seq_len_u32);
@@ -2749,8 +3148,7 @@ impl Backend for CudaBackend {
         let seq_len = q.shape()[1];
 
         // Route through attention_fwd (FA2 when feature enabled, naive otherwise)
-        let result_4d =
-            crate::flash_attention::attention_fwd(self, q, k, v, scale, is_causal)?;
+        let result_4d = crate::flash_attention::attention_fwd(self, q, k, v, scale, is_causal)?;
 
         // Flatten from [1, seq_len, num_heads, head_dim] → [seq_len, num_heads * head_dim]
         self.reshape(&result_4d, &[seq_len, num_heads * head_dim])
@@ -2915,5 +3313,344 @@ impl Backend for CudaBackend {
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
+    }
+
+    /// On-device per-row argmax: one block reduces one row of `[rows, cols]`
+    /// logits to its max-value index, so only `rows` ids cross PCIe (vs the
+    /// full logits in the default impl). Tie-break matches the CPU sampler —
+    /// highest index among equal maxima (see [`Backend::argmax`]).
+    fn argmax(&self, logits: &CudaTensor) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1usize, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "argmax: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "argmax: empty logits (cols == 0)".into(),
+            ));
+        }
+
+        let mut out_ids = self
+            .stream
+            .alloc_zeros::<u32>(rows)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let block_dim = next_power_of_2(256u32.min(cols as u32)).max(1);
+        // Reduction scratch: one f32 value + one u32 index per thread.
+        let shared_mem = block_dim * 8;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        match logits.dtype() {
+            DType::F32 => {
+                let l = logits.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.argmax_f32);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let l = logits.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.argmax_f16);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+
+        self.stream
+            .memcpy_dtov(&out_ids)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// On-device Gumbel-max multinomial sample (see [`Backend::sample_gumbel`]).
+    /// One block per row perturbs each logit with Gumbel noise and reduces to
+    /// the argmax; only `rows` ids cross PCIe.
+    fn sample_gumbel(
+        &self,
+        logits: &CudaTensor,
+        temperature: f32,
+        seed: u64,
+        step: u32,
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1usize, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "sample_gumbel: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "sample_gumbel: empty logits (cols == 0)".into(),
+            ));
+        }
+        if temperature <= 0.0 || temperature.is_nan() {
+            return Err(ForgeError::InvalidArgument(
+                "sample_gumbel: temperature must be > 0 (use argmax for greedy)".into(),
+            ));
+        }
+
+        let mut out_ids = self
+            .stream
+            .alloc_zeros::<u32>(rows)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let inv_temp = 1.0f32 / temperature;
+        let block_dim = next_power_of_2(256u32.min(cols as u32)).max(1);
+        let shared_mem = block_dim * 8; // f32 value + u32 index per thread
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        match logits.dtype() {
+            DType::F32 => {
+                let l = logits.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_gumbel_f32);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&inv_temp);
+                builder.arg(&seed);
+                builder.arg(&step);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let l = logits.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_gumbel_f16);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&inv_temp);
+                builder.arg(&seed);
+                builder.arg(&step);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+
+        self.stream
+            .memcpy_dtov(&out_ids)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// On-device per-row sampling (see [`Backend::sample`]): one block per row,
+    /// greedy (argmax) when `temps[row] <= 0` else Gumbel-max. The per-row
+    /// params are uploaded to small device buffers (sampling runs outside any
+    /// captured region, so no staging is needed).
+    #[allow(clippy::too_many_arguments)]
+    fn sample(
+        &self,
+        logits: &CudaTensor,
+        temps: &[f32],
+        min_ps: &[f32],
+        top_ks: &[u32],
+        top_ps: &[f32],
+        seeds: &[u64],
+        steps: &[u32],
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1usize, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "sample: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "sample: empty logits (cols == 0)".into(),
+            ));
+        }
+        if temps.len() != rows
+            || min_ps.len() != rows
+            || top_ks.len() != rows
+            || top_ps.len() != rows
+            || seeds.len() != rows
+            || steps.len() != rows
+        {
+            return Err(ForgeError::InvalidArgument(format!(
+                "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
+                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
+            )));
+        }
+
+        let temps_dev = self
+            .stream
+            .memcpy_stod(temps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let min_ps_dev = self
+            .stream
+            .memcpy_stod(min_ps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let top_ks_dev = self
+            .stream
+            .memcpy_stod(top_ks)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let top_ps_dev = self
+            .stream
+            .memcpy_stod(top_ps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let seeds_dev = self
+            .stream
+            .memcpy_stod(seeds)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let steps_dev = self
+            .stream
+            .memcpy_stod(steps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let mut out_ids = self
+            .stream
+            .alloc_zeros::<u32>(rows)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let block_dim = next_power_of_2(256u32.min(cols as u32)).max(1);
+        let shared_mem = block_dim * 8; // f32 value + u32 index per thread
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        match logits.dtype() {
+            DType::F32 => {
+                let l = logits.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_perrow_f32);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&temps_dev);
+                builder.arg(&min_ps_dev);
+                builder.arg(&top_ks_dev);
+                builder.arg(&top_ps_dev);
+                builder.arg(&seeds_dev);
+                builder.arg(&steps_dev);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let l = logits.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_perrow_f16);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&temps_dev);
+                builder.arg(&min_ps_dev);
+                builder.arg(&top_ks_dev);
+                builder.arg(&top_ps_dev);
+                builder.arg(&seeds_dev);
+                builder.arg(&steps_dev);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+
+        self.stream
+            .memcpy_dtov(&out_ids)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    fn stage_decode_inputs(&self, inputs: &DecodeStageInputs) -> Result<()> {
+        self.stage_decode_inputs_impl(
+            inputs.token_indices,
+            inputs.rope_cos,
+            inputs.rope_sin,
+            inputs.block_tables,
+            inputs.kv_lens,
+        )
+    }
+
+    fn stage_slot_mapping(&self, slot_mapping: &[i32]) -> Result<usize> {
+        // Inherent method: uploads to the persistent device scratch.
+        CudaBackend::stage_slot_mapping(self, slot_mapping)
+    }
+
+    fn scatter_kv(
+        &self,
+        pool: &mut CudaTensor,
+        src: &CudaTensor,
+        _slot_mapping: &[i32],
+        n_rows: usize,
+    ) -> Result<()> {
+        // Capture-safe: ignore the host slot_mapping and read the device
+        // scratch staged by `stage_slot_mapping` — no host pointer is baked
+        // into the captured graph.
+        CudaBackend::scatter_kv(self, pool, src, n_rows)
+    }
+
+    fn make_decode_graph_runner(&self, buckets: &[u32]) -> Option<Box<dyn DecodeGraphDispatch>> {
+        Some(Box::new(DecodeGraphRunner::with_buckets(
+            self.ctx(),
+            self.stream(),
+            buckets.to_vec(),
+        )))
+    }
+
+    fn decode_capture_epoch(&self) -> u64 {
+        // Sum of every persistent decode scratch's grow-counter. Counters only
+        // increment, so any scratch reallocation (which moves the device
+        // pointer a captured graph baked) changes the sum and triggers
+        // re-capture in the engine.
+        let (bt, kv) = self.paged_scratch_versions();
+        let (cos, sin) = self.rope_scratch_versions();
+        bt.wrapping_add(kv)
+            .wrapping_add(cos)
+            .wrapping_add(sin)
+            .wrapping_add(self.embedding_scratch_version())
+            .wrapping_add(self.scatter_slot_mapping_version())
     }
 }

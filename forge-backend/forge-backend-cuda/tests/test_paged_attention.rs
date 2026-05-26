@@ -175,6 +175,23 @@ fn paged_attention_cuda_matches_default_impl() {
         )
         .expect_err("invalid head config should fail");
 
+    // ── Rejection: num_kv_heads == 0 must error, not panic on the
+    //    `num_heads % num_kv_heads` divide-by-zero (Codex PR #5 review) ──
+    let _ = backend
+        .paged_attention(
+            &q,
+            &k_pool,
+            &v_pool,
+            &block_tables,
+            &kv_lens,
+            max_blocks,
+            num_heads,
+            0, // num_kv_heads == 0
+            head_dim,
+            scale,
+        )
+        .expect_err("num_kv_heads == 0 should be rejected, not panic");
+
     // ── Rejection: shape mismatch on q ────────────────────────────
     let q_wrong = backend
         .copy_from_host_f32(&q_data[..16], &[1, 16])

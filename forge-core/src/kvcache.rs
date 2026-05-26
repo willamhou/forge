@@ -1,5 +1,5 @@
-use crate::tensor::Tensor;
 use crate::Result;
+use crate::tensor::Tensor;
 
 /// Inputs for a fused paged-attention kernel call, produced by paged caches
 /// and consumed by the model's decode path. Naive (non-paged) caches return
@@ -41,13 +41,7 @@ pub trait KvCache: Send + Sync {
     fn allocate(&mut self, seq_id: u64, initial_len: usize) -> Result<()>;
 
     /// Append new KV to cache for a specific layer.
-    fn append(
-        &mut self,
-        seq_id: u64,
-        layer: usize,
-        key: &Self::T,
-        value: &Self::T,
-    ) -> Result<()>;
+    fn append(&mut self, seq_id: u64, layer: usize, key: &Self::T, value: &Self::T) -> Result<()>;
 
     /// Retrieve the full cached K and V for a specific layer.
     /// Returns (key, value) where each is [total_cached_len, num_kv_heads * head_dim].
@@ -86,5 +80,42 @@ pub trait KvCache: Send + Sync {
         _seq_ids: &[u64],
     ) -> Result<Option<PagedAttentionInputs<'a, Self::T>>> {
         Ok(None)
+    }
+
+    /// Advance the cache by one decode token per sequence: allocate blocks as
+    /// needed and bump per-sequence lengths (host bookkeeping only — no device
+    /// KV write). Returns the absolute pool slot for each sequence's new token,
+    /// in `seq_ids` order.
+    ///
+    /// This is the bookkeeping half of an `append`, split out for the
+    /// capture-safe decode path: it must run on **every** decode step (so the
+    /// cache stays consistent even when the device KV write is a replayed
+    /// graph), whereas the device write happens in [`Self::scatter_decode`]
+    /// inside the captured region.
+    ///
+    /// Default: unsupported (only paged caches implement the capture-safe path).
+    fn advance_decode(&mut self, _seq_ids: &[u64]) -> Result<Vec<i32>> {
+        Err(crate::ForgeError::InvalidArgument(
+            "advance_decode: this KV cache does not support the capture-safe decode path".into(),
+        ))
+    }
+
+    /// Capture-safe device KV write for one layer: scatter the batch's `key`/
+    /// `value` rows (`[n_rows, kv_dim]`) into the layer's pool at the slots
+    /// from the matching [`Self::advance_decode`] (passed as `slot_mapping`).
+    /// Pure device op — the slot mapping was staged on-device beforehand.
+    ///
+    /// Default: unsupported.
+    fn scatter_decode(
+        &mut self,
+        _layer: usize,
+        _key: &Self::T,
+        _value: &Self::T,
+        _slot_mapping: &[i32],
+        _n_rows: usize,
+    ) -> Result<()> {
+        Err(crate::ForgeError::InvalidArgument(
+            "scatter_decode: this KV cache does not support the capture-safe decode path".into(),
+        ))
     }
 }

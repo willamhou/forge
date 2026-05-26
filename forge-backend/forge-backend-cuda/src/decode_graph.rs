@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
 
-use forge_core::Result;
+use forge_core::{DecodeGraphDispatch, Result};
 
 use crate::cuda_graph::CudaGraphCache;
 
@@ -52,11 +52,7 @@ impl DecodeGraphRunner {
     }
 
     /// Convenience: build a fresh `CudaGraphCache` and wrap.
-    pub fn with_buckets(
-        ctx: Arc<CudaContext>,
-        stream: Arc<CudaStream>,
-        buckets: Vec<u32>,
-    ) -> Self {
+    pub fn with_buckets(ctx: Arc<CudaContext>, stream: Arc<CudaStream>, buckets: Vec<u32>) -> Self {
         Self::new(CudaGraphCache::new(ctx, stream), buckets)
     }
 
@@ -122,5 +118,27 @@ impl DecodeGraphRunner {
     /// Invalidate just one bucket's captured graph.
     pub fn invalidate(&mut self, batch_size: u32) -> bool {
         self.cache.invalidate(batch_size)
+    }
+}
+
+// SAFETY: `DecodeGraphRunner` holds CUDA graph handles (raw `CUgraph` /
+// `CUgraphExec` pointers) that cudarc does not mark `Send`. The engine owns a
+// single runner and drives it from one task at a time — never concurrently
+// (see `CudaGraphCache`'s single-threaded stream contract). The handles are
+// tied to the backend's context, which is itself shared across tokio worker
+// threads (`CudaBackend: Send + Sync`); moving the runner between threads
+// sequentially is sound, concurrent access is not (and never happens).
+unsafe impl Send for DecodeGraphRunner {}
+
+impl DecodeGraphDispatch for DecodeGraphRunner {
+    fn dispatch(&mut self, batch_size: u32, fwd: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        // Adapt the engine's `&mut dyn FnMut` to the inherent `FnOnce` API:
+        // the closure is invoked at most once (on capture / fallback) and
+        // never on a replay cache hit — matching `DecodeGraphRunner::dispatch`.
+        DecodeGraphRunner::dispatch(self, batch_size, fwd)
+    }
+
+    fn invalidate_all(&mut self) {
+        DecodeGraphRunner::invalidate_all(self);
     }
 }
