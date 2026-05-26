@@ -267,6 +267,10 @@ macro_rules! sample_perrow_src {
             "                lz += __expf(z - z_max);\n",
             "            }\n",
             "            float z_min = forge_block_reduce_min(lmin, sval);\n",
+            // Floor at the f32 exp-underflow boundary so `mid` stays finite even
+            // if a logit is -inf (else the bisection collapses to -inf). Tokens
+            // below z_max-88 contribute 0 mass in f32 regardless.
+            "            z_min = fmaxf(z_min, z_max - 88.0f);\n",
             "            float Z = forge_block_reduce_sum(lz, sval);\n",
             "\n",
             "            if (do_top_k) {\n",

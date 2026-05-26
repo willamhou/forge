@@ -1274,10 +1274,15 @@ pub trait Backend: Send + Sync + 'static {
                     thresh = z_max + min_ps[r].ln();
                 }
                 if do_top_k || do_top_p {
+                    // Floor the bisection lower bound at the f32 exp-underflow
+                    // boundary: tokens below z_max-88 contribute 0 mass in f32
+                    // anyway, and this keeps `mid` finite even if a logit is
+                    // -inf (which would otherwise collapse the bisection).
                     let z_min = row
                         .iter()
                         .map(|&v| v * inv_temp)
-                        .fold(f32::INFINITY, f32::min);
+                        .fold(f32::INFINITY, f32::min)
+                        .max(z_max - 88.0);
                     let z_total: f32 = row.iter().map(|&v| (v * inv_temp - z_max).exp()).sum();
                     if do_top_k {
                         let (mut lo, mut hi) = (z_min, z_max);

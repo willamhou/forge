@@ -244,6 +244,23 @@ fn sample_top_p_restricts_to_nucleus() {
 }
 
 #[test]
+fn sample_with_neg_inf_logit_does_not_break_filtering() {
+    // A -inf logit (e.g. a masked token) must not collapse the top-p/top-k
+    // bisection (the lower bound is floored). top_p=0.9 keeps only the peak;
+    // the -inf token is never sampled.
+    let backend = CudaBackend::new(0).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[5.0, f32::NEG_INFINITY, 0.0, 0.0], &[1, 4])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[0], &[0.9], &[3], &[step])
+            .unwrap();
+        assert_eq!(s, vec![0], "peak must be picked, -inf token never (step {step})");
+    }
+}
+
+#[test]
 fn sample_top_k_matches_cpu_reference() {
     // Distribution check: GPU top-k sampling covers exactly the top-k set and
     // nothing outside it, over many draws.
