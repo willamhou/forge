@@ -25,6 +25,18 @@ pub trait Model: Send + Sync {
 
     fn config(&self) -> &ModelConfig;
 
+    /// Whether the capture-safe decode path (`stage_decode` + `compute_decode`)
+    /// is supported for this model. The engine only routes decode through the
+    /// CUDA-Graph path when this is true; otherwise it falls back to eager
+    /// `forward` (which can still feed device-side sampling). Default: true.
+    ///
+    /// A model returns false when an architectural feature isn't yet wired into
+    /// the persistent-buffer path (e.g. Llama's QKV-bias / Qwen2), so enabling
+    /// `--cuda-graph` degrades gracefully instead of failing decode.
+    fn supports_capture_decode(&self) -> bool {
+        true
+    }
+
     /// Allocate decode state for a fixed `batch_size`.
     ///
     /// Used by the engine's CUDA-Graph decode path (one state per bucket).

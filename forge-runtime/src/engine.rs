@@ -481,9 +481,11 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 min_ps.push(p.min_p.unwrap_or(0.0));
                 top_ks.push(p.top_k.unwrap_or(0) as u32);
                 top_ps.push(p.top_p);
-                // seed: explicit per-request seed, else derive from seq_id so
-                // each sequence still gets an independent, deterministic stream.
-                seeds.push(p.seed.unwrap_or(s.seq_id));
+                // Explicit per-request seed → reproducible. No seed → a fresh
+                // random seed each step, so unseeded sampling stays stochastic
+                // (matches the CPU sampler's thread_rng default; deriving from
+                // seq_id would make it deterministic — a behavioral regression).
+                seeds.push(p.seed.unwrap_or_else(rand::random));
                 steps.push(self.get_generated_count(s.seq_id) as u32);
             }
             Some((temps, min_ps, top_ks, top_ps, seeds, steps))
@@ -494,7 +496,12 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // Run the decode forward via the CUDA-Graph capture/replay path
         // (bucketed batch sizes) or the eager forward, then produce either the
         // per-seq token ids (fast path) or the host [N, vocab_size] logits.
-        let use_graph = self.decode_runner.is_some() && self.is_decode_bucket(n);
+        // Only capture/replay when the model supports the capture-safe decode
+        // path; otherwise (e.g. QKV-bias models) fall back to eager `forward`,
+        // which still feeds the device-sampling fast path below.
+        let use_graph = self.decode_runner.is_some()
+            && self.is_decode_bucket(n)
+            && self.model.supports_capture_decode();
         let decode_out: DecodeOut = if use_graph {
             // Lazily allocate this bucket's persistent decode state.
             if !self.decode_states.contains_key(&n) {

@@ -112,6 +112,12 @@ impl<B: Backend> LlamaAttention<B> {
         }
     }
 
+    /// Whether this attention has a QKV bias (Qwen2). The capture-safe decode
+    /// path doesn't support it yet, so the engine falls back to eager decode.
+    pub fn has_qkv_bias(&self) -> bool {
+        self.qkv_bias.is_some()
+    }
+
     /// Apply the fused QKV projection (matmul + optional bias).
     fn project_qkv(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
         let qkv = backend.matmul(x, &self.wqkv)?;
@@ -442,6 +448,11 @@ impl<B: Backend> LlamaDecoderLayer<B> {
             post_attention_layernorm,
             mlp,
         }
+    }
+
+    /// See [`LlamaAttention::has_qkv_bias`].
+    pub fn has_qkv_bias(&self) -> bool {
+        self.self_attn.has_qkv_bias()
     }
 
     pub fn forward(
