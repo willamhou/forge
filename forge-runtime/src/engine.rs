@@ -293,6 +293,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     }
                 }
             }
+
+            // Yield to the runtime after each scheduling step. The per-token
+            // path is fully synchronous (forward + blocking `synchronize` +
+            // `try_send`) and never awaits, so without this the loop monopolises
+            // its worker and the SSE handler task isn't polled until generation
+            // ends — making streaming clients receive every token at once. One
+            // cooperative yield per step lets the handler drain events live.
+            tokio::task::yield_now().await;
         }
     }
 
