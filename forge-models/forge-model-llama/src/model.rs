@@ -128,6 +128,15 @@ impl<B: Backend + Clone> LlamaModel<B> {
                 state.buffers.batch_size
             )));
         }
+        // Guard the parallel-Vec indexing below: a malformed ModelInput must
+        // return an error, not panic.
+        if input.token_ids.len() != n || input.positions.len() != n {
+            return Err(ForgeError::InvalidArgument(format!(
+                "stage_decode: ragged input — {n} seq_metadata but {} token_ids / {} positions",
+                input.token_ids.len(),
+                input.positions.len()
+            )));
+        }
         for (i, meta) in input.seq_metadata.iter().enumerate() {
             if meta.is_prefill {
                 return Err(ForgeError::InvalidArgument(
@@ -174,7 +183,14 @@ impl<B: Backend + Clone> LlamaModel<B> {
                 )));
             }
             for (j, &b) in bt.iter().enumerate() {
-                block_tables[i * max_blocks_per_seq + j] = b as i32;
+                // Block ids feed paged attention as i32; a wrap to negative
+                // would silently read garbage KV. Reject oversized pools.
+                block_tables[i * max_blocks_per_seq + j] =
+                    i32::try_from(b).map_err(|_| {
+                        ForgeError::InvalidArgument(format!(
+                            "stage_decode: block id {b} exceeds i32::MAX (KV pool too large)"
+                        ))
+                    })?;
             }
         }
 

@@ -383,7 +383,14 @@ impl<B: Backend + Clone> KvCache for PagedKvCache<B> {
             }
 
             let block_id = self.sequences.get(&seq_id).unwrap().block_ids[block_idx];
-            slot_mapping.push((block_id * block_size + slot) as i32);
+            // The scatter kernel consumes slots as i32; a wrap to negative
+            // would misdirect or skip the KV write. Reject oversized pools.
+            let slot_abs = block_id * block_size + slot;
+            slot_mapping.push(i32::try_from(slot_abs).map_err(|_| {
+                ForgeError::InvalidArgument(format!(
+                    "advance_decode: slot index {slot_abs} exceeds i32::MAX (KV pool too large)"
+                ))
+            })?);
 
             let seq_mut = self.sequences.get_mut(&seq_id).unwrap();
             seq_mut.num_tokens += 1;

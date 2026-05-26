@@ -60,6 +60,9 @@ struct KernelFunctions {
 
     scatter_kv_f32: CudaFunction,
     scatter_kv_f16: CudaFunction,
+    // Sampling
+    argmax_f32: CudaFunction,
+    argmax_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -153,7 +156,7 @@ impl CudaBackend {
 
         // Compile F32 kernels (concatenate all module sources)
         let f32_src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F32_SRC,
             forge_kernels::norm::F32_SRC,
             forge_kernels::positional::F32_SRC,
@@ -161,6 +164,7 @@ impl CudaBackend {
             forge_kernels::attention::F32_SRC,
             forge_kernels::decode_attention::F32_SRC,
             forge_kernels::paged_attention::F32_SRC,
+            forge_kernels::sampling::F32_SRC,
         );
         let ptx_f32 =
             compile_ptx(&f32_src).map_err(|e| ForgeError::Cuda(format!("nvrtc f32: {e}")))?;
@@ -170,7 +174,7 @@ impl CudaBackend {
 
         // Compile F16 kernels — requires cuda_fp16.h from CUDA toolkit
         let f16_src = format!(
-            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F16_SRC,
             forge_kernels::norm::F16_SRC,
             forge_kernels::positional::F16_SRC,
@@ -178,6 +182,7 @@ impl CudaBackend {
             forge_kernels::attention::F16_SRC,
             forge_kernels::decode_attention::F16_SRC,
             forge_kernels::paged_attention::F16_SRC,
+            forge_kernels::sampling::F16_SRC,
         );
         let cuda_include = Self::find_cuda_include()?;
         let ptx_f16 = cudarc::nvrtc::compile_ptx_with_opts(
@@ -249,6 +254,8 @@ impl CudaBackend {
             paged_attention_f16: load_f16("paged_attention_f16")?,
             scatter_kv_f32: load_f32("scatter_kv_f32")?,
             scatter_kv_f16: load_f16("scatter_kv_f16")?,
+            argmax_f32: load_f32("argmax_f32")?,
+            argmax_f16: load_f16("argmax_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -279,35 +286,39 @@ impl CudaBackend {
             kernels: Arc::new(kernels),
             _module_f32: module_f32,
             _module_f16: module_f16,
+            // Host mirrors are sized to match their device buffers (invariant:
+            // `host.len() == buf.len()`), so `upload_*` never resizes the host
+            // on the hot path — only `ensure_*` grows both together (bumping
+            // `version`), keeping the captured H2D source pointer stable.
             paged_block_tables: Arc::new(Mutex::new(I32Scratch {
                 buf: block_tables,
                 version: 0,
-                host: Vec::new(),
+                host: vec![0i32; initial_scratch_cap],
             })),
             paged_kv_lens: Arc::new(Mutex::new(I32Scratch {
                 buf: kv_lens,
                 version: 0,
-                host: Vec::new(),
+                host: vec![0i32; initial_scratch_cap],
             })),
             embedding_indices: Arc::new(Mutex::new(U32Scratch {
                 buf: emb_indices,
                 version: 0,
-                host: Vec::new(),
+                host: vec![0u32; initial_scratch_cap],
             })),
             rope_cos: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_cos_buf,
                 version: 0,
-                host: Vec::new(),
+                host: vec![0.0f32; initial_scratch_cap],
             })),
             rope_sin: Arc::new(Mutex::new(F32Scratch {
                 buf: rope_sin_buf,
                 version: 0,
-                host: Vec::new(),
+                host: vec![0.0f32; initial_scratch_cap],
             })),
             scatter_slot_mapping: Arc::new(Mutex::new(I32Scratch {
                 buf: slot_mapping_buf,
                 version: 0,
-                host: Vec::new(),
+                host: vec![0i32; initial_scratch_cap],
             })),
         })
     }
@@ -548,6 +559,11 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<i32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow i32 scratch: {e}")))?;
+            // Grow the HOST mirror in lockstep: a captured graph bakes the
+            // mirror's pointer as its H2D source, so the mirror must only move
+            // when `version` bumps (else a bucket-size change reallocs the host
+            // Vec without invalidating captures → replay reads freed memory).
+            scratch.host.resize(new_cap, 0);
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
@@ -561,6 +577,8 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<u32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow u32 scratch: {e}")))?;
+            // Host mirror grows with the device buffer — see ensure_i32_scratch.
+            scratch.host.resize(new_cap, 0);
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
@@ -574,6 +592,8 @@ impl CudaBackend {
                 .stream
                 .alloc_zeros::<f32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow f32 scratch: {e}")))?;
+            // Host mirror grows with the device buffer — see ensure_i32_scratch.
+            scratch.host.resize(new_cap, 0.0);
             scratch.version = scratch.version.wrapping_add(1);
         }
         Ok(())
@@ -588,10 +608,10 @@ impl CudaBackend {
     /// once warmed to steady-state size (a `grow` bumps `version`, which the
     /// capture cache uses to invalidate).
     fn upload_i32_scratch(&self, scratch: &mut I32Scratch, src: &[i32]) -> Result<()> {
+        // `ensure_*` grows the host mirror with the device buffer (bumping
+        // `version`), so the mirror is always large enough here — never resize
+        // it on this path, which would move the pointer without a version bump.
         self.ensure_i32_scratch(scratch, src.len().max(1))?;
-        if scratch.host.len() < src.len() {
-            scratch.host.resize(src.len(), 0);
-        }
         scratch.host[..src.len()].copy_from_slice(src);
         self.stream
             .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
@@ -600,10 +620,8 @@ impl CudaBackend {
 
     /// u32 sibling of `upload_i32_scratch`.
     fn upload_u32_scratch(&self, scratch: &mut U32Scratch, src: &[u32]) -> Result<()> {
+        // See upload_i32_scratch: the mirror is pre-sized by `ensure_*`.
         self.ensure_u32_scratch(scratch, src.len().max(1))?;
-        if scratch.host.len() < src.len() {
-            scratch.host.resize(src.len(), 0);
-        }
         scratch.host[..src.len()].copy_from_slice(src);
         self.stream
             .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
@@ -612,10 +630,8 @@ impl CudaBackend {
 
     /// f32 sibling of `upload_i32_scratch`.
     fn upload_f32_scratch(&self, scratch: &mut F32Scratch, src: &[f32]) -> Result<()> {
+        // See upload_i32_scratch: the mirror is pre-sized by `ensure_*`.
         self.ensure_f32_scratch(scratch, src.len().max(1))?;
-        if scratch.host.len() < src.len() {
-            scratch.host.resize(src.len(), 0.0);
-        }
         scratch.host[..src.len()].copy_from_slice(src);
         self.stream
             .memcpy_htod(&scratch.host[..src.len()], &mut scratch.buf)
@@ -3219,6 +3235,78 @@ impl Backend for CudaBackend {
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
+    }
+
+    /// On-device per-row argmax: one block reduces one row of `[rows, cols]`
+    /// logits to its max-value index, so only `rows` ids cross PCIe (vs the
+    /// full logits in the default impl). Tie-break matches the CPU sampler —
+    /// highest index among equal maxima (see [`Backend::argmax`]).
+    fn argmax(&self, logits: &CudaTensor) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1usize, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "argmax: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "argmax: empty logits (cols == 0)".into(),
+            ));
+        }
+
+        let mut out_ids = self
+            .stream
+            .alloc_zeros::<u32>(rows)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let block_dim = next_power_of_2(256u32.min(cols as u32)).max(1);
+        // Reduction scratch: one f32 value + one u32 index per thread.
+        let shared_mem = block_dim * 8;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        match logits.dtype() {
+            DType::F32 => {
+                let l = logits.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.argmax_f32);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let l = logits.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.argmax_f16);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+
+        self.stream
+            .memcpy_dtov(&out_ids)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
     }
 
     fn stage_decode_inputs(&self, inputs: &DecodeStageInputs) -> Result<()> {

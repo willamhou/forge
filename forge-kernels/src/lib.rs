@@ -12,3 +12,4 @@ pub mod memory;
 pub mod norm;
 pub mod paged_attention;
 pub mod positional;
+pub mod sampling;

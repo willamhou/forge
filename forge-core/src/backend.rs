@@ -1080,6 +1080,48 @@ pub trait Backend: Send + Sync + 'static {
         self.copy_from_host_f32(&result, &[seq_len, num_heads * head_dim])
     }
 
+    /// Per-row argmax of `[rows, cols]` (or `[cols]`) logits → one token id per
+    /// row. This is greedy decode. Tie-break: the HIGHEST index among equal
+    /// maxima wins, matching the CPU sampler's `Iterator::max_by` (which
+    /// returns the last maximum), so the GPU path is bit-for-bit identical.
+    ///
+    /// Default: copy to host and reduce on CPU. Capture-capable backends
+    /// (CUDA) override this with an on-device reduction, so only the `rows`
+    /// resulting ids cross PCIe instead of the full `[rows, cols]` logits.
+    fn argmax(&self, logits: &Self::Tensor) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "argmax: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "argmax: empty logits (cols == 0)".into(),
+            ));
+        }
+        let host = self.copy_to_host_f32(logits)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let mut best = f32::NEG_INFINITY;
+            let mut best_i = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                // `>=` keeps the last (highest-index) maximum, matching `max_by`.
+                if v >= best {
+                    best = v;
+                    best_i = i;
+                }
+            }
+            out.push(best_i as u32);
+        }
+        Ok(out)
+    }
+
     /// Stage one decode step's per-step inputs (token ids, RoPE freqs, paged
     /// block tables, KV lengths) into persistent device scratch buffers, so a
     /// replayed captured [`Model::compute_decode`](crate::Model::compute_decode)

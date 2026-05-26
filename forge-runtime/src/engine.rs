@@ -447,23 +447,25 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 self.decode_states.insert(n, st);
             }
 
-            // A backend capture-epoch change means a device pointer a captured
-            // graph baked may have moved (scratch/pool realloc) — drop all
-            // captures so the next dispatch re-captures against fresh pointers.
-            let epoch = self.backend.decode_capture_epoch();
-            if epoch != self.last_capture_epoch {
-                if let Some(r) = self.decode_runner.as_mut() {
-                    r.invalidate_all();
-                }
-                self.last_capture_epoch = epoch;
-            }
-
             // Stage this step's inputs into persistent scratch (outside any
             // captured region) so a replayed graph reads fresh data.
             {
                 let state = self.decode_states.get_mut(&n).unwrap();
                 self.model
                     .stage_decode(&input, &mut *self.kv_cache, state)?;
+            }
+
+            // Capture-epoch check AFTER staging: staging is what grows the
+            // scratch/pool buffers, so any device/host pointer a captured graph
+            // baked may have moved during this very step. Checking here (rather
+            // than before `stage_decode`) guarantees a staging-time grow drops
+            // the stale graphs before `dispatch` could replay one.
+            let epoch = self.backend.decode_capture_epoch();
+            if epoch != self.last_capture_epoch {
+                if let Some(r) = self.decode_runner.as_mut() {
+                    r.invalidate_all();
+                }
+                self.last_capture_epoch = epoch;
             }
 
             // Capture-or-replay the pure-kernel compute. Disjoint-field borrows
