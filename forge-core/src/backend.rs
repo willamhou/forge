@@ -130,6 +130,18 @@ pub trait Backend: Send + Sync + 'static {
         self.copy_from_host_f32(&data, shape)
     }
 
+    /// In-place broadcast bias add: `buf[r, c] += bias[c]`. Used by the
+    /// capture-safe decode path for QKV bias (Qwen2) — the bias is a static
+    /// weight, so applying it in place keeps the buffer's device pointer
+    /// stable. Default: allocate via [`Self::add_bias`] then copy back with
+    /// `reshape_into` (NOT capture-safe — capture backends must override with a
+    /// true in-place kernel). CUDA does.
+    fn add_bias_into(&self, buf: &mut Self::Tensor, bias: &Self::Tensor) -> Result<()> {
+        let shape = buf.shape().to_vec();
+        let biased = self.add_bias(buf, bias)?;
+        self.reshape_into(buf, &biased, &shape)
+    }
+
     /// Matrix multiply, writing into a caller-provided output buffer.
     ///
     /// `a`: `[m, k]`, `b`: `[k, n]`, `out`: `[m, n]`; out dtype must match

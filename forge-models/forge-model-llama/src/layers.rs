@@ -317,18 +317,13 @@ impl<B: Backend> LlamaAttention<B> {
 
         // QKV bias not yet supported in the persistent-buffer (capture) path —
         // would need an add_bias_into op + a buffer for the biased qkv. The
-        // capture path isn't engine-wired yet anyway; reject loudly rather
-        // than silently dropping the bias (which would corrupt Qwen output).
-        if self.qkv_bias.is_some() {
-            return Err(ForgeError::InvalidArgument(
-                "forward_batch_into: QKV bias (Qwen2) not yet supported on the \
-                 persistent-buffer path; use the allocating forward_batch"
-                    .into(),
-            ));
-        }
-
-        // QKV projection + split. Reads from buffers.normed (caller convention).
+        // QKV projection + optional bias (Qwen2). Reads from buffers.normed
+        // (caller convention). `add_bias_into` mutates the persistent qkv buffer
+        // in place (the bias is a static weight), so it stays capture-safe.
         backend.matmul_into(&mut buffers.qkv, &buffers.normed, &self.wqkv)?;
+        if let Some(bias) = &self.qkv_bias {
+            backend.add_bias_into(&mut buffers.qkv, bias)?;
+        }
         backend.split_qkv_into(
             &mut buffers.q_2d,
             &mut buffers.k_2d,

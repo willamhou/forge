@@ -306,13 +306,6 @@ impl<B: Backend + Clone> Model for LlamaModel<B> {
         &self.config
     }
 
-    /// QKV bias (Qwen2) isn't wired into the persistent-buffer (capture) path,
-    /// so models that have it must use eager decode. The engine then skips the
-    /// CUDA-Graph path for them (device-side sampling still applies).
-    fn supports_capture_decode(&self) -> bool {
-        !self.layers.iter().any(|l| l.has_qkv_bias())
-    }
-
     fn make_decode_state(&self, batch_size: usize) -> Result<LlamaDecodeState<B>> {
         // Uniform-dtype buffers (F16 weights + F16 activations is the
         // production norm, and what the standard load path yields). Mixed

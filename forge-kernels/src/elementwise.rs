@@ -52,6 +52,16 @@ extern "C" __global__ void add_bias_f32(
         out[i] = x[i] + bias[i % cols];
     }
 }
+
+extern "C" __global__ void add_bias_inplace_f32(
+    float* buf, const float* bias, unsigned int rows, unsigned int cols
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int n = rows * cols;
+    if (i < n) {
+        buf[i] += bias[i % cols];
+    }
+}
 "#;
 
 pub const F16_SRC: &str = r#"
@@ -102,6 +112,16 @@ extern "C" __global__ void add_bias_f16(
     unsigned int n = rows * cols;
     if (i < n) {
         out[i] = __hadd(x[i], bias[i % cols]);
+    }
+}
+
+extern "C" __global__ void add_bias_inplace_f16(
+    __half* buf, const __half* bias, unsigned int rows, unsigned int cols
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int n = rows * cols;
+    if (i < n) {
+        buf[i] = __hadd(buf[i], bias[i % cols]);
     }
 }
 "#;
