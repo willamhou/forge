@@ -1,6 +1,27 @@
 use crate::tensor::Tensor;
 use crate::{DType, Result};
 
+/// Counter-based uniform in (0, 1) keyed on `(seed, step, row, col)`, bit-for-bit
+/// identical to `forge_uniform` in `forge-kernels/src/sampling.rs` so the CPU
+/// default and CUDA `sample_gumbel` paths draw the same numbers.
+fn forge_uniform(seed: u64, step: u32, row: u32, col: u32) -> f32 {
+    let mut x = seed
+        ^ (step as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (((row as u64) << 32) | (col as u64));
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^= x >> 31;
+    let hi = (x >> 40) as u32; // top 24 bits
+    (hi as f32 + 0.5) * (1.0 / 16_777_216.0)
+}
+
+/// Gumbel noise `-log(-log u)` for the Gumbel-max sampling trick.
+fn gumbel_noise(seed: u64, step: u32, row: u32, col: u32) -> f32 {
+    let u = forge_uniform(seed, step, row, col);
+    -(-(u.ln())).ln()
+}
+
 /// Per-step decode inputs the engine stages into backend-persistent scratch
 /// buffers before a captured/replayed decode forward (see
 /// [`Backend::stage_decode_inputs`]). On replay the captured graph re-reads
@@ -1114,6 +1135,62 @@ pub trait Backend: Send + Sync + 'static {
                 // `>=` keeps the last (highest-index) maximum, matching `max_by`.
                 if v >= best {
                     best = v;
+                    best_i = i;
+                }
+            }
+            out.push(best_i as u32);
+        }
+        Ok(out)
+    }
+
+    /// Per-row multinomial sample from `softmax(logits / temperature)` via the
+    /// Gumbel-max trick: `argmax_i(logits_i / T + g_i)` with
+    /// `g_i = -log(-log u_i)` and `u_i` a counter-based uniform keyed on
+    /// `(seed, step, row, col)`. This is the on-device draw used by vLLM/SGLang;
+    /// it is reproducible run-to-run for a fixed `(seed, step)` on the same
+    /// backend, but does NOT reproduce a CPU `StdRng` sequence.
+    ///
+    /// `temperature` must be > 0 (greedy/`T <= 0` callers use [`Self::argmax`]).
+    /// Default: copy to host and reduce on CPU with the identical RNG, so the
+    /// CPU and CUDA paths agree; CUDA overrides with an on-device kernel.
+    fn sample_gumbel(
+        &self,
+        logits: &Self::Tensor,
+        temperature: f32,
+        seed: u64,
+        step: u32,
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(crate::ForgeError::InvalidArgument(format!(
+                    "sample_gumbel: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(crate::ForgeError::InvalidArgument(
+                "sample_gumbel: empty logits (cols == 0)".into(),
+            ));
+        }
+        if !(temperature > 0.0) {
+            return Err(crate::ForgeError::InvalidArgument(
+                "sample_gumbel: temperature must be > 0 (use argmax for greedy)".into(),
+            ));
+        }
+        let inv_temp = 1.0 / temperature;
+        let host = self.copy_to_host_f32(logits)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &host[r * cols..(r + 1) * cols];
+            let mut best = f32::NEG_INFINITY;
+            let mut best_i = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                let key = v * inv_temp + gumbel_noise(seed, step, r as u32, i as u32);
+                if key >= best {
+                    best = key;
                     best_i = i;
                 }
             }

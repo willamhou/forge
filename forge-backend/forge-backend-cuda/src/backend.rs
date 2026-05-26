@@ -63,6 +63,8 @@ struct KernelFunctions {
     // Sampling
     argmax_f32: CudaFunction,
     argmax_f16: CudaFunction,
+    sample_gumbel_f32: CudaFunction,
+    sample_gumbel_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -256,6 +258,8 @@ impl CudaBackend {
             scatter_kv_f16: load_f16("scatter_kv_f16")?,
             argmax_f32: load_f32("argmax_f32")?,
             argmax_f16: load_f16("argmax_f16")?,
+            sample_gumbel_f32: load_f32("sample_gumbel_f32")?,
+            sample_gumbel_f16: load_f16("sample_gumbel_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -3295,6 +3299,94 @@ impl Backend for CudaBackend {
                 builder.arg(l);
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            other => return Err(ForgeError::UnsupportedDtype(other)),
+        }
+
+        self.stream
+            .memcpy_dtov(&out_ids)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))
+    }
+
+    /// On-device Gumbel-max multinomial sample (see [`Backend::sample_gumbel`]).
+    /// One block per row perturbs each logit with Gumbel noise and reduces to
+    /// the argmax; only `rows` ids cross PCIe.
+    fn sample_gumbel(
+        &self,
+        logits: &CudaTensor,
+        temperature: f32,
+        seed: u64,
+        step: u32,
+    ) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let (rows, cols) = match shape.len() {
+            1 => (1usize, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "sample_gumbel: expected 1-D or 2-D logits, got {shape:?}"
+                )));
+            }
+        };
+        if cols == 0 {
+            return Err(ForgeError::InvalidArgument(
+                "sample_gumbel: empty logits (cols == 0)".into(),
+            ));
+        }
+        if !(temperature > 0.0) {
+            return Err(ForgeError::InvalidArgument(
+                "sample_gumbel: temperature must be > 0 (use argmax for greedy)".into(),
+            ));
+        }
+
+        let mut out_ids = self
+            .stream
+            .alloc_zeros::<u32>(rows)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let inv_temp = 1.0f32 / temperature;
+        let block_dim = next_power_of_2(256u32.min(cols as u32)).max(1);
+        let shared_mem = block_dim * 8; // f32 value + u32 index per thread
+        let launch_cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        match logits.dtype() {
+            DType::F32 => {
+                let l = logits.f32_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_gumbel_f32);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&inv_temp);
+                builder.arg(&seed);
+                builder.arg(&step);
+                unsafe {
+                    builder
+                        .launch(launch_cfg)
+                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                }
+            }
+            DType::F16 => {
+                let l = logits.f16_slice()?;
+                let mut builder = self.stream.launch_builder(&self.kernels.sample_gumbel_f16);
+                builder.arg(&mut out_ids);
+                builder.arg(l);
+                builder.arg(&rows_u32);
+                builder.arg(&cols_u32);
+                builder.arg(&inv_temp);
+                builder.arg(&seed);
+                builder.arg(&step);
                 unsafe {
                     builder
                         .launch(launch_cfg)
