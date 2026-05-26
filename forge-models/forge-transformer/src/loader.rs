@@ -2,7 +2,7 @@ use forge_core::{Backend, ModelConfig, Result};
 use forge_loader::SafeTensorsLoader;
 
 use crate::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
-use crate::model::LlamaModel;
+use crate::model::TransformerModel;
 use crate::rope::RopeFreqs;
 
 /// Load a Llama model from SafeTensors files.
@@ -10,11 +10,11 @@ use crate::rope::RopeFreqs;
 /// HuggingFace stores linear weights as `[out_features, in_features]`.
 /// Our `matmul(x, W)` needs `[in_features, out_features]`, so all linear
 /// weights are transposed at load time.
-pub fn load_llama_model<B: Backend + Clone>(
+pub fn load_transformer<B: Backend + Clone>(
     loader: &SafeTensorsLoader,
     config: ModelConfig,
     backend: &B,
-) -> Result<LlamaModel<B>> {
+) -> Result<TransformerModel<B>> {
     let embed_tokens = loader.load_tensor("model.embed_tokens.weight", backend)?;
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -40,7 +40,7 @@ pub fn load_llama_model<B: Backend + Clone>(
 
     let rope_freqs = RopeFreqs::precompute(&config, config.max_position_embeddings, backend)?;
 
-    Ok(LlamaModel::new(
+    Ok(TransformerModel::new(
         config,
         embed_tokens,
         layers,
@@ -98,7 +98,22 @@ fn load_decoder_layer<B: Backend>(
     } else {
         None // Llama: no QKV bias
     };
-    let attn = LlamaAttention::new_with_bias(wqkv, qkv_bias, wo, config);
+    // Optional per-head QK-norm (Qwen3): RMSNorm on Q / K over head_dim,
+    // present only when `self_attn.q_norm.weight` exists. Detect by presence,
+    // same contract as the bias above.
+    let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
+    let (q_norm, k_norm) = if loader.contains(&q_norm_name) {
+        let q_w = loader.load_tensor(&q_norm_name, backend)?;
+        let k_w = loader.load_tensor(&format!("{prefix}.self_attn.k_norm.weight"), backend)?;
+        (
+            Some(RMSNorm::new(q_w, config.rms_norm_eps)),
+            Some(RMSNorm::new(k_w, config.rms_norm_eps)),
+        )
+    } else {
+        (None, None)
+    };
+    let attn =
+        LlamaAttention::new_with_bias(wqkv, qkv_bias, wo, config).with_qk_norm(q_norm, k_norm);
 
     // MLP weights (transposed at load)
     let gate_proj = load_linear(loader, &format!("{prefix}.mlp.gate_proj.weight"), backend)?;

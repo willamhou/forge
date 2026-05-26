@@ -3,6 +3,10 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct LlamaConfig {
+    /// HF `architectures` list (e.g. `["Qwen3ForCausalLM"]`). Drives the model
+    /// registry's per-architecture dispatch. Empty if absent from config.json.
+    #[serde(default)]
+    pub architectures: Vec<String>,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
@@ -26,6 +30,11 @@ fn default_rope_theta() -> f64 {
 }
 
 impl LlamaConfig {
+    /// Primary HF architecture string (first entry), e.g. `"Qwen3ForCausalLM"`.
+    pub fn architecture(&self) -> Option<&str> {
+        self.architectures.first().map(String::as_str)
+    }
+
     pub fn to_model_config(&self) -> ModelConfig {
         let head_dim = self
             .head_dim

@@ -7,9 +7,9 @@ use forge_backend_cpu::CpuBackend;
 use forge_core::{Backend, DType, KvCache, Model, ModelConfig, ModelInput, SeqMetadata};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_kvcache::paged_cache::PagedKvCache;
-use forge_model_llama::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
-use forge_model_llama::rope::RopeFreqs;
-use forge_model_llama::LlamaModel;
+use forge_transformer::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
+use forge_transformer::rope::RopeFreqs;
+use forge_transformer::TransformerModel;
 
 fn tiny_config() -> ModelConfig {
     ModelConfig {
@@ -27,7 +27,7 @@ fn tiny_config() -> ModelConfig {
     }
 }
 
-fn build_tiny_model(backend: &CpuBackend) -> LlamaModel<CpuBackend> {
+fn build_tiny_model(backend: &CpuBackend) -> TransformerModel<CpuBackend> {
     let config = tiny_config();
     let h = config.hidden_size;
     let inter = config.intermediate_size;
@@ -77,7 +77,7 @@ fn build_tiny_model(backend: &CpuBackend) -> LlamaModel<CpuBackend> {
     let layer = LlamaDecoderLayer::new(layer_norm, attn, post_norm, mlp);
     let rope = RopeFreqs::precompute(&config, 64, backend).unwrap();
 
-    LlamaModel::new(
+    TransformerModel::new(
         config,
         embed_tokens,
         vec![layer],
@@ -89,7 +89,7 @@ fn build_tiny_model(backend: &CpuBackend) -> LlamaModel<CpuBackend> {
 }
 
 fn prefill(
-    model: &LlamaModel<CpuBackend>,
+    model: &TransformerModel<CpuBackend>,
     kv_cache: &mut dyn KvCache<T = <CpuBackend as Backend>::Tensor>,
     seq_id: u64,
     prompt_tokens: &[u32],
@@ -110,7 +110,7 @@ fn prefill(
 }
 
 fn batched_decode_logits(
-    model: &LlamaModel<CpuBackend>,
+    model: &TransformerModel<CpuBackend>,
     backend: &CpuBackend,
     kv_cache: &mut dyn KvCache<T = <CpuBackend as Backend>::Tensor>,
 ) -> Vec<f32> {

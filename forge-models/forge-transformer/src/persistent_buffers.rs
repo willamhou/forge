@@ -4,7 +4,7 @@
 //! once (per `batch_size`) and reused across calls. Combined with the
 //! `_into` Backend op variants (Tasks 5a–5c.3) and the persistent scratch
 //! buffers on CudaBackend (Task 2.5a + 5c.3), this means a captured CUDA
-//! Graph from `LlamaModel::forward_into` references device pointers that
+//! Graph from `TransformerModel::forward_into` references device pointers that
 //! are stable across replays.
 //!
 //! Buffer layout is one-per-logical-role, reused across all decoder layers.
@@ -24,8 +24,8 @@
 use forge_core::{Backend, DType, ModelConfig, Result};
 
 /// Staged per-step decode metadata: computed host-side in
-/// [`LlamaModel::stage_decode`](crate::LlamaModel) and read by the
-/// capture-safe [`LlamaModel::compute_decode`](crate::LlamaModel) kernel
+/// [`TransformerModel::stage_decode`](crate::TransformerModel) and read by the
+/// capture-safe [`TransformerModel::compute_decode`](crate::TransformerModel) kernel
 /// sequence. Shapes are fixed across steps (block-table width anchored to the
 /// model's max context) so a captured graph's metadata buffers never resize.
 pub struct StagedDecodeMeta {
@@ -57,8 +57,8 @@ impl StagedDecodeMeta {
 }
 
 /// Per-batch decode state: persistent activation buffers plus the per-step
-/// inputs that [`LlamaModel::stage_decode`](crate::LlamaModel) refreshes and
-/// [`LlamaModel::compute_decode`](crate::LlamaModel) reads. This is the
+/// inputs that [`TransformerModel::stage_decode`](crate::TransformerModel) refreshes and
+/// [`TransformerModel::compute_decode`](crate::TransformerModel) reads. This is the
 /// `Model::DecodeState` for Llama.
 pub struct LlamaDecodeState<B: Backend> {
     /// Persistent activation + logits buffers.
@@ -79,7 +79,7 @@ impl<B: Backend> LlamaDecodeState<B> {
     }
 }
 
-/// Per-batch persistent buffers for [`LlamaModel::forward_into`].
+/// Per-batch persistent buffers for [`TransformerModel::forward_into`].
 ///
 /// Construct once with [`Self::new`] for a fixed `batch_size`; pass the
 /// same instance into every `forward_into` call at that batch shape.
@@ -112,6 +112,11 @@ pub struct LlamaPersistentBuffers<B: Backend> {
     pub q_4d: B::Tensor,
     /// K reshaped to 4D for RoPE input. `[1, N, num_kv_heads, head_dim]`.
     pub k_4d: B::Tensor,
+    /// Q after Qwen3 QK-norm, 4D (RoPE input when q_norm is present). Unused
+    /// for models without QK-norm. `[1, N, num_heads, head_dim]`.
+    pub q_normed_4d: B::Tensor,
+    /// K after Qwen3 QK-norm, 4D. `[1, N, num_kv_heads, head_dim]`.
+    pub k_normed_4d: B::Tensor,
     /// Q post-RoPE, 4D. `[1, N, num_heads, head_dim]`.
     pub q_rotated_4d: B::Tensor,
     /// K post-RoPE, 4D. `[1, N, num_kv_heads, head_dim]`.
@@ -220,6 +225,10 @@ impl<B: Backend> LlamaPersistentBuffers<B> {
             q_4d: backend
                 .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
             k_4d: backend
+                .allocate_zeros(&[1, n, config.num_key_value_heads, config.head_dim], dt)?,
+            q_normed_4d: backend
+                .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
+            k_normed_4d: backend
                 .allocate_zeros(&[1, n, config.num_key_value_heads, config.head_dim], dt)?,
             q_rotated_4d: backend
                 .allocate_zeros(&[1, n, config.num_attention_heads, config.head_dim], dt)?,
