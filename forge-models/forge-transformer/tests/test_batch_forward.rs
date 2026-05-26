@@ -3,9 +3,9 @@
 use forge_backend_cpu::CpuBackend;
 use forge_core::{Backend, DType, KvCache, Model, ModelConfig, ModelInput, SeqMetadata};
 use forge_kvcache::naive::NaiveKvCache;
-use forge_model_llama::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
-use forge_model_llama::rope::RopeFreqs;
-use forge_model_llama::LlamaModel;
+use forge_transformer::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
+use forge_transformer::rope::RopeFreqs;
+use forge_transformer::TransformerModel;
 
 fn tiny_config() -> ModelConfig {
     ModelConfig {
@@ -23,8 +23,8 @@ fn tiny_config() -> ModelConfig {
     }
 }
 
-/// Build a tiny LlamaModel with deterministic random-ish weights.
-fn build_tiny_model(backend: &CpuBackend) -> LlamaModel<CpuBackend> {
+/// Build a tiny TransformerModel with deterministic random-ish weights.
+fn build_tiny_model(backend: &CpuBackend) -> TransformerModel<CpuBackend> {
     let config = tiny_config();
     let h = config.hidden_size;
     let inter = config.intermediate_size;
@@ -87,12 +87,12 @@ fn build_tiny_model(backend: &CpuBackend) -> LlamaModel<CpuBackend> {
     let layer = LlamaDecoderLayer::new(layer_norm, attn, post_norm, mlp);
     let rope = RopeFreqs::precompute(&config, 64, backend).unwrap();
 
-    LlamaModel::new(config, embed_tokens, vec![layer], norm, lm_head, rope, backend.clone())
+    TransformerModel::new(config, embed_tokens, vec![layer], norm, lm_head, rope, backend.clone())
 }
 
 /// Run prefill for a sequence to populate KV cache.
 fn prefill(
-    model: &LlamaModel<CpuBackend>,
+    model: &TransformerModel<CpuBackend>,
     kv_cache: &mut dyn KvCache<T = <CpuBackend as Backend>::Tensor>,
     seq_id: u64,
     prompt_tokens: &[u32],
@@ -114,7 +114,7 @@ fn prefill(
 
 /// Run single-sequence decode and return logits.
 fn decode_single(
-    model: &LlamaModel<CpuBackend>,
+    model: &TransformerModel<CpuBackend>,
     backend: &CpuBackend,
     kv_cache: &mut dyn KvCache<T = <CpuBackend as Backend>::Tensor>,
     seq_id: u64,

@@ -7,7 +7,7 @@ use crate::layers::{LlamaDecoderLayer, RMSNorm};
 use crate::persistent_buffers::{LlamaDecodeState, LlamaPersistentBuffers, StagedDecodeMeta};
 use crate::rope::RopeFreqs;
 
-pub struct LlamaModel<B: Backend> {
+pub struct TransformerModel<B: Backend> {
     config: ModelConfig,
     embed_tokens: B::Tensor,
     layers: Vec<LlamaDecoderLayer<B>>,
@@ -17,7 +17,7 @@ pub struct LlamaModel<B: Backend> {
     backend: B,
 }
 
-impl<B: Backend> LlamaModel<B> {
+impl<B: Backend> TransformerModel<B> {
     pub fn new(
         config: ModelConfig,
         embed_tokens: B::Tensor,
@@ -39,7 +39,7 @@ impl<B: Backend> LlamaModel<B> {
     }
 }
 
-impl<B: Backend + Clone> LlamaModel<B> {
+impl<B: Backend + Clone> TransformerModel<B> {
     /// Single-sequence forward pass (prefill or decode).
     fn forward_single(
         &self,
@@ -270,7 +270,7 @@ impl<B: Backend + Clone> LlamaModel<B> {
     }
 }
 
-impl<B: Backend + Clone> Model for LlamaModel<B> {
+impl<B: Backend + Clone> Model for TransformerModel<B> {
     type T = B::Tensor;
     type DecodeState = LlamaDecodeState<B>;
 

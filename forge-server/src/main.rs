@@ -18,7 +18,7 @@ use forge_core::{Backend, ModelConfig};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_kvcache::paged_cache::PagedKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
-use forge_model_llama::load_llama_model;
+use forge_transformer::load_model;
 use forge_runtime::constraints::fsm::TokenVocab;
 use forge_runtime::engine::Engine;
 use forge_scheduler::{ContinuousBatchingScheduler, SchedulerConfig};
@@ -115,9 +115,11 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", config_path.display()))?;
     let llama_config: LlamaConfig = serde_json::from_str(&config_text)?;
     let model_config = llama_config.to_model_config();
+    let arch = llama_config.architecture().map(String::from);
 
     info!(
-        "Model config: {} layers, {} heads, {} KV heads, vocab {}",
+        "Model config: arch={}, {} layers, {} heads, {} KV heads, vocab {}",
+        arch.as_deref().unwrap_or("(unspecified)"),
         model_config.num_hidden_layers,
         model_config.num_attention_heads,
         model_config.num_key_value_heads,
@@ -128,13 +130,13 @@ async fn main() -> anyhow::Result<()> {
         "cpu" => {
             let backend = CpuBackend::new();
             info!("CPU backend initialized");
-            run_server(backend, &cli, model_config).await
+            run_server(backend, &cli, model_config, arch).await
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
             let backend = CudaBackend::new(cli.device)?;
             info!("CUDA backend initialized (device {})", cli.device);
-            run_server(backend, &cli, model_config).await
+            run_server(backend, &cli, model_config, arch).await
         }
         #[cfg(not(feature = "cuda"))]
         "cuda" => anyhow::bail!("CUDA backend not available: compile with --features cuda"),
@@ -146,11 +148,12 @@ async fn run_server<B: Backend + Clone>(
     backend: B,
     cli: &Cli,
     model_config: ModelConfig,
+    arch: Option<String>,
 ) -> anyhow::Result<()> {
-    // --- Load model weights ---
+    // --- Load model weights (registry dispatches by architecture) ---
     info!("Loading model from {}...", cli.model_path.display());
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
-    let model = load_llama_model(&loader, model_config.clone(), &backend)?;
+    let model = load_model(arch.as_deref(), &loader, model_config.clone(), &backend)?;
     info!("Model loaded successfully");
 
     // --- Load tokenizer ---

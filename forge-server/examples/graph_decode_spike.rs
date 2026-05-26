@@ -24,7 +24,7 @@ use forge_backend_cuda::{CudaBackend, CudaGraphCache};
 use forge_core::{Backend, KvCache, Model, ModelInput, SeqMetadata};
 use forge_kvcache::paged_cache::PagedKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
-use forge_model_llama::load_llama_model;
+use forge_transformer::load_transformer;
 
 #[derive(Parser)]
 struct Cli {
@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     let backend = CudaBackend::new(cli.device)?;
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
-    let model = load_llama_model(&loader, config.clone(), &backend)?;
+    let model = load_transformer(&loader, config.clone(), &backend)?;
     println!(
         "== graph_decode spike: {} layers ==",
         config.num_hidden_layers

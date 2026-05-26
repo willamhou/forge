@@ -2,7 +2,7 @@ use forge_core::{Backend, ModelConfig, Result};
 use forge_loader::SafeTensorsLoader;
 
 use crate::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
-use crate::model::LlamaModel;
+use crate::model::TransformerModel;
 use crate::rope::RopeFreqs;
 
 /// Load a Llama model from SafeTensors files.
@@ -10,11 +10,11 @@ use crate::rope::RopeFreqs;
 /// HuggingFace stores linear weights as `[out_features, in_features]`.
 /// Our `matmul(x, W)` needs `[in_features, out_features]`, so all linear
 /// weights are transposed at load time.
-pub fn load_llama_model<B: Backend + Clone>(
+pub fn load_transformer<B: Backend + Clone>(
     loader: &SafeTensorsLoader,
     config: ModelConfig,
     backend: &B,
-) -> Result<LlamaModel<B>> {
+) -> Result<TransformerModel<B>> {
     let embed_tokens = loader.load_tensor("model.embed_tokens.weight", backend)?;
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -40,7 +40,7 @@ pub fn load_llama_model<B: Backend + Clone>(
 
     let rope_freqs = RopeFreqs::precompute(&config, config.max_position_embeddings, backend)?;
 
-    Ok(LlamaModel::new(
+    Ok(TransformerModel::new(
         config,
         embed_tokens,
         layers,

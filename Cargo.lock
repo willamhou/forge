@@ -743,17 +743,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-model-llama"
-version = "0.1.0"
-dependencies = [
- "forge-backend-cpu",
- "forge-core",
- "forge-kvcache",
- "forge-loader",
- "tracing",
-]
-
-[[package]]
 name = "forge-quantize"
 version = "0.1.0"
 dependencies = [
@@ -792,9 +781,9 @@ dependencies = [
  "forge-core",
  "forge-kvcache",
  "forge-loader",
- "forge-model-llama",
  "forge-runtime",
  "forge-scheduler",
+ "forge-transformer",
  "forge-transport",
  "http-body-util",
  "minijinja",
@@ -808,6 +797,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "forge-transformer"
+version = "0.1.0"
+dependencies = [
+ "forge-backend-cpu",
+ "forge-core",
+ "forge-kvcache",
+ "forge-loader",
+ "tracing",
 ]
 
 [[package]]

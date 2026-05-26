@@ -12,7 +12,7 @@ cuda = ["dep:forge-backend-cuda"]
 forge-core.workspace = true
 forge-runtime.workspace = true
 forge-loader.workspace = true
-forge-model-llama.workspace = true
+forge-transformer.workspace = true
 forge-backend-cuda = { workspace = true, optional = true }
 forge-backend-cpu.workspace = true
 forge-scheduler.workspace = true

@@ -19,7 +19,7 @@ use clap::Parser;
 use forge_core::{Backend, KvCache, Model, ModelInput, SeqMetadata};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
-use forge_model_llama::load_llama_model;
+use forge_transformer::load_transformer;
 
 #[derive(Parser)]
 struct Cli {
@@ -76,7 +76,7 @@ fn run<B: Backend + Clone>(
     vocab: usize,
 ) -> anyhow::Result<()> {
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
-    let model = load_llama_model(&loader, model_config.clone(), backend)?;
+    let model = load_transformer(&loader, model_config.clone(), backend)?;
 
     let mut kv = NaiveKvCache::new(backend.clone(), model_config.num_hidden_layers, 1);
     kv.allocate(0, token_ids.len())?;
