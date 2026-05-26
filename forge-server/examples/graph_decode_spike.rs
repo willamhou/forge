@@ -21,10 +21,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use forge_backend_cuda::{CudaBackend, CudaGraphCache};
-use forge_core::{Backend, KvCache, Model, ModelInput, SeqMetadata, Tensor};
+use forge_core::{Backend, KvCache, Model, ModelInput, SeqMetadata};
 use forge_kvcache::paged_cache::PagedKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
-use forge_model_llama::{load_llama_model, LlamaPersistentBuffers};
+use forge_model_llama::load_llama_model;
 
 #[derive(Parser)]
 struct Cli {
@@ -56,7 +56,10 @@ fn main() -> anyhow::Result<()> {
     let backend = CudaBackend::new(cli.device)?;
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
     let model = load_llama_model(&loader, config.clone(), &backend)?;
-    println!("== graph_decode spike: {} layers ==", config.num_hidden_layers);
+    println!(
+        "== graph_decode spike: {} layers ==",
+        config.num_hidden_layers
+    );
 
     // Prefill one sequence so the KV cache + paged attention have content.
     let mut kv = PagedKvCache::new(
@@ -99,34 +102,34 @@ fn main() -> anyhow::Result<()> {
         }],
     };
 
-    let mut buffers = LlamaPersistentBuffers::new_uniform(&backend, &config, 1)?;
+    let mut state = model.make_decode_state(1)?;
 
-    // ── Baseline: uncaptured forward_into ────────────────────────────
-    // Note: forward_into appends to the KV cache (advances seq 1 to
-    // prompt.len()+1). We capture the FOLLOWING decode step; for the spike
-    // we only care whether capture succeeds + the immediate post-capture
-    // launch is sane, not multi-step KV correctness (that's the slot_mapping
-    // gap we expect to find).
-    model.forward_into(&decode, &mut kv, &mut buffers)?;
+    // ── Baseline: uncaptured stage + compute ─────────────────────────
+    // Note: stage_decode advances the KV cache (seq 1 → prompt.len()+1). We
+    // capture the FOLLOWING decode step; for the spike we only care whether
+    // capture succeeds + the immediate post-capture launch is sane.
+    model.stage_decode(&decode, &mut kv, &mut state)?;
+    model.compute_decode(&mut kv, &mut state)?;
     backend.synchronize()?;
-    let baseline = backend.copy_to_host_f32(&buffers.logits)?;
+    let baseline = backend.copy_to_host_f32(model.decode_logits(&state))?;
     let (b_arg, b_val) = argmax(&baseline);
-    println!("[baseline forward_into] argmax={b_arg} ({b_val:.3})");
+    println!("[baseline compute_decode] argmax={b_arg} ({b_val:.3})");
 
     // ── Attempt capture ──────────────────────────────────────────────
     let mut cache = CudaGraphCache::new(backend.ctx(), backend.stream());
     let model_ref = &model;
     let decode_ref = &decode;
 
-    println!("[capture] attempting run_or_capture over forward_into ...");
-    let cap_result = cache.run_or_capture(1, || {
-        model_ref.forward_into(decode_ref, &mut kv, &mut buffers)
-    });
+    // Stage this step's inputs OUTSIDE the captured region, then capture only
+    // the pure-kernel compute.
+    model.stage_decode(decode_ref, &mut kv, &mut state)?;
+    println!("[capture] attempting run_or_capture over compute_decode ...");
+    let cap_result = cache.run_or_capture(1, || model_ref.compute_decode(&mut kv, &mut state));
 
     match cap_result {
         Ok(()) => {
             backend.synchronize()?;
-            let captured = backend.copy_to_host_f32(&buffers.logits)?;
+            let captured = backend.copy_to_host_f32(model_ref.decode_logits(&state))?;
             let (c_arg, c_val) = argmax(&captured);
             println!("[capture] SUCCEEDED — captured-launch argmax={c_arg} ({c_val:.3})");
             println!("[capture] has(1)={}", cache.has(1));
@@ -135,14 +138,16 @@ fn main() -> anyhow::Result<()> {
             match cache.replay(1) {
                 Ok(()) => {
                     backend.synchronize()?;
-                    let replayed = backend.copy_to_host_f32(&buffers.logits)?;
+                    let replayed = backend.copy_to_host_f32(model_ref.decode_logits(&state))?;
                     let (r_arg, r_val) = argmax(&replayed);
                     let max_diff = captured
                         .iter()
                         .zip(&replayed)
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0_f32, f32::max);
-                    println!("[replay] argmax={r_arg} ({r_val:.3}) max|Δ vs captured|={max_diff:.4}");
+                    println!(
+                        "[replay] argmax={r_arg} ({r_val:.3}) max|Δ vs captured|={max_diff:.4}"
+                    );
                     if r_arg == c_arg && max_diff < 1e-3 {
                         println!("\nGREEN — capture + replay both work, results stable.");
 
@@ -177,23 +182,37 @@ fn main() -> anyhow::Result<()> {
                         }
                         let replay_sync_ms = t2.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
-                        // Eager: full forward_into each step (grows the cache).
+                        // Eager: stage + compute each step (grows the cache).
                         for _ in 0..warmup {
-                            model_ref.forward_into(decode_ref, &mut kv, &mut buffers)?;
+                            model_ref.stage_decode(decode_ref, &mut kv, &mut state)?;
+                            model_ref.compute_decode(&mut kv, &mut state)?;
                         }
                         backend.synchronize()?;
                         let t0 = std::time::Instant::now();
                         for _ in 0..iters {
-                            model_ref.forward_into(decode_ref, &mut kv, &mut buffers)?;
+                            model_ref.stage_decode(decode_ref, &mut kv, &mut state)?;
+                            model_ref.compute_decode(&mut kv, &mut state)?;
                         }
                         backend.synchronize()?;
                         let eager_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
-                        println!("\n── pipelined latency (sync at end, {iters} iters, {} layers) ──", config.num_hidden_layers);
-                        println!("  eager forward_into : {eager_ms:.3} ms/step ({:.1} tok/s)", 1e3 / eager_ms);
-                        println!("  captured replay    : {replay_ms:.3} ms/step ({:.1} tok/s)", 1e3 / replay_ms);
-                        println!("  speedup            : {:.2}x  (saved {:.3} ms/step)",
-                                 eager_ms / replay_ms, eager_ms - replay_ms);
+                        println!(
+                            "\n── pipelined latency (sync at end, {iters} iters, {} layers) ──",
+                            config.num_hidden_layers
+                        );
+                        println!(
+                            "  eager forward_into : {eager_ms:.3} ms/step ({:.1} tok/s)",
+                            1e3 / eager_ms
+                        );
+                        println!(
+                            "  captured replay    : {replay_ms:.3} ms/step ({:.1} tok/s)",
+                            1e3 / replay_ms
+                        );
+                        println!(
+                            "  speedup            : {:.2}x  (saved {:.3} ms/step)",
+                            eager_ms / replay_ms,
+                            eager_ms - replay_ms
+                        );
 
                         // Per-call-sync latency: closer to what the engine sees,
                         // since it syncs every token (copy_to_host logits → sample).
@@ -201,21 +220,33 @@ fn main() -> anyhow::Result<()> {
                         // (replay_sync_ms was measured above, before the eager grow.)
                         let t3 = std::time::Instant::now();
                         for _ in 0..iters {
-                            model_ref.forward_into(decode_ref, &mut kv, &mut buffers)?;
+                            model_ref.stage_decode(decode_ref, &mut kv, &mut state)?;
+                            model_ref.compute_decode(&mut kv, &mut state)?;
                             backend.synchronize()?;
                         }
                         let eager_sync_ms = t3.elapsed().as_secs_f64() * 1e3 / iters as f64;
                         println!("\n── per-call-sync latency (engine-realistic) ──");
-                        println!("  eager forward_into : {eager_sync_ms:.3} ms/step ({:.1} tok/s)", 1e3 / eager_sync_ms);
-                        println!("  captured replay    : {replay_sync_ms:.3} ms/step ({:.1} tok/s)", 1e3 / replay_sync_ms);
-                        println!("  speedup            : {:.2}x  (saved {:.3} ms/step)",
-                                 eager_sync_ms / replay_sync_ms, eager_sync_ms - replay_sync_ms);
+                        println!(
+                            "  eager forward_into : {eager_sync_ms:.3} ms/step ({:.1} tok/s)",
+                            1e3 / eager_sync_ms
+                        );
+                        println!(
+                            "  captured replay    : {replay_sync_ms:.3} ms/step ({:.1} tok/s)",
+                            1e3 / replay_sync_ms
+                        );
+                        println!(
+                            "  speedup            : {:.2}x  (saved {:.3} ms/step)",
+                            eager_sync_ms / replay_sync_ms,
+                            eager_sync_ms - replay_sync_ms
+                        );
                     } else {
-                        println!("\nYELLOW — capture + replay run, but replay result differs \
+                        println!(
+                            "\nYELLOW — capture + replay run, but replay result differs \
                                   from captured (argmax {c_arg}->{r_arg}, Δ={max_diff:.4}). \
                                   Likely the stale-host-pointer / slot_mapping issue: replay \
                                   re-reads baked host data. Need host uploads out of capture \
-                                  region OR pinned persistent host buffers.");
+                                  region OR pinned persistent host buffers."
+                        );
                     }
                 }
                 Err(e) => {
@@ -225,12 +256,14 @@ fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             println!("[capture] FAILED: {e}");
-            println!("\nRED — cannot capture forward_into as-is. Most likely a \
+            println!(
+                "\nRED — cannot capture forward_into as-is. Most likely a \
                       memcpy_htod of pageable host memory inside the capture region \
                       (embedding indices / rope cos-sin / block_tables / slot_mapping). \
                       Fix: move host->device uploads OUT of the captured region (upload \
                       to persistent device buffers before graph.launch), capturing only \
-                      the pure-kernel compute. See Task 1 spike Stage E.");
+                      the pure-kernel compute. See Task 1 spike Stage E."
+            );
         }
     }
 

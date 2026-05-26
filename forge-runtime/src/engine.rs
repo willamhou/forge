@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use forge_core::{
-    Backend, FinishReason, InferenceRequest, KvCache, Model, ModelInput, Result, ScheduledSeq,
-    Scheduler, SeqMetadata,
+    Backend, DecodeGraphDispatch, FinishReason, InferenceRequest, KvCache, Model, ModelInput,
+    Result, ScheduledSeq, Scheduler, SeqMetadata,
 };
 
 use crate::constraints::fsm::FsmConstraint;
@@ -71,6 +71,14 @@ pub struct Engine<B: Backend, M: Model<T = B::Tensor>> {
     /// Tokens are held here until we confirm they don't form part of a
     /// stop string, then flushed to the event channel.
     stop_buffers: HashMap<u64, Vec<u32>>,
+    /// Optional CUDA-Graph decode dispatcher (None on CPU / when disabled).
+    decode_runner: Option<Box<dyn DecodeGraphDispatch>>,
+    /// Configured CUDA-Graph batch-size buckets (sorted, deduped).
+    decode_buckets: Vec<u32>,
+    /// Per-bucket persistent decode state (allocated lazily on first use).
+    decode_states: HashMap<u32, M::DecodeState>,
+    /// Last observed backend capture epoch; a change invalidates all graphs.
+    last_capture_epoch: u64,
 }
 
 impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
@@ -92,6 +100,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             constraints: HashMap::new(),
             decode_fn: None,
             stop_buffers: HashMap::new(),
+            decode_runner: None,
+            decode_buckets: Vec::new(),
+            decode_states: HashMap::new(),
+            last_capture_epoch: 0,
         }
     }
 
@@ -99,6 +111,34 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     pub fn with_decode_fn(mut self, f: DecodeFn) -> Self {
         self.decode_fn = Some(f);
         self
+    }
+
+    /// Enable CUDA-Graph decode capture for the given batch-size `buckets`.
+    ///
+    /// No-op (logs a warning, stays on the eager path) when the backend has no
+    /// graph support — `Backend::make_decode_graph_runner` returns `None` for
+    /// CPU and for naive (non-paged) KV caches. The default is off; the server
+    /// opts in via `--cuda-graph`.
+    pub fn with_cuda_graph(mut self, mut buckets: Vec<u32>) -> Self {
+        buckets.retain(|&b| b > 0);
+        buckets.sort_unstable();
+        buckets.dedup();
+        match self.backend.make_decode_graph_runner(&buckets) {
+            Some(runner) => {
+                self.decode_runner = Some(runner);
+                self.decode_buckets = buckets;
+                self.last_capture_epoch = self.backend.decode_capture_epoch();
+            }
+            None => {
+                warn!("CUDA graph requested but backend has no graph support — staying eager");
+            }
+        }
+        self
+    }
+
+    /// True if `batch_size` exactly matches a configured CUDA-Graph bucket.
+    fn is_decode_bucket(&self, batch_size: u32) -> bool {
+        self.decode_buckets.binary_search(&batch_size).is_ok()
     }
 
     /// Main engine loop. Runs until the request channel is closed.
@@ -200,7 +240,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .filter(|s| !failed_seq_ids.contains(&s.seq_id))
                 .collect();
 
-            if decode_seqs.len() > 1 {
+            // Route through the batched path when graph capture is on (so
+            // batch=1 decode also benefits) or whenever there's more than one
+            // decode sequence. Single-sequence decode without graph capture
+            // stays on the simpler `process_sequence` path.
+            let route_batched =
+                !decode_seqs.is_empty() && (self.decode_runner.is_some() || decode_seqs.len() > 1);
+
+            if route_batched {
                 if let Err(e) = self.process_decode_batch(&decode_seqs) {
                     // Forward pass failed — clean up all sequences in the batch
                     error!(error = %e, "batch decode forward failed");
@@ -311,8 +358,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // finish immediately without running the forward pass.
         let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
         if generated.len() >= seq.sampling_params.max_tokens {
-            self.scheduler
-                .finish(seq.seq_id, FinishReason::MaxTokens)?;
+            self.scheduler.finish(seq.seq_id, FinishReason::MaxTokens)?;
             self.kv_cache.free(seq.seq_id)?;
             self.send_event(
                 seq.seq_id,
@@ -366,8 +412,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         for seq in seqs {
             let generated = self.scheduler.get_generated_tokens(seq.seq_id)?;
             if generated.len() >= seq.sampling_params.max_tokens {
-                self.scheduler
-                    .finish(seq.seq_id, FinishReason::MaxTokens)?;
+                self.scheduler.finish(seq.seq_id, FinishReason::MaxTokens)?;
                 self.kv_cache.free(seq.seq_id)?;
                 self.send_event(
                     seq.seq_id,
@@ -390,13 +435,60 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
 
         // Build batched ModelInput (N sequences, 1 token each)
         let input = self.build_batch_input(&active_seqs);
+        let n = active_seqs.len() as u32;
 
-        // Single forward pass for all decode sequences
-        let output = self.model.forward(&input, &mut *self.kv_cache)?;
-        self.backend.synchronize()?;
+        // Copy logits to host: [N, vocab_size]. Either via the CUDA-Graph
+        // capture/replay path (bucketed batch sizes) or the eager forward.
+        let use_graph = self.decode_runner.is_some() && self.is_decode_bucket(n);
+        let logits_host: Vec<f32> = if use_graph {
+            // Lazily allocate this bucket's persistent decode state.
+            if !self.decode_states.contains_key(&n) {
+                let st = self.model.make_decode_state(n as usize)?;
+                self.decode_states.insert(n, st);
+            }
 
-        // Copy logits to host: [N, vocab_size]
-        let logits_host = self.backend.copy_to_host_f32(&output.logits)?;
+            // A backend capture-epoch change means a device pointer a captured
+            // graph baked may have moved (scratch/pool realloc) — drop all
+            // captures so the next dispatch re-captures against fresh pointers.
+            let epoch = self.backend.decode_capture_epoch();
+            if epoch != self.last_capture_epoch {
+                if let Some(r) = self.decode_runner.as_mut() {
+                    r.invalidate_all();
+                }
+                self.last_capture_epoch = epoch;
+            }
+
+            // Stage this step's inputs into persistent scratch (outside any
+            // captured region) so a replayed graph reads fresh data.
+            {
+                let state = self.decode_states.get_mut(&n).unwrap();
+                self.model
+                    .stage_decode(&input, &mut *self.kv_cache, state)?;
+            }
+
+            // Capture-or-replay the pure-kernel compute. Disjoint-field borrows
+            // keep the dispatcher and the closure's captures separate.
+            {
+                let model = &self.model;
+                let kv = &mut *self.kv_cache;
+                let state = self.decode_states.get_mut(&n).unwrap();
+                let runner = self
+                    .decode_runner
+                    .as_mut()
+                    .expect("decode_runner is Some in the graph branch");
+                let mut fwd = || model.compute_decode(kv, state);
+                runner.dispatch(n, &mut fwd)?;
+            }
+            self.backend.synchronize()?;
+
+            let state = self.decode_states.get(&n).unwrap();
+            self.backend
+                .copy_to_host_f32(self.model.decode_logits(state))?
+        } else {
+            let output = self.model.forward(&input, &mut *self.kv_cache)?;
+            self.backend.synchronize()?;
+            self.backend.copy_to_host_f32(&output.logits)?
+        };
         let vocab_size = self.model.config().vocab_size;
 
         // Per-sequence sampling
@@ -437,11 +529,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // If FSM is in a terminal state with no allowed tokens, finish cleanly
         // instead of sampling (which would pick an arbitrary token and fail).
         if let Some((fsm, state)) = constraint_ref {
-            let no_tokens = fsm
-                .allowed_tokens(state)
-                .is_none_or(|t| t.is_empty());
+            let no_tokens = fsm.allowed_tokens(state).is_none_or(|t| t.is_empty());
             if no_tokens && fsm.is_final_state(state) {
-                self.scheduler.finish(seq.seq_id, FinishReason::StopString)?;
+                self.scheduler
+                    .finish(seq.seq_id, FinishReason::StopString)?;
                 self.kv_cache.free(seq.seq_id)?;
                 self.send_event(
                     seq.seq_id,
@@ -494,7 +585,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let mut fsm_finished = false;
         let mut fsm_abort: Option<(u32, u32)> = None; // (fsm_state, token_id)
         if let Some(seq_constraint) = self.constraints.get_mut(&seq.seq_id) {
-            match seq_constraint.fsm.next_state(seq_constraint.state, token_id) {
+            match seq_constraint
+                .fsm
+                .next_state(seq_constraint.state, token_id)
+            {
                 Some(next) => {
                     seq_constraint.state = next;
                     if seq_constraint.fsm.is_final_state(next) {
@@ -583,9 +677,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                     all_tokens.push(token_id);
                     let text = decode(&all_tokens)?;
                     let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
-                        s.char_indices().skip(1).any(|(byte_pos, _)| {
-                            text.ends_with(&s[..byte_pos])
-                        }) || text.ends_with(s)
+                        s.char_indices()
+                            .skip(1)
+                            .any(|(byte_pos, _)| text.ends_with(&s[..byte_pos]))
+                            || text.ends_with(s)
                     });
                     Some(is_prefix)
                 })
