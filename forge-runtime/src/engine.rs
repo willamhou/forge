@@ -467,24 +467,29 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // Per-row sampling params, built once (they don't depend on the logits).
         // Only needed for the mixed greedy/Gumbel `sample` path; the all-argmax
         // path uploads nothing.
-        let sample_params: Option<(Vec<f32>, Vec<f32>, Vec<u64>, Vec<u32>)> =
-            if all_device && !all_argmax {
-                let mut temps = Vec::with_capacity(active_seqs.len());
-                let mut min_ps = Vec::with_capacity(active_seqs.len());
-                let mut seeds = Vec::with_capacity(active_seqs.len());
-                let mut steps = Vec::with_capacity(active_seqs.len());
-                for s in &active_seqs {
-                    temps.push(s.sampling_params.temperature);
-                    min_ps.push(s.sampling_params.min_p.unwrap_or(0.0));
-                    // seed: explicit per-request seed, else derive from seq_id so
-                    // each sequence still gets an independent, deterministic stream.
-                    seeds.push(s.sampling_params.seed.unwrap_or(s.seq_id));
-                    steps.push(self.get_generated_count(s.seq_id) as u32);
-                }
-                Some((temps, min_ps, seeds, steps))
-            } else {
-                None
-            };
+        type SampleParams = (Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>, Vec<u64>, Vec<u32>);
+        let sample_params: Option<SampleParams> = if all_device && !all_argmax {
+            let mut temps = Vec::with_capacity(active_seqs.len());
+            let mut min_ps = Vec::with_capacity(active_seqs.len());
+            let mut top_ks = Vec::with_capacity(active_seqs.len());
+            let mut top_ps = Vec::with_capacity(active_seqs.len());
+            let mut seeds = Vec::with_capacity(active_seqs.len());
+            let mut steps = Vec::with_capacity(active_seqs.len());
+            for s in &active_seqs {
+                let p = &s.sampling_params;
+                temps.push(p.temperature);
+                min_ps.push(p.min_p.unwrap_or(0.0));
+                top_ks.push(p.top_k.unwrap_or(0) as u32);
+                top_ps.push(p.top_p);
+                // seed: explicit per-request seed, else derive from seq_id so
+                // each sequence still gets an independent, deterministic stream.
+                seeds.push(p.seed.unwrap_or(s.seq_id));
+                steps.push(self.get_generated_count(s.seq_id) as u32);
+            }
+            Some((temps, min_ps, top_ks, top_ps, seeds, steps))
+        } else {
+            None
+        };
 
         // Run the decode forward via the CUDA-Graph capture/replay path
         // (bucketed batch sizes) or the eager forward, then produce either the
@@ -537,8 +542,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             let logits = self.model.decode_logits(state);
             if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(logits)?)
-            } else if let Some((temps, min_ps, seeds, steps)) = &sample_params {
-                DecodeOut::Ids(self.backend.sample(logits, temps, min_ps, seeds, steps)?)
+            } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
+                DecodeOut::Ids(self.backend.sample(logits, temps, min_ps, top_ks, top_ps, seeds, steps)?)
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(logits)?)
             }
@@ -547,8 +552,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             self.backend.synchronize()?;
             if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(&output.logits)?)
-            } else if let Some((temps, min_ps, seeds, steps)) = &sample_params {
-                DecodeOut::Ids(self.backend.sample(&output.logits, temps, min_ps, seeds, steps)?)
+            } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
+                DecodeOut::Ids(self.backend.sample(&output.logits, temps, min_ps, top_ks, top_ps, seeds, steps)?)
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(&output.logits)?)
             }
@@ -606,15 +611,12 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     }
 
     /// Whether `seq` can be sampled with on-device Gumbel-max: temperature > 0,
-    /// no top-k/top-p filtering (not yet on the device path — min-p IS supported
-    /// by the device `sample` op), no penalties (which need the token history on
-    /// host), and no FSM constraint. Draws from `softmax(logits / temperature)`
-    /// restricted to the min-p nucleus.
+    /// no penalties (which need the token history on host), and no FSM
+    /// constraint. The device `sample` op handles temperature, min-p, top-k and
+    /// top-p; only penalties and FSM masking still require the host path.
     fn decode_gumbel_eligible(&self, seq: &ScheduledSeq) -> bool {
         let p = &seq.sampling_params;
         p.temperature > 0.0
-            && p.top_k.is_none()
-            && p.top_p >= 1.0
             && p.repetition_penalty == 1.0
             && p.presence_penalty == 0.0
             && p.frequency_penalty == 0.0

@@ -68,19 +68,55 @@ fn sample_min_p_filters_low_prob_tokens() {
         .unwrap();
     for step in 0..32u32 {
         let s = backend
-            .sample(&logits, &[1.0], &[0.5], &[7], &[step])
+            .sample(&logits, &[1.0], &[0.5], &[0], &[1.0], &[7], &[step])
             .unwrap();
         assert_eq!(s, vec![0], "min_p must restrict to the peak (step {step})");
     }
     // Without min_p the 0.167 tokens win sometimes.
     let mut seen_other = false;
     for step in 0..200u32 {
-        if backend.sample(&logits, &[1.0], &[0.0], &[7], &[step]).unwrap() != vec![0] {
+        if backend
+            .sample(&logits, &[1.0], &[0.0], &[0], &[1.0], &[7], &[step])
+            .unwrap()
+            != vec![0]
+        {
             seen_other = true;
             break;
         }
     }
     assert!(seen_other, "without min_p, low-prob tokens should sometimes win");
+}
+
+#[test]
+fn sample_top_k_restricts_to_k_highest() {
+    // top_k=1 keeps only the single highest-logit token, so every draw picks
+    // it regardless of temperature/noise.
+    let backend = CpuBackend::new();
+    let logits = backend
+        .copy_from_host_f32(&[0.5, 3.0, 1.0, 0.2, 2.0], &[1, 5])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[1], &[1.0], &[9], &[step])
+            .unwrap();
+        assert_eq!(s, vec![1], "top_k=1 must pick the argmax (step {step})");
+    }
+}
+
+#[test]
+fn sample_top_p_restricts_to_nucleus() {
+    // softmax([5,0,0,0]) ≈ [0.985, 0.005×3]. top_p=0.9 keeps only the peak
+    // (its mass alone exceeds 0.9), so every draw picks it.
+    let backend = CpuBackend::new();
+    let logits = backend
+        .copy_from_host_f32(&[5.0, 0.0, 0.0, 0.0], &[1, 4])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[0], &[0.9], &[3], &[step])
+            .unwrap();
+        assert_eq!(s, vec![0], "top_p=0.9 must keep only the peak (step {step})");
+    }
 }
 
 #[test]

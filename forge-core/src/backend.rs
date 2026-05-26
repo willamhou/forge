@@ -1212,11 +1212,14 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// Default: copy to host and reduce on CPU with the identical RNG, so the
     /// CPU and CUDA paths agree; CUDA overrides with an on-device kernel.
+    #[allow(clippy::too_many_arguments)]
     fn sample(
         &self,
         logits: &Self::Tensor,
         temps: &[f32],
         min_ps: &[f32],
+        top_ks: &[u32],
+        top_ps: &[f32],
         seeds: &[u64],
         steps: &[u32],
     ) -> Result<Vec<u32>> {
@@ -1235,14 +1238,16 @@ pub trait Backend: Send + Sync + 'static {
                 "sample: empty logits (cols == 0)".into(),
             ));
         }
-        if temps.len() != rows || min_ps.len() != rows || seeds.len() != rows || steps.len() != rows
+        if temps.len() != rows
+            || min_ps.len() != rows
+            || top_ks.len() != rows
+            || top_ps.len() != rows
+            || seeds.len() != rows
+            || steps.len() != rows
         {
             return Err(crate::ForgeError::InvalidArgument(format!(
-                "sample: per-row params must have {rows} entries (got temps={}, min_ps={}, seeds={}, steps={})",
-                temps.len(),
-                min_ps.len(),
-                seeds.len(),
-                steps.len()
+                "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
+                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
             )));
         }
         let host = self.copy_to_host_f32(logits)?;
@@ -1252,16 +1257,63 @@ pub trait Backend: Send + Sync + 'static {
             let temp = temps[r];
             let do_sample = temp > 0.0;
             let inv_temp = if do_sample { 1.0 / temp } else { 0.0 };
-            // min-p threshold in scaled-logit space: z >= z_max + ln(min_p).
-            let thresh = if do_sample && min_ps[r] > 0.0 {
+            let top_k = top_ks[r] as usize;
+            let top_p = top_ps[r];
+            let do_top_k = do_sample && top_k > 0 && top_k < cols;
+            let do_top_p = do_sample && top_p < 1.0;
+
+            // All filters collapse to a single scaled-logit threshold (see the
+            // CUDA `sample_perrow` kernel — identical algorithm so they agree).
+            let mut thresh = f32::NEG_INFINITY;
+            if do_sample && (min_ps[r] > 0.0 || do_top_k || do_top_p) {
                 let z_max = row
                     .iter()
                     .map(|&v| v * inv_temp)
                     .fold(f32::NEG_INFINITY, f32::max);
-                z_max + min_ps[r].ln()
-            } else {
-                f32::NEG_INFINITY
-            };
+                if min_ps[r] > 0.0 {
+                    thresh = z_max + min_ps[r].ln();
+                }
+                if do_top_k || do_top_p {
+                    let z_min = row
+                        .iter()
+                        .map(|&v| v * inv_temp)
+                        .fold(f32::INFINITY, f32::min);
+                    let z_total: f32 = row.iter().map(|&v| (v * inv_temp - z_max).exp()).sum();
+                    if do_top_k {
+                        let (mut lo, mut hi) = (z_min, z_max);
+                        for _ in 0..24 {
+                            let mid = 0.5 * (lo + hi);
+                            let cnt = row.iter().filter(|&&v| v * inv_temp >= mid).count();
+                            if cnt >= top_k {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        thresh = thresh.max(lo);
+                    }
+                    if do_top_p {
+                        let (mut lo, mut hi) = (z_min, z_max);
+                        let target = top_p * z_total;
+                        for _ in 0..24 {
+                            let mid = 0.5 * (lo + hi);
+                            let mass: f32 = row
+                                .iter()
+                                .map(|&v| v * inv_temp)
+                                .filter(|&z| z >= mid)
+                                .map(|z| (z - z_max).exp())
+                                .sum();
+                            if mass >= target {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        thresh = thresh.max(lo);
+                    }
+                }
+            }
+
             let mut best = f32::NEG_INFINITY;
             let mut best_i = 0usize;
             for (i, &v) in row.iter().enumerate() {

@@ -111,11 +111,13 @@ fn sample_all_greedy_matches_argmax() {
     let logits = backend.copy_from_host_f32(&data, &[3, 4]).unwrap();
     let temps = [0.0f32; 3];
     let min_ps = [0.0f32; 3];
+    let top_ks = [0u32; 3];
+    let top_ps = [1.0f32; 3];
     let seeds = [1u64; 3];
     let steps = [0u32; 3];
     assert_eq!(
         backend
-            .sample(&logits, &temps, &min_ps, &seeds, &steps)
+            .sample(&logits, &temps, &min_ps, &top_ks, &top_ps, &seeds, &steps)
             .unwrap(),
         backend.argmax(&logits).unwrap()
     );
@@ -131,7 +133,7 @@ fn sample_single_row_matches_scalar_gumbel() {
         .unwrap();
     for (seed, step) in [(1u64, 0u32), (42, 7), (12345, 99)] {
         let via_perrow = backend
-            .sample(&logits, &[0.7], &[0.0], &[seed], &[step])
+            .sample(&logits, &[0.7], &[0.0], &[0], &[1.0], &[seed], &[step])
             .unwrap();
         let via_scalar = backend.sample_gumbel(&logits, 0.7, seed, step).unwrap();
         assert_eq!(via_perrow, via_scalar, "(seed {seed}, step {step})");
@@ -149,7 +151,15 @@ fn sample_mixed_batch_greedy_and_sampled() {
     ];
     let logits = backend.copy_from_host_f32(&data, &[2, 4]).unwrap();
     let out = backend
-        .sample(&logits, &[0.0, 1.0], &[0.0, 0.0], &[7, 7], &[0, 3])
+        .sample(
+            &logits,
+            &[0.0, 1.0],
+            &[0.0, 0.0],
+            &[0, 0],
+            &[1.0, 1.0],
+            &[7, 7],
+            &[0, 3],
+        )
         .unwrap();
     assert_eq!(out, vec![2, 0]);
 }
@@ -161,7 +171,15 @@ fn sample_rejects_param_length_mismatch() {
     // 2 rows but only 1 temp.
     assert!(
         backend
-            .sample(&logits, &[1.0], &[0.0, 0.0], &[1, 2], &[0, 0])
+            .sample(
+                &logits,
+                &[1.0],
+                &[0.0, 0.0],
+                &[0, 0],
+                &[1.0, 1.0],
+                &[1, 2],
+                &[0, 0]
+            )
             .is_err()
     );
 }
@@ -177,7 +195,7 @@ fn sample_min_p_filters_low_prob_tokens() {
         .unwrap();
     for step in 0..32u32 {
         let s = backend
-            .sample(&logits, &[1.0], &[0.5], &[7], &[step])
+            .sample(&logits, &[1.0], &[0.5], &[0], &[1.0], &[7], &[step])
             .unwrap();
         assert_eq!(s, vec![0], "min_p must restrict to the peak (step {step})");
     }
@@ -185,7 +203,7 @@ fn sample_min_p_filters_low_prob_tokens() {
     let mut seen_other = false;
     for step in 0..200u32 {
         let s = backend
-            .sample(&logits, &[1.0], &[0.0], &[7], &[step])
+            .sample(&logits, &[1.0], &[0.0], &[0], &[1.0], &[7], &[step])
             .unwrap();
         if s != vec![0] {
             seen_other = true;
@@ -193,4 +211,58 @@ fn sample_min_p_filters_low_prob_tokens() {
         }
     }
     assert!(seen_other, "without min_p, low-prob tokens should sometimes win");
+}
+
+#[test]
+fn sample_top_k_restricts_to_k_highest() {
+    // top_k=1 keeps only the highest-logit token → always picked.
+    let backend = CudaBackend::new(0).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[0.5, 3.0, 1.0, 0.2, 2.0], &[1, 5])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[1], &[1.0], &[9], &[step])
+            .unwrap();
+        assert_eq!(s, vec![1], "top_k=1 must pick the argmax (step {step})");
+    }
+}
+
+#[test]
+fn sample_top_p_restricts_to_nucleus() {
+    // softmax([5,0,0,0]) ≈ [0.985, 0.005×3]; top_p=0.9 keeps only the peak.
+    let backend = CudaBackend::new(0).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[5.0, 0.0, 0.0, 0.0], &[1, 4])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[0], &[0.9], &[3], &[step])
+            .unwrap();
+        assert_eq!(s, vec![0], "top_p=0.9 must keep only the peak (step {step})");
+    }
+}
+
+#[test]
+fn sample_top_k_matches_cpu_reference() {
+    // Distribution check: GPU top-k sampling covers exactly the top-k set and
+    // nothing outside it, over many draws.
+    let backend = CudaBackend::new(0).unwrap();
+    let data = [3.0f32, 1.0, 2.5, 0.5, 2.0, 0.1, 2.8, 0.3];
+    let logits = backend.copy_from_host_f32(&data, &[1, 8]).unwrap();
+    // top-3 by logit are indices 0 (3.0), 6 (2.8), 2 (2.5).
+    let allowed = [0u32, 6, 2];
+    let mut seen = std::collections::HashSet::new();
+    for step in 0..400u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[3], &[1.0], &[5], &[step])
+            .unwrap();
+        assert!(
+            allowed.contains(&s[0]),
+            "top_k=3 sampled {} outside the top-3 set (step {step})",
+            s[0]
+        );
+        seen.insert(s[0]);
+    }
+    assert_eq!(seen.len(), 3, "all 3 top-k tokens should appear over 400 draws");
 }

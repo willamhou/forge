@@ -45,6 +45,44 @@ __device__ __forceinline__ float forge_gumbel(
     u = fminf(fmaxf(u, 1.0e-7f), 1.0f - 1.0e-7f);
     return -logf(-logf(u));
 }
+
+// Block reductions over `smem` (blockDim.x floats). Each ends with a
+// __syncthreads so `smem` can be reused immediately. All threads get the result.
+__device__ __forceinline__ float forge_block_reduce_max(float v, float* smem) {
+    smem[threadIdx.x] = v;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && smem[threadIdx.x + s] > smem[threadIdx.x])
+            smem[threadIdx.x] = smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float r = smem[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float forge_block_reduce_min(float v, float* smem) {
+    smem[threadIdx.x] = v;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && smem[threadIdx.x + s] < smem[threadIdx.x])
+            smem[threadIdx.x] = smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float r = smem[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float forge_block_reduce_sum(float v, float* smem) {
+    smem[threadIdx.x] = v;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    float r = smem[0];
+    __syncthreads();
+    return r;
+}
 "#
     };
 }
@@ -157,17 +195,23 @@ macro_rules! sample_gumbel_src {
     };
 }
 
-/// Per-row sampling: each row carries its own `temp[row]`, `min_p[row]`,
-/// `seed[row]`, `step[row]`. A row with `temp <= 0` decodes greedily
-/// (key = logit, no filtering); a row with `temp > 0` draws via Gumbel-max
-/// (key = logit/temp + gumbel) over the tokens passing min-p filtering. One
-/// call handles a batch mixing greedy and sampled sequences.
+/// Per-row sampling with per-sequence temperature / min-p / top-k / top-p.
+/// A row with `temp <= 0` decodes greedily (raw argmax, filters ignored); a
+/// row with `temp > 0` draws via Gumbel-max over the tokens surviving the
+/// filters. One call handles a batch mixing greedy and sampled sequences.
 ///
-/// min-p keeps tokens with `prob >= min_p * max_prob`, which in scaled-logit
-/// space is exactly `z_i >= z_max + ln(min_p)` (monotonic, no normalisation
-/// needed) — so a single max-reduction gives the threshold. `min_p <= 0`
-/// disables it (threshold -inf). The max-logit token always passes, so at
-/// least one candidate survives.
+/// All three filters reduce to a single scaled-logit threshold τ (prob is
+/// monotonic in the logit), and we keep tokens with `z_i >= τ` where
+/// `τ = max(τ_minp, τ_topk, τ_topp)`:
+/// - min-p: `prob >= min_p·max_prob` ⟺ `z_i >= z_max + ln(min_p)` (closed form).
+/// - top-k: τ = the k-th largest `z_i`, found by bisecting on the count of
+///   `z_i >= τ` (largest τ with count >= k).
+/// - top-p: τ = the nucleus cutoff, found by bisecting on the retained mass
+///   `Σ_{z_i>=τ} exp(z_i - z_max)` vs `top_p · Z` (largest τ with mass >= top_p·Z).
+///
+/// The max-logit token always passes, so at least one candidate survives.
+/// Bisection (24 iters) gives full f32 threshold precision; sampling parity
+/// with the CPU path is distributional, not bit-exact (matching vLLM/SGLang).
 macro_rules! sample_perrow_src {
     ($name:literal, $ty:literal, $load:literal) => {
         concat!(
@@ -178,6 +222,8 @@ macro_rules! sample_perrow_src {
             "    unsigned int cols,\n",
             "    const float* temps,\n",
             "    const float* min_ps,\n",
+            "    const unsigned int* top_ks,\n",
+            "    const float* top_ps,\n",
             "    const unsigned long long* seeds,\n",
             "    const unsigned int* steps\n",
             ") {\n",
@@ -188,36 +234,73 @@ macro_rules! sample_perrow_src {
             "    int do_sample = (temp > 0.0f);\n",
             "    float inv_temp = do_sample ? (1.0f / temp) : 0.0f;\n",
             "    float min_p = min_ps[row];\n",
-            "    int do_min_p = (do_sample && min_p > 0.0f);\n",
+            "    unsigned int top_k = top_ks[row];\n",
+            "    float top_p = top_ps[row];\n",
             "    unsigned long long seed = seeds[row];\n",
             "    unsigned int step = steps[row];\n",
+            "    int do_top_k = (do_sample && top_k > 0u && top_k < cols);\n",
+            "    int do_top_p = (do_sample && top_p < 1.0f);\n",
             "\n",
             "    extern __shared__ unsigned char argmax_smem[];\n",
             "    float* sval = (float*)argmax_smem;\n",
             "    unsigned int* sidx = (unsigned int*)(sval + blockDim.x);\n",
             "    float neg_inf = __uint_as_float(0xff800000u);\n",
             "\n",
-            // Pass 1: row max of the scaled logits (only when min-p is active).
             "    float thresh = neg_inf;\n",
-            "    if (do_min_p) {\n",
-            "        float local_max = neg_inf;\n",
+            "    if (do_sample && (min_p > 0.0f || do_top_k || do_top_p)) {\n",
+            // z_max over the scaled logits.
+            "        float lmax = neg_inf;\n",
             "        for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
             "            float z = ", $load, " * inv_temp;\n",
-            "            if (z > local_max) local_max = z;\n",
+            "            if (z > lmax) lmax = z;\n",
             "        }\n",
-            "        sval[threadIdx.x] = local_max;\n",
-            "        __syncthreads();\n",
-            "        for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {\n",
-            "            if (threadIdx.x < s && sval[threadIdx.x + s] > sval[threadIdx.x])\n",
-            "                sval[threadIdx.x] = sval[threadIdx.x + s];\n",
-            "            __syncthreads();\n",
+            "        float z_max = forge_block_reduce_max(lmax, sval);\n",
+            "        if (min_p > 0.0f) thresh = z_max + logf(min_p);\n",
+            "\n",
+            "        if (do_top_k || do_top_p) {\n",
+            // z_min for the bisection range, and Z (total mass) for top-p.
+            "            float lmin = -neg_inf;\n",
+            "            float lz = 0.0f;\n",
+            "            for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
+            "                float z = ", $load, " * inv_temp;\n",
+            "                if (z < lmin) lmin = z;\n",
+            "                lz += __expf(z - z_max);\n",
+            "            }\n",
+            "            float z_min = forge_block_reduce_min(lmin, sval);\n",
+            "            float Z = forge_block_reduce_sum(lz, sval);\n",
+            "\n",
+            "            if (do_top_k) {\n",
+            "                float lo = z_min, hi = z_max;\n",
+            "                for (int it = 0; it < 24; ++it) {\n",
+            "                    float mid = 0.5f * (lo + hi);\n",
+            "                    float c = 0.0f;\n",
+            "                    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x)\n",
+            "                        if (", $load, " * inv_temp >= mid) c += 1.0f;\n",
+            "                    float cnt = forge_block_reduce_sum(c, sval);\n",
+            "                    if (cnt >= (float)top_k) lo = mid; else hi = mid;\n",
+            "                }\n",
+            "                if (lo > thresh) thresh = lo;\n",
+            "            }\n",
+            "            if (do_top_p) {\n",
+            "                float lo = z_min, hi = z_max;\n",
+            "                float target = top_p * Z;\n",
+            "                for (int it = 0; it < 24; ++it) {\n",
+            "                    float mid = 0.5f * (lo + hi);\n",
+            "                    float m = 0.0f;\n",
+            "                    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
+            "                        float z = ", $load, " * inv_temp;\n",
+            "                        if (z >= mid) m += __expf(z - z_max);\n",
+            "                    }\n",
+            "                    float mass = forge_block_reduce_sum(m, sval);\n",
+            "                    if (mass >= target) lo = mid; else hi = mid;\n",
+            "                }\n",
+            "                if (lo > thresh) thresh = lo;\n",
+            "            }\n",
             "        }\n",
-            "        thresh = sval[0] + logf(min_p);\n",
-            "        __syncthreads();\n",
             "    }\n",
             "\n",
-            // Pass 2: keyed argmax. Sampled rows add Gumbel noise and drop
-            // tokens below the min-p threshold; greedy rows take the raw argmax.
+            // Final pass: keyed argmax. Sampled rows add Gumbel noise and drop
+            // tokens below the combined threshold; greedy rows take raw argmax.
             "    float best = neg_inf;\n",
             "    unsigned int best_i = 0;\n",
             "    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",

@@ -3409,11 +3409,14 @@ impl Backend for CudaBackend {
     /// greedy (argmax) when `temps[row] <= 0` else Gumbel-max. The per-row
     /// params are uploaded to small device buffers (sampling runs outside any
     /// captured region, so no staging is needed).
+    #[allow(clippy::too_many_arguments)]
     fn sample(
         &self,
         logits: &CudaTensor,
         temps: &[f32],
         min_ps: &[f32],
+        top_ks: &[u32],
+        top_ps: &[f32],
         seeds: &[u64],
         steps: &[u32],
     ) -> Result<Vec<u32>> {
@@ -3432,14 +3435,16 @@ impl Backend for CudaBackend {
                 "sample: empty logits (cols == 0)".into(),
             ));
         }
-        if temps.len() != rows || min_ps.len() != rows || seeds.len() != rows || steps.len() != rows
+        if temps.len() != rows
+            || min_ps.len() != rows
+            || top_ks.len() != rows
+            || top_ps.len() != rows
+            || seeds.len() != rows
+            || steps.len() != rows
         {
             return Err(ForgeError::InvalidArgument(format!(
-                "sample: per-row params must have {rows} entries (got temps={}, min_ps={}, seeds={}, steps={})",
-                temps.len(),
-                min_ps.len(),
-                seeds.len(),
-                steps.len()
+                "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
+                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
             )));
         }
 
@@ -3450,6 +3455,14 @@ impl Backend for CudaBackend {
         let min_ps_dev = self
             .stream
             .memcpy_stod(min_ps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let top_ks_dev = self
+            .stream
+            .memcpy_stod(top_ks)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let top_ps_dev = self
+            .stream
+            .memcpy_stod(top_ps)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         let seeds_dev = self
             .stream
@@ -3484,6 +3497,8 @@ impl Backend for CudaBackend {
                 builder.arg(&cols_u32);
                 builder.arg(&temps_dev);
                 builder.arg(&min_ps_dev);
+                builder.arg(&top_ks_dev);
+                builder.arg(&top_ps_dev);
                 builder.arg(&seeds_dev);
                 builder.arg(&steps_dev);
                 unsafe {
@@ -3501,6 +3516,8 @@ impl Backend for CudaBackend {
                 builder.arg(&cols_u32);
                 builder.arg(&temps_dev);
                 builder.arg(&min_ps_dev);
+                builder.arg(&top_ks_dev);
+                builder.arg(&top_ps_dev);
                 builder.arg(&seeds_dev);
                 builder.arg(&steps_dev);
                 unsafe {
