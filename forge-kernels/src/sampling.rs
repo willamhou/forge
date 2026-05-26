@@ -157,11 +157,17 @@ macro_rules! sample_gumbel_src {
     };
 }
 
-/// Per-row sampling: each row carries its own `temp[row]`, `seed[row]`,
-/// `step[row]`. A row with `temp <= 0` decodes greedily (key = logit); a row
-/// with `temp > 0` draws via Gumbel-max (key = logit/temp + gumbel). One call
-/// thus handles a batch mixing greedy and sampled sequences — what the engine
-/// needs, since each sequence has its own sampling params.
+/// Per-row sampling: each row carries its own `temp[row]`, `min_p[row]`,
+/// `seed[row]`, `step[row]`. A row with `temp <= 0` decodes greedily
+/// (key = logit, no filtering); a row with `temp > 0` draws via Gumbel-max
+/// (key = logit/temp + gumbel) over the tokens passing min-p filtering. One
+/// call handles a batch mixing greedy and sampled sequences.
+///
+/// min-p keeps tokens with `prob >= min_p * max_prob`, which in scaled-logit
+/// space is exactly `z_i >= z_max + ln(min_p)` (monotonic, no normalisation
+/// needed) — so a single max-reduction gives the threshold. `min_p <= 0`
+/// disables it (threshold -inf). The max-logit token always passes, so at
+/// least one candidate survives.
 macro_rules! sample_perrow_src {
     ($name:literal, $ty:literal, $load:literal) => {
         concat!(
@@ -171,6 +177,7 @@ macro_rules! sample_perrow_src {
             "    unsigned int rows,\n",
             "    unsigned int cols,\n",
             "    const float* temps,\n",
+            "    const float* min_ps,\n",
             "    const unsigned long long* seeds,\n",
             "    const unsigned int* steps\n",
             ") {\n",
@@ -180,18 +187,48 @@ macro_rules! sample_perrow_src {
             "    float temp = temps[row];\n",
             "    int do_sample = (temp > 0.0f);\n",
             "    float inv_temp = do_sample ? (1.0f / temp) : 0.0f;\n",
+            "    float min_p = min_ps[row];\n",
+            "    int do_min_p = (do_sample && min_p > 0.0f);\n",
             "    unsigned long long seed = seeds[row];\n",
             "    unsigned int step = steps[row];\n",
             "\n",
             "    extern __shared__ unsigned char argmax_smem[];\n",
             "    float* sval = (float*)argmax_smem;\n",
             "    unsigned int* sidx = (unsigned int*)(sval + blockDim.x);\n",
+            "    float neg_inf = __uint_as_float(0xff800000u);\n",
             "\n",
-            "    float best = __uint_as_float(0xff800000u);\n",
+            // Pass 1: row max of the scaled logits (only when min-p is active).
+            "    float thresh = neg_inf;\n",
+            "    if (do_min_p) {\n",
+            "        float local_max = neg_inf;\n",
+            "        for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
+            "            float z = ", $load, " * inv_temp;\n",
+            "            if (z > local_max) local_max = z;\n",
+            "        }\n",
+            "        sval[threadIdx.x] = local_max;\n",
+            "        __syncthreads();\n",
+            "        for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {\n",
+            "            if (threadIdx.x < s && sval[threadIdx.x + s] > sval[threadIdx.x])\n",
+            "                sval[threadIdx.x] = sval[threadIdx.x + s];\n",
+            "            __syncthreads();\n",
+            "        }\n",
+            "        thresh = sval[0] + logf(min_p);\n",
+            "        __syncthreads();\n",
+            "    }\n",
+            "\n",
+            // Pass 2: keyed argmax. Sampled rows add Gumbel noise and drop
+            // tokens below the min-p threshold; greedy rows take the raw argmax.
+            "    float best = neg_inf;\n",
             "    unsigned int best_i = 0;\n",
             "    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
             "        float lg = ", $load, ";\n",
-            "        float key = do_sample ? (lg * inv_temp + forge_gumbel(seed, step, row, i)) : lg;\n",
+            "        float key;\n",
+            "        if (do_sample) {\n",
+            "            float z = lg * inv_temp;\n",
+            "            key = (z >= thresh) ? (z + forge_gumbel(seed, step, row, i)) : neg_inf;\n",
+            "        } else {\n",
+            "            key = lg;\n",
+            "        }\n",
             "        if (key >= best) { best = key; best_i = i; }\n",
             "    }\n",
             "    sval[threadIdx.x] = best;\n",

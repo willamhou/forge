@@ -110,10 +110,13 @@ fn sample_all_greedy_matches_argmax() {
     let data = [1.0, 2.0, 9.0, 0.0, 5.0, 1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 4.0];
     let logits = backend.copy_from_host_f32(&data, &[3, 4]).unwrap();
     let temps = [0.0f32; 3];
+    let min_ps = [0.0f32; 3];
     let seeds = [1u64; 3];
     let steps = [0u32; 3];
     assert_eq!(
-        backend.sample(&logits, &temps, &seeds, &steps).unwrap(),
+        backend
+            .sample(&logits, &temps, &min_ps, &seeds, &steps)
+            .unwrap(),
         backend.argmax(&logits).unwrap()
     );
 }
@@ -127,7 +130,9 @@ fn sample_single_row_matches_scalar_gumbel() {
         .copy_from_host_f32(&[0.5, 1.0, 0.2, 0.8, 0.1, 0.9], &[1, 6])
         .unwrap();
     for (seed, step) in [(1u64, 0u32), (42, 7), (12345, 99)] {
-        let via_perrow = backend.sample(&logits, &[0.7], &[seed], &[step]).unwrap();
+        let via_perrow = backend
+            .sample(&logits, &[0.7], &[0.0], &[seed], &[step])
+            .unwrap();
         let via_scalar = backend.sample_gumbel(&logits, 0.7, seed, step).unwrap();
         assert_eq!(via_perrow, via_scalar, "(seed {seed}, step {step})");
     }
@@ -144,7 +149,7 @@ fn sample_mixed_batch_greedy_and_sampled() {
     ];
     let logits = backend.copy_from_host_f32(&data, &[2, 4]).unwrap();
     let out = backend
-        .sample(&logits, &[0.0, 1.0], &[7, 7], &[0, 3])
+        .sample(&logits, &[0.0, 1.0], &[0.0, 0.0], &[7, 7], &[0, 3])
         .unwrap();
     assert_eq!(out, vec![2, 0]);
 }
@@ -154,5 +159,38 @@ fn sample_rejects_param_length_mismatch() {
     let backend = CudaBackend::new(0).unwrap();
     let logits = backend.copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
     // 2 rows but only 1 temp.
-    assert!(backend.sample(&logits, &[1.0], &[1, 2], &[0, 0]).is_err());
+    assert!(
+        backend
+            .sample(&logits, &[1.0], &[0.0, 0.0], &[1, 2], &[0, 0])
+            .is_err()
+    );
+}
+
+#[test]
+fn sample_min_p_filters_low_prob_tokens() {
+    // softmax([1.1,0,0,0]) ≈ [0.50, 0.167, 0.167, 0.167]. With min_p=0.5 the
+    // keep threshold is 0.5*0.50 = 0.25; only the peak (0.50) survives, so every
+    // draw picks it. With min_p disabled the 0.167 tokens win ~half the time.
+    let backend = CudaBackend::new(0).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[1.1, 0.0, 0.0, 0.0], &[1, 4])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.5], &[7], &[step])
+            .unwrap();
+        assert_eq!(s, vec![0], "min_p must restrict to the peak (step {step})");
+    }
+    // With min_p disabled (0.0) the same logits can occasionally pick others.
+    let mut seen_other = false;
+    for step in 0..200u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.0], &[7], &[step])
+            .unwrap();
+        if s != vec![0] {
+            seen_other = true;
+            break;
+        }
+    }
+    assert!(seen_other, "without min_p, low-prob tokens should sometimes win");
 }

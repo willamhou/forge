@@ -3413,6 +3413,7 @@ impl Backend for CudaBackend {
         &self,
         logits: &CudaTensor,
         temps: &[f32],
+        min_ps: &[f32],
         seeds: &[u64],
         steps: &[u32],
     ) -> Result<Vec<u32>> {
@@ -3431,10 +3432,12 @@ impl Backend for CudaBackend {
                 "sample: empty logits (cols == 0)".into(),
             ));
         }
-        if temps.len() != rows || seeds.len() != rows || steps.len() != rows {
+        if temps.len() != rows || min_ps.len() != rows || seeds.len() != rows || steps.len() != rows
+        {
             return Err(ForgeError::InvalidArgument(format!(
-                "sample: per-row params must have {rows} entries (got temps={}, seeds={}, steps={})",
+                "sample: per-row params must have {rows} entries (got temps={}, min_ps={}, seeds={}, steps={})",
                 temps.len(),
+                min_ps.len(),
                 seeds.len(),
                 steps.len()
             )));
@@ -3443,6 +3446,10 @@ impl Backend for CudaBackend {
         let temps_dev = self
             .stream
             .memcpy_stod(temps)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        let min_ps_dev = self
+            .stream
+            .memcpy_stod(min_ps)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         let seeds_dev = self
             .stream
@@ -3476,6 +3483,7 @@ impl Backend for CudaBackend {
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
                 builder.arg(&temps_dev);
+                builder.arg(&min_ps_dev);
                 builder.arg(&seeds_dev);
                 builder.arg(&steps_dev);
                 unsafe {
@@ -3492,6 +3500,7 @@ impl Backend for CudaBackend {
                 builder.arg(&rows_u32);
                 builder.arg(&cols_u32);
                 builder.arg(&temps_dev);
+                builder.arg(&min_ps_dev);
                 builder.arg(&seeds_dev);
                 builder.arg(&steps_dev);
                 unsafe {

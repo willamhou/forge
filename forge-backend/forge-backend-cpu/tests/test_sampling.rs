@@ -59,6 +59,31 @@ fn gumbel_uniform_logits_cover_all_tokens() {
 }
 
 #[test]
+fn sample_min_p_filters_low_prob_tokens() {
+    // Mirrors the CUDA test: softmax([1.1,0,0,0]) ≈ [0.50, 0.167×3]; min_p=0.5
+    // keeps only the peak (threshold 0.25), so every draw picks token 0.
+    let backend = CpuBackend::new();
+    let logits = backend
+        .copy_from_host_f32(&[1.1, 0.0, 0.0, 0.0], &[1, 4])
+        .unwrap();
+    for step in 0..32u32 {
+        let s = backend
+            .sample(&logits, &[1.0], &[0.5], &[7], &[step])
+            .unwrap();
+        assert_eq!(s, vec![0], "min_p must restrict to the peak (step {step})");
+    }
+    // Without min_p the 0.167 tokens win sometimes.
+    let mut seen_other = false;
+    for step in 0..200u32 {
+        if backend.sample(&logits, &[1.0], &[0.0], &[7], &[step]).unwrap() != vec![0] {
+            seen_other = true;
+            break;
+        }
+    }
+    assert!(seen_other, "without min_p, low-prob tokens should sometimes win");
+}
+
+#[test]
 fn gumbel_rejects_nonpositive_temperature() {
     let backend = CpuBackend::new();
     let logits = backend.copy_from_host_f32(&[1.0, 2.0], &[1, 2]).unwrap();

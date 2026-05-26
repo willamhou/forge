@@ -1216,6 +1216,7 @@ pub trait Backend: Send + Sync + 'static {
         &self,
         logits: &Self::Tensor,
         temps: &[f32],
+        min_ps: &[f32],
         seeds: &[u64],
         steps: &[u32],
     ) -> Result<Vec<u32>> {
@@ -1234,10 +1235,12 @@ pub trait Backend: Send + Sync + 'static {
                 "sample: empty logits (cols == 0)".into(),
             ));
         }
-        if temps.len() != rows || seeds.len() != rows || steps.len() != rows {
+        if temps.len() != rows || min_ps.len() != rows || seeds.len() != rows || steps.len() != rows
+        {
             return Err(crate::ForgeError::InvalidArgument(format!(
-                "sample: per-row params must have {rows} entries (got temps={}, seeds={}, steps={})",
+                "sample: per-row params must have {rows} entries (got temps={}, min_ps={}, seeds={}, steps={})",
                 temps.len(),
+                min_ps.len(),
                 seeds.len(),
                 steps.len()
             )));
@@ -1249,11 +1252,26 @@ pub trait Backend: Send + Sync + 'static {
             let temp = temps[r];
             let do_sample = temp > 0.0;
             let inv_temp = if do_sample { 1.0 / temp } else { 0.0 };
+            // min-p threshold in scaled-logit space: z >= z_max + ln(min_p).
+            let thresh = if do_sample && min_ps[r] > 0.0 {
+                let z_max = row
+                    .iter()
+                    .map(|&v| v * inv_temp)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                z_max + min_ps[r].ln()
+            } else {
+                f32::NEG_INFINITY
+            };
             let mut best = f32::NEG_INFINITY;
             let mut best_i = 0usize;
             for (i, &v) in row.iter().enumerate() {
                 let key = if do_sample {
-                    v * inv_temp + gumbel_noise(seeds[r], steps[r], r as u32, i as u32)
+                    let z = v * inv_temp;
+                    if z >= thresh {
+                        z + gumbel_noise(seeds[r], steps[r], r as u32, i as u32)
+                    } else {
+                        f32::NEG_INFINITY
+                    }
                 } else {
                     v
                 };
