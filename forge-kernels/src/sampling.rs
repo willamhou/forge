@@ -39,7 +39,10 @@ __device__ __forceinline__ float forge_gumbel(
     unsigned long long seed, unsigned int step, unsigned int row, unsigned int col
 ) {
     float u = forge_uniform(seed, step, row, col);
-    // u already in (0,1); -log(-log(u)) is finite.
+    // Clamp into the open interval: at hi=2^24-1 the uniform rounds to exactly
+    // 1.0 in f32, which would make -log(-log(u)) = +inf and force that token.
+    // Same clamp on the CPU side (gumbel_noise in forge-core) keeps them aligned.
+    u = fminf(fmaxf(u, 1.0e-7f), 1.0f - 1.0e-7f);
     return -logf(-logf(u));
 }
 "#
@@ -68,8 +71,9 @@ macro_rules! argmax_src {
             "    float* sval = (float*)argmax_smem;\n",
             "    unsigned int* sidx = (unsigned int*)(sval + blockDim.x);\n",
             "\n",
-            // NVRTC has no <math.h> INFINITY; -1e38 is below any real logit.
-            "    float best = -1e38f;\n",
+            // True -inf (bit pattern) so an all-(-inf)-key row reduces the same
+            // way as the CPU path's f32::NEG_INFINITY seed (NVRTC has no INFINITY).
+            "    float best = __uint_as_float(0xff800000u);\n",
             "    unsigned int best_i = 0;\n",
             "    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
             "        float v = ", $load, ";\n",
@@ -123,7 +127,9 @@ macro_rules! sample_gumbel_src {
             "    float* sval = (float*)argmax_smem;\n",
             "    unsigned int* sidx = (unsigned int*)(sval + blockDim.x);\n",
             "\n",
-            "    float best = -1e38f;\n",
+            // True -inf (bit pattern) so an all-(-inf)-key row reduces the same
+            // way as the CPU path's f32::NEG_INFINITY seed (NVRTC has no INFINITY).
+            "    float best = __uint_as_float(0xff800000u);\n",
             "    unsigned int best_i = 0;\n",
             "    for (unsigned int i = threadIdx.x; i < cols; i += blockDim.x) {\n",
             "        float key = ", $load, " * inv_temp + forge_gumbel(seed, step, row, i);\n",

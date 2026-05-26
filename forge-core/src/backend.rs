@@ -16,9 +16,14 @@ fn forge_uniform(seed: u64, step: u32, row: u32, col: u32) -> f32 {
     (hi as f32 + 0.5) * (1.0 / 16_777_216.0)
 }
 
-/// Gumbel noise `-log(-log u)` for the Gumbel-max sampling trick.
+/// Gumbel noise `-log(-log u)` for the Gumbel-max sampling trick. `u` is
+/// clamped into the open interval (same clamp as `forge_gumbel` in
+/// `forge-kernels`): at the top of the range the f32 uniform can round to
+/// exactly 1.0, which would make the noise `+inf` and pin that token.
 fn gumbel_noise(seed: u64, step: u32, row: u32, col: u32) -> f32 {
-    let u = forge_uniform(seed, step, row, col);
+    let u = forge_uniform(seed, step, row, col)
+        .max(1.0e-7_f32)
+        .min(1.0_f32 - 1.0e-7_f32);
     -(-(u.ln())).ln()
 }
 
