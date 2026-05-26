@@ -48,6 +48,14 @@ struct SeqConstraint {
     state: u32,
 }
 
+/// Result of a batched decode forward: either the per-sequence token ids
+/// (device-argmax fast path, only N ids leave the GPU) or the full host
+/// `[N, vocab_size]` logits (CPU sampler path).
+enum DecodeOut {
+    Ids(Vec<u32>),
+    Logits(Vec<f32>),
+}
+
 /// Optional decode function for stop_strings checking.
 /// Takes a slice of token IDs and returns the decoded text.
 pub type DecodeFn = Arc<dyn Fn(&[u32]) -> Option<String> + Send + Sync>;
@@ -437,10 +445,18 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         let input = self.build_batch_input(&active_seqs);
         let n = active_seqs.len() as u32;
 
-        // Copy logits to host: [N, vocab_size]. Either via the CUDA-Graph
-        // capture/replay path (bucketed batch sizes) or the eager forward.
+        // When every sequence in the batch is greedy + unconstrained, sample
+        // with a pure device-side argmax and pull back only N token ids,
+        // skipping the [N, vocab_size] logits D2H. Any sequence needing the CPU
+        // sampler (temperature/top-k/p, penalties, FSM mask) forces the full
+        // host-logits path for the whole batch.
+        let all_argmax = active_seqs.iter().all(|s| self.decode_argmax_eligible(s));
+
+        // Run the decode forward via the CUDA-Graph capture/replay path
+        // (bucketed batch sizes) or the eager forward, then produce either the
+        // per-seq token ids (fast path) or the host [N, vocab_size] logits.
         let use_graph = self.decode_runner.is_some() && self.is_decode_bucket(n);
-        let logits_host: Vec<f32> = if use_graph {
+        let decode_out: DecodeOut = if use_graph {
             // Lazily allocate this bucket's persistent decode state.
             if !self.decode_states.contains_key(&n) {
                 let st = self.model.make_decode_state(n as usize)?;
@@ -484,19 +500,40 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             self.backend.synchronize()?;
 
             let state = self.decode_states.get(&n).unwrap();
-            self.backend
-                .copy_to_host_f32(self.model.decode_logits(state))?
+            let logits = self.model.decode_logits(state);
+            if all_argmax {
+                DecodeOut::Ids(self.backend.argmax(logits)?)
+            } else {
+                DecodeOut::Logits(self.backend.copy_to_host_f32(logits)?)
+            }
         } else {
             let output = self.model.forward(&input, &mut *self.kv_cache)?;
             self.backend.synchronize()?;
-            self.backend.copy_to_host_f32(&output.logits)?
+            if all_argmax {
+                DecodeOut::Ids(self.backend.argmax(&output.logits)?)
+            } else {
+                DecodeOut::Logits(self.backend.copy_to_host_f32(&output.logits)?)
+            }
         };
         let vocab_size = self.model.config().vocab_size;
 
-        // Per-sequence sampling
+        // Per-sequence emit. The fast path skips the sampler entirely (eligible
+        // seqs have no FSM, so `emit_token` handles append/stop/finish); the
+        // full path runs the CPU sampler over each seq's logits slice.
         for (i, seq) in active_seqs.iter().enumerate() {
-            let seq_logits = &logits_host[i * vocab_size..(i + 1) * vocab_size];
-            if let Err(e) = self.sample_and_emit(seq, seq_logits) {
+            let res = match &decode_out {
+                DecodeOut::Ids(ids) => {
+                    let token_id = ids[i];
+                    match self.scheduler.get_generated_tokens(seq.seq_id) {
+                        Ok(generated) => self.emit_token(seq, token_id, &generated),
+                        Err(e) => Err(e),
+                    }
+                }
+                DecodeOut::Logits(host) => {
+                    self.sample_and_emit(seq, &host[i * vocab_size..(i + 1) * vocab_size])
+                }
+            };
+            if let Err(e) = res {
                 error!(seq_id = seq.seq_id, error = %e, "sampling failed in batch");
                 self.send_event(
                     seq.seq_id,
@@ -514,6 +551,20 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         }
 
         Ok(())
+    }
+
+    /// Whether `seq` can be decoded with a pure device-side argmax: greedy
+    /// (temperature ≤ 0), no penalties (which would reshape the logits), and no
+    /// FSM constraint (which masks logits before sampling). top-k/top-p/min-p
+    /// are irrelevant under greedy. These seqs need only the argmax token id,
+    /// never the full host logits.
+    fn decode_argmax_eligible(&self, seq: &ScheduledSeq) -> bool {
+        let p = &seq.sampling_params;
+        p.temperature <= 0.0
+            && p.repetition_penalty == 1.0
+            && p.presence_penalty == 0.0
+            && p.frequency_penalty == 0.0
+            && !self.constraints.contains_key(&seq.seq_id)
     }
 
     /// Sample a token from logits, advance FSM, handle stop conditions, emit events.
@@ -578,7 +629,15 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .sample_single(last_logits, &seq.sampling_params, &generated)?
         };
 
-        let token_id = result.token_id;
+        self.emit_token(seq, result.token_id, &generated)
+    }
+
+    /// Append `token_id` to `seq`, advance any FSM constraint, run stop /
+    /// EOS / max-token checks, and emit the resulting events. Shared by the
+    /// host sampler path ([`Self::sample_and_emit`]) and the device-argmax
+    /// fast path in [`Self::process_decode_batch`]. `generated` is the
+    /// sequence's tokens BEFORE this one.
+    fn emit_token(&mut self, seq: &ScheduledSeq, token_id: u32, generated: &[u32]) -> Result<()> {
         self.scheduler.append_token(seq.seq_id, token_id)?;
 
         // Advance FSM state if constraint is active.
@@ -653,7 +712,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .push(token_id);
 
             self.decode_fn.as_ref().and_then(|decode| {
-                let mut all_tokens = generated.clone();
+                let mut all_tokens = generated.to_vec();
                 all_tokens.push(token_id);
                 let text = decode(&all_tokens)?;
                 seq.sampling_params
@@ -675,7 +734,7 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             let flush_all = should_finish;
             let prefix_match = if !flush_all {
                 self.decode_fn.as_ref().and_then(|decode| {
-                    let mut all_tokens = generated.clone();
+                    let mut all_tokens = generated.to_vec();
                     all_tokens.push(token_id);
                     let text = decode(&all_tokens)?;
                     let is_prefix = seq.sampling_params.stop_strings.iter().any(|s| {
