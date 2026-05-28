@@ -499,10 +499,20 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // Only capture/replay when the model supports the capture-safe decode
         // path; otherwise (e.g. QKV-bias models) fall back to eager `forward`,
         // which still feeds the device-sampling fast path below.
-        let use_graph = self.decode_runner.is_some()
-            && self.is_decode_bucket(n)
-            && self.model.supports_capture_decode();
-        let decode_out: DecodeOut = if use_graph {
+        // The persistent-buffer decode path (stage → compute_decode →
+        // decode_logits) reuses preallocated scratch every step, so it avoids
+        // the per-op device malloc/free + per-layer sync that the allocating
+        // `forward` incurs. Use it whenever the model supports the capture-safe
+        // decode (Llama/Qwen family); only QKV-bias-style models without an
+        // `_into` path fall back to the allocating `forward` below.
+        //
+        // CUDA-Graph replay layers on top: when this batch size is a configured
+        // bucket and a runner exists, the pure-kernel compute is captured once
+        // and replayed (no launch overhead). Without a bucket/runner we still
+        // run `compute_decode` directly — eager, but allocation-free.
+        let use_persistent = self.model.supports_capture_decode();
+        let use_graph = use_persistent && self.decode_runner.is_some() && self.is_decode_bucket(n);
+        let decode_out: DecodeOut = if use_persistent {
             // Lazily allocate this bucket's persistent decode state.
             if !self.decode_states.contains_key(&n) {
                 let st = self.model.make_decode_state(n as usize)?;
@@ -521,27 +531,35 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             // scratch/pool buffers, so any device/host pointer a captured graph
             // baked may have moved during this very step. Checking here (rather
             // than before `stage_decode`) guarantees a staging-time grow drops
-            // the stale graphs before `dispatch` could replay one.
-            let epoch = self.backend.decode_capture_epoch();
-            if epoch != self.last_capture_epoch {
-                if let Some(r) = self.decode_runner.as_mut() {
-                    r.invalidate_all();
+            // the stale graphs before `dispatch` could replay one. Only relevant
+            // when a graph may be replayed.
+            if use_graph {
+                let epoch = self.backend.decode_capture_epoch();
+                if epoch != self.last_capture_epoch {
+                    if let Some(r) = self.decode_runner.as_mut() {
+                        r.invalidate_all();
+                    }
+                    self.last_capture_epoch = epoch;
                 }
-                self.last_capture_epoch = epoch;
             }
 
-            // Capture-or-replay the pure-kernel compute. Disjoint-field borrows
-            // keep the dispatcher and the closure's captures separate.
+            // Pure-kernel compute: replay via CUDA graph when bucketed, else run
+            // the persistent-buffer forward directly. Disjoint-field borrows keep
+            // the dispatcher and the closure's captures separate.
             {
                 let model = &self.model;
                 let kv = &mut *self.kv_cache;
                 let state = self.decode_states.get_mut(&n).unwrap();
-                let runner = self
-                    .decode_runner
-                    .as_mut()
-                    .expect("decode_runner is Some in the graph branch");
-                let mut fwd = || model.compute_decode(kv, state);
-                runner.dispatch(n, &mut fwd)?;
+                if use_graph {
+                    let runner = self
+                        .decode_runner
+                        .as_mut()
+                        .expect("decode_runner is Some in the graph branch");
+                    let mut fwd = || model.compute_decode(kv, state);
+                    runner.dispatch(n, &mut fwd)?;
+                } else {
+                    model.compute_decode(kv, state)?;
+                }
             }
             self.backend.synchronize()?;
 
@@ -550,7 +568,10 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(logits)?)
             } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
-                DecodeOut::Ids(self.backend.sample(logits, temps, min_ps, top_ks, top_ps, seeds, steps)?)
+                DecodeOut::Ids(
+                    self.backend
+                        .sample(logits, temps, min_ps, top_ks, top_ps, seeds, steps)?,
+                )
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(logits)?)
             }
@@ -560,7 +581,15 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
             if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(&output.logits)?)
             } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
-                DecodeOut::Ids(self.backend.sample(&output.logits, temps, min_ps, top_ks, top_ps, seeds, steps)?)
+                DecodeOut::Ids(self.backend.sample(
+                    &output.logits,
+                    temps,
+                    min_ps,
+                    top_ks,
+                    top_ps,
+                    seeds,
+                    steps,
+                )?)
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(&output.logits)?)
             }

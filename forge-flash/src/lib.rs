@@ -17,6 +17,7 @@ unsafe extern "C" {
         k: *const core::ffi::c_void,
         v: *const core::ffi::c_void,
         out: *mut core::ffi::c_void,
+        softmax_lse: *mut core::ffi::c_void,
         batch_size: i32,
         seqlen_q: i32,
         seqlen_k: i32,
@@ -39,12 +40,17 @@ unsafe extern "C" {
 /// - K shape: `[batch_size, seqlen_k, num_heads_k, head_dim]` (contiguous)
 /// - V shape: `[batch_size, seqlen_k, num_heads_k, head_dim]` (contiguous)
 /// - out shape: `[batch_size, seqlen_q, num_heads, head_dim]` (pre-allocated)
+/// - `softmax_lse` points to a `[batch_size, num_heads, seqlen_q]` f32 scratch
+///   buffer the kernel always writes; it must hold at least that many floats and
+///   stay valid for the launch. Forward-only inference never reads it back.
 /// - Data must be F16 or BF16 (not F32)
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn flash_fwd(
     q: u64,
     k: u64,
     v: u64,
     out: u64,
+    softmax_lse: u64,
     batch_size: i32,
     seqlen_q: i32,
     seqlen_k: i32,
@@ -62,6 +68,7 @@ pub unsafe fn flash_fwd(
             k as *const core::ffi::c_void,
             v as *const core::ffi::c_void,
             out as *mut core::ffi::c_void,
+            softmax_lse as *mut core::ffi::c_void,
             batch_size,
             seqlen_q,
             seqlen_k,

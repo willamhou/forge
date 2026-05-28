@@ -121,10 +121,29 @@ fn flash_attn_dispatch(
     // Raw-ptr → integer goes through usize per Rust cast rules.
     let stream_ptr = backend.stream.cu_stream() as usize as u64;
 
+    // Persistent backend-owned LSE scratch ([batch, num_heads, seqlen_q] f32).
+    // FA2 always writes it; we never read it back. Reusing one buffer avoids the
+    // per-call cudaMalloc/cudaFree + cudaStreamSynchronize the C wrapper used to do.
+    let lse_len = (batch_size as usize) * (num_heads as usize) * (seqlen_q as usize);
+    let lse_ptr = backend.flash_lse_ptr(lse_len.max(1))?;
+
     unsafe {
         forge_flash::flash_fwd(
-            q_ptr, k_ptr, v_ptr, out_ptr, batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k,
-            head_dim, scale, is_causal, fa_dtype, stream_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            out_ptr,
+            lse_ptr,
+            batch_size,
+            seqlen_q,
+            seqlen_k,
+            num_heads,
+            num_heads_k,
+            head_dim,
+            scale,
+            is_causal,
+            fa_dtype,
+            stream_ptr,
         );
     }
 

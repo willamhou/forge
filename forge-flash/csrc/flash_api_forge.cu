@@ -60,6 +60,7 @@ extern "C" void forge_flash_attn_fwd(
     void* k_ptr,      // [B, seqlen_k, num_heads_k, head_dim]
     void* v_ptr,      // [B, seqlen_k, num_heads_k, head_dim]
     void* out_ptr,     // [B, seqlen_q, num_heads, head_dim]
+    void* softmax_lse_ptr, // [B, num_heads, seqlen_q] f32 scratch (caller-owned, persistent)
     int batch_size,
     int seqlen_q,
     int seqlen_k,
@@ -145,18 +146,15 @@ extern "C" void forge_flash_attn_fwd(
     // --- softcap disabled ---
     params.softcap = 0.0f;
 
-    // --- allocate scratch for softmax log-sum-exp (always written by kernel) ---
-    // Shape: [batch_size, num_heads, seqlen_q]  (float32)
-    void* softmax_lse = nullptr;
-    size_t lse_bytes = static_cast<size_t>(batch_size) * num_heads * seqlen_q * sizeof(float);
-    cudaMalloc(&softmax_lse, lse_bytes);
-    params.softmax_lse_ptr = softmax_lse;
+    // --- softmax log-sum-exp scratch (always written by the kernel) ---
+    // Shape: [batch_size, num_heads, seqlen_q] f32. The caller passes a
+    // persistent, backend-owned buffer so we avoid a per-call cudaMalloc/cudaFree
+    // — and the cudaStreamSynchronize they'd otherwise require to free the buffer
+    // safely, which serialized every layer's attention and killed CPU/GPU overlap
+    // during prefill. LSE is never read back in forward-only inference, and all
+    // ops run on `stream`, so reusing this buffer across calls is safe.
+    params.softmax_lse_ptr = softmax_lse_ptr;
 
     // --- launch ---
     run_mha_fwd(params, static_cast<cudaStream_t>(stream));
-
-    // Free the scratch buffer (synchronize on the stream first so the kernel
-    // has finished writing to it before we free).
-    cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-    cudaFree(softmax_lse);
 }

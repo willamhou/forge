@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::sys::cublasOperation_t;
@@ -105,6 +106,22 @@ pub struct CudaBackend {
     /// op can be recorded in a captured graph (the old `paged_write_kv`
     /// host-loop bakes destinations into memcpy nodes — not replay-safe).
     scatter_slot_mapping: Arc<Mutex<I32Scratch>>,
+    /// When true, the decode input scratch (token indices, RoPE cos/sin, paged
+    /// block tables / kv lens) was already uploaded by `stage_decode_inputs`
+    /// this step, so `embedding_into` / RoPE / `paged_attention_into` skip their
+    /// own redundant H2D upload of that data. Set around the captured
+    /// `compute_decode` forward; off everywhere else (prefill / eager `forward`
+    /// still upload normally). Eliminates redundant memcpy nodes that otherwise
+    /// bloat the captured decode graph and slow every replay.
+    decode_inputs_prestaged: Arc<AtomicBool>,
+    /// Persistent device scratch for FlashAttention's softmax log-sum-exp output.
+    /// FA2 always writes a `[batch, num_heads, seqlen_q]` f32 LSE buffer; in
+    /// forward-only inference we never read it back, so we hand the kernel this
+    /// reused backend-owned buffer instead of `cudaMalloc`/`cudaFree`-ing per
+    /// call. That per-call free also forced a `cudaStreamSynchronize` after every
+    /// layer's attention, serializing prefill — eliminating it restores CPU/GPU
+    /// overlap. Grows monotonically; never freed until the backend drops.
+    flash_lse: Arc<Mutex<CudaSlice<f32>>>,
 }
 
 /// Monotonically-growing i32 device buffer. `version` increments on every
@@ -290,11 +307,15 @@ impl CudaBackend {
         let slot_mapping_buf = stream
             .alloc_zeros::<i32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc scatter_slot_mapping: {e}")))?;
+        let flash_lse_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc flash_lse: {e}")))?;
 
         Ok(Self {
             ctx,
             stream,
             blas: Arc::new(blas),
+            decode_inputs_prestaged: Arc::new(AtomicBool::new(false)),
             kernels: Arc::new(kernels),
             _module_f32: module_f32,
             _module_f16: module_f16,
@@ -332,7 +353,26 @@ impl CudaBackend {
                 version: 0,
                 host: vec![0i32; initial_scratch_cap],
             })),
+            flash_lse: Arc::new(Mutex::new(flash_lse_buf)),
         })
+    }
+
+    /// Grow the FlashAttention LSE scratch to hold at least `needed` f32 and
+    /// return its device pointer. The buffer is backend-owned and persistent, so
+    /// the pointer stays valid for a kernel launched on `self.stream`. Caller
+    /// hands the pointer straight to the FA2 FFI. Grows geometrically; the LSE
+    /// is write-only scratch in forward-only inference, so reuse is safe.
+    pub(crate) fn flash_lse_ptr(&self, needed: usize) -> Result<u64> {
+        use cudarc::driver::DevicePtr;
+        let mut lse = self.flash_lse.lock().unwrap();
+        if lse.len() < needed {
+            let new_cap = needed.max(lse.len() * 3 / 2).max(16);
+            *lse = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow flash_lse: {e}")))?;
+        }
+        Ok(lse.device_ptr(&self.stream).0)
     }
 
     /// Shared handle to the CUDA context. Used by callers that need to
@@ -777,17 +817,25 @@ impl CudaBackend {
         // single-threaded engine access — no recursion, no contention. Lock
         // order is stable (block_tables → kv_lens) so even if that contract
         // changes there's no deadlock risk between paged_attention calls.
+        // Skipped on the captured decode path: stage_decode_inputs already
+        // uploaded block_tables/kv_lens, so re-uploading per layer would add 2
+        // redundant memcpy graph nodes per layer.
+        let prestaged = self.decode_inputs_prestaged.load(Ordering::Relaxed);
         let mut bt_scratch = self
             .paged_block_tables
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_block_tables mutex poisoned".into()))?;
-        self.upload_i32_scratch(&mut bt_scratch, block_tables)?;
+        if !prestaged {
+            self.upload_i32_scratch(&mut bt_scratch, block_tables)?;
+        }
 
         let mut kv_scratch = self
             .paged_kv_lens
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_kv_lens mutex poisoned".into()))?;
-        self.upload_i32_scratch(&mut kv_scratch, kv_lens)?;
+        if !prestaged {
+            self.upload_i32_scratch(&mut kv_scratch, kv_lens)?;
+        }
 
         let block_tables_dev = &bt_scratch.buf;
         let kv_lens_dev = &kv_scratch.buf;
@@ -1867,18 +1915,25 @@ impl Backend for CudaBackend {
             )));
         }
 
-        // Stage cos/sin into persistent scratch.
+        // Stage cos/sin into persistent scratch. Skipped on the captured decode
+        // path: stage_decode_inputs already uploaded them, and re-uploading per
+        // layer would add 2 redundant memcpy graph nodes per layer.
+        let prestaged = self.decode_inputs_prestaged.load(Ordering::Relaxed);
         let mut cos_scratch = self
             .rope_cos
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_cos mutex poisoned".into()))?;
-        self.upload_f32_scratch(&mut cos_scratch, cos_host)?;
+        if !prestaged {
+            self.upload_f32_scratch(&mut cos_scratch, cos_host)?;
+        }
 
         let mut sin_scratch = self
             .rope_sin
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_sin mutex poisoned".into()))?;
-        self.upload_f32_scratch(&mut sin_scratch, sin_host)?;
+        if !prestaged {
+            self.upload_f32_scratch(&mut sin_scratch, sin_host)?;
+        }
 
         let cos_dev = &cos_scratch.buf;
         let sin_dev = &sin_scratch.buf;
@@ -2166,7 +2221,11 @@ impl Backend for CudaBackend {
             .embedding_indices
             .lock()
             .map_err(|_| ForgeError::Cuda("embedding_indices mutex poisoned".into()))?;
-        self.upload_u32_scratch(&mut indices_scratch, indices)?;
+        // Skip the upload when stage_decode_inputs already wrote these indices
+        // (captured decode path) — avoids a redundant memcpy graph node.
+        if !self.decode_inputs_prestaged.load(Ordering::Relaxed) {
+            self.upload_u32_scratch(&mut indices_scratch, indices)?;
+        }
         let indices_dev = &indices_scratch.buf;
 
         let launch_cfg = LaunchConfig {
@@ -3514,7 +3573,12 @@ impl Backend for CudaBackend {
         {
             return Err(ForgeError::InvalidArgument(format!(
                 "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
-                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
+                temps.len(),
+                min_ps.len(),
+                top_ks.len(),
+                top_ps.len(),
+                seeds.len(),
+                steps.len()
             )));
         }
 
@@ -3638,6 +3702,11 @@ impl Backend for CudaBackend {
             self.stream(),
             buckets.to_vec(),
         )))
+    }
+
+    fn set_decode_inputs_prestaged(&self, prestaged: bool) {
+        self.decode_inputs_prestaged
+            .store(prestaged, Ordering::Relaxed);
     }
 
     fn decode_capture_epoch(&self) -> u64 {

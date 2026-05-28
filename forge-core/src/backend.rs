@@ -1259,7 +1259,12 @@ pub trait Backend: Send + Sync + 'static {
         {
             return Err(crate::ForgeError::InvalidArgument(format!(
                 "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
-                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
+                temps.len(),
+                min_ps.len(),
+                top_ks.len(),
+                top_ps.len(),
+                seeds.len(),
+                steps.len()
             )));
         }
         let host = self.copy_to_host_f32(logits)?;
@@ -1409,4 +1414,13 @@ pub trait Backend: Send + Sync + 'static {
     fn decode_capture_epoch(&self) -> u64 {
         0
     }
+
+    /// Hint that the decode input scratch (token indices, RoPE cos/sin, paged
+    /// block tables / kv lens) has already been uploaded by
+    /// `stage_decode_inputs` for the current step. While set, capture-path ops
+    /// (`embedding_into`, RoPE, `paged_attention_into`) skip their own H2D
+    /// upload of that same data — eliminating redundant memcpy nodes from the
+    /// captured decode graph (and redundant copies on the eager path). The
+    /// caller must clear it after the decode forward. Default: no-op.
+    fn set_decode_inputs_prestaged(&self, _prestaged: bool) {}
 }
