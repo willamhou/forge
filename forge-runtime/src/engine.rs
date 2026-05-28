@@ -248,12 +248,19 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 .filter(|s| !failed_seq_ids.contains(&s.seq_id))
                 .collect();
 
-            // Route through the batched path when graph capture is on (so
-            // batch=1 decode also benefits) or whenever there's more than one
-            // decode sequence. Single-sequence decode without graph capture
-            // stays on the simpler `process_sequence` path.
-            let route_batched =
-                !decode_seqs.is_empty() && (self.decode_runner.is_some() || decode_seqs.len() > 1);
+            // Route ALL decode through the batched path (process_decode_batch):
+            // allocation-free persistent-buffer compute_decode + device-side
+            // sampling (argmax/Gumbel, only N ids leave the GPU) + quantized
+            // decode — none of which the old single-seq forward_single path has.
+            //
+            // History: until the split-KV paged-attention fix (d63dfa0),
+            // compute_decode was ~2x slower than forward_single at batch=1 on
+            // GB10 (the naive paged-attention decode kernel was 63x slower than
+            // FA2), so batch=1 deliberately stayed on forward_single. The fix
+            // brought compute_decode to parity (54 vs 56ms), so batch=1 now
+            // routes here too — gaining device sampling + Q8 quantized decode at
+            // no regression. Graph replay still only engages with a runner+bucket.
+            let route_batched = !decode_seqs.is_empty();
 
             if route_batched {
                 if let Err(e) = self.process_decode_batch(&decode_seqs) {
