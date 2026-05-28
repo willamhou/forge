@@ -76,7 +76,7 @@ fn run<B: Backend + Clone>(
     vocab: usize,
 ) -> anyhow::Result<()> {
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
-    let model = load_transformer(&loader, model_config.clone(), backend)?;
+    let model = load_transformer(&loader, model_config.clone(), backend, false)?;
 
     let mut kv = NaiveKvCache::new(backend.clone(), model_config.num_hidden_layers, 1);
     kv.allocate(0, token_ids.len())?;

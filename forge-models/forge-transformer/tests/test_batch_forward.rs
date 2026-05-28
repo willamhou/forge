@@ -5,6 +5,7 @@ use forge_core::{Backend, DType, KvCache, Model, ModelConfig, ModelInput, SeqMet
 use forge_kvcache::naive::NaiveKvCache;
 use forge_transformer::TransformerModel;
 use forge_transformer::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
+use forge_transformer::quantized_linear::QuantizedLinear;
 use forge_transformer::rope::RopeFreqs;
 
 fn tiny_config() -> ModelConfig {
@@ -39,7 +40,7 @@ fn build_tiny_model(backend: &CpuBackend) -> TransformerModel<CpuBackend> {
     };
 
     let embed_tokens = make_weight(vocab, h);
-    let lm_head = make_weight(h, vocab);
+    let lm_head = QuantizedLinear::new_f16(make_weight(h, vocab));
 
     let norm = RMSNorm::new(
         backend.copy_from_host_f32(&vec![1.0; h], &[h]).unwrap(),
@@ -58,15 +59,15 @@ fn build_tiny_model(backend: &CpuBackend) -> TransformerModel<CpuBackend> {
     let cat_t = backend.cat(&[&wq_t, &wk_t, &wv_t], 0).unwrap();
     let wqkv = backend.transpose(&cat_t, 0, 1).unwrap();
     let attn = LlamaAttention::new(
-        wqkv,
-        make_weight(q_dim, h), // wo
+        QuantizedLinear::new_f16(wqkv),
+        QuantizedLinear::new_f16(make_weight(q_dim, h)), // wo
         &config,
     );
 
     let mlp = LlamaMLP::new(
-        make_weight(h, inter), // gate
-        make_weight(h, inter), // up
-        make_weight(inter, h), // down
+        QuantizedLinear::new_f16(make_weight(h, inter)), // gate
+        QuantizedLinear::new_f16(make_weight(h, inter)), // up
+        QuantizedLinear::new_f16(make_weight(inter, h)), // down
     );
 
     let layer_norm = RMSNorm::new(
