@@ -546,4 +546,103 @@ fn paged_attention_cuda_matches_default_impl() {
             scale,
         )
         .expect_err("block_id beyond pool size must fail");
+
+    // ── Split-KV multi-split + 4-warp coverage ──────────────────────────
+    //
+    // The shapes above use head_dim=32 (1 warp) and kv_len < 512 → num_splits=1,
+    // so they never exercise the flash-decoding combine step or the 4-warp dot
+    // reduction. Re-run with the real Qwen decode geometry: head_dim=128
+    // (4 warps), GQA group 4, and a kv_len of 1500 that crosses many blocks and
+    // forces num_splits = ceil(1500/512) = 3. Compare the F16 split-KV kernel
+    // against the F32 gather + batched_decode_attention reference.
+    {
+        let s_num_heads = 8;
+        let s_num_kv_heads = 2; // group size 4
+        let s_head_dim = 128;
+        let s_kv_dim = s_num_kv_heads * s_head_dim;
+        let s_block_size = 16;
+        let s_kv_len = 1500usize; // ceil(1500/16) = 94 blocks; > 512 → 3 splits
+        let s_blocks_needed = s_kv_len.div_ceil(s_block_size);
+        let s_total_blocks = s_blocks_needed + 4;
+        let s_max_blocks = s_blocks_needed;
+        let s_block_tables: Vec<i32> = (0..s_max_blocks as i32).collect();
+        let s_kv_lens: Vec<i32> = vec![s_kv_len as i32];
+
+        let s_pool_n = s_total_blocks * s_block_size * s_kv_dim;
+        let mut s_seed = 0x5917A11Du64.wrapping_add(0xBEEF);
+        let s_k: Vec<f32> = (0..s_pool_n).map(|_| rng_lcg(&mut s_seed) * 0.2).collect();
+        let s_v: Vec<f32> = (0..s_pool_n).map(|_| rng_lcg(&mut s_seed) * 0.2).collect();
+        let s_q: Vec<f32> = (0..s_num_heads * s_head_dim)
+            .map(|_| rng_lcg(&mut s_seed) * 0.2)
+            .collect();
+
+        let s_k_pool = backend
+            .copy_from_host_f32(&s_k, &[s_total_blocks, s_block_size, s_kv_dim])
+            .unwrap();
+        let s_v_pool = backend
+            .copy_from_host_f32(&s_v, &[s_total_blocks, s_block_size, s_kv_dim])
+            .unwrap();
+        let s_q_t = backend
+            .copy_from_host_f32(&s_q, &[1, s_num_heads * s_head_dim])
+            .unwrap();
+        let s_scale = (s_head_dim as f32).powf(-0.5);
+
+        // Reference (F32): gather the seq's KV then batched_decode_attention.
+        let s_block_ids: Vec<usize> = (0..s_blocks_needed).collect();
+        let s_kc = backend
+            .paged_gather_kv(&s_k_pool, &s_block_ids, s_kv_len)
+            .unwrap();
+        let s_vc = backend
+            .paged_gather_kv(&s_v_pool, &s_block_ids, s_kv_len)
+            .unwrap();
+        let s_ref = backend
+            .batched_decode_attention(
+                &s_q_t,
+                &[s_kc],
+                &[s_vc],
+                s_num_heads,
+                s_num_kv_heads,
+                s_head_dim,
+                s_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        let s_ref_host = backend.copy_to_host_f32(&s_ref).unwrap();
+
+        // F16 split-KV path.
+        let s_k16 = backend.cast(&s_k_pool, DType::F16).unwrap();
+        let s_v16 = backend.cast(&s_v_pool, DType::F16).unwrap();
+        let s_q16 = backend.cast(&s_q_t, DType::F16).unwrap();
+        let s_out16 = backend
+            .paged_attention(
+                &s_q16,
+                &s_k16,
+                &s_v16,
+                &s_block_tables,
+                &s_kv_lens,
+                s_max_blocks,
+                s_num_heads,
+                s_num_kv_heads,
+                s_head_dim,
+                s_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        let s_out_f32 = backend.cast(&s_out16, DType::F32).unwrap();
+        let s_out_host = backend.copy_to_host_f32(&s_out_f32).unwrap();
+
+        let s_max_abs_val = s_ref_host.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let s_diff = s_out_host
+            .iter()
+            .zip(&s_ref_host)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let s_tol = 5e-3_f32.max(s_max_abs_val * 5e-3);
+        assert!(
+            s_diff < s_tol,
+            "split-KV (3 splits, head_dim=128) F16 vs F32 ref: max abs diff {s_diff} > tol {s_tol} (ref max abs {s_max_abs_val})\n  out[0..8] = {:?}\n  ref[0..8] = {:?}",
+            &s_out_host[..s_out_host.len().min(8)],
+            &s_ref_host[..s_ref_host.len().min(8)],
+        );
+    }
 }

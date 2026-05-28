@@ -59,7 +59,13 @@ struct KernelFunctions {
     batched_decode_attention_f16: CudaFunction,
     // Paged attention (decode)
     paged_attention_f32: CudaFunction,
+    /// Naive single-pass F16 paged attention. Superseded on the decode path by
+    /// the split-KV pair below (kept loaded as a numerical reference / fallback).
+    #[allow(dead_code)]
     paged_attention_f16: CudaFunction,
+    // Split-KV flash-decoding (fast F16 decode attention)
+    paged_attention_f16_split: CudaFunction,
+    paged_attention_f16_combine: CudaFunction,
 
     scatter_kv_f32: CudaFunction,
     scatter_kv_f16: CudaFunction,
@@ -124,6 +130,27 @@ pub struct CudaBackend {
     /// layer's attention, serializing prefill — eliminating it restores CPU/GPU
     /// overlap. Grows monotonically; never freed until the backend drops.
     flash_lse: Arc<Mutex<CudaSlice<f32>>>,
+    /// Persistent device scratch for the split-KV (flash-decoding) paged
+    /// attention partials. The main `paged_attention_f16_split` kernel writes
+    /// per-(seq,head,split) {out, running-max m, running-sum l} here, and the
+    /// `paged_attention_f16_combine` kernel reads them back. Pure write-then-read
+    /// scratch (never observed by the host), but because the attention runs on
+    /// the captured `compute_decode` path, the buffers must have STABLE device
+    /// pointers across replays — a grow bumps `version`, which feeds
+    /// `decode_capture_epoch` so the engine re-captures when the geometry
+    /// (num_seqs*num_heads*num_splits) outgrows the current allocation.
+    paged_split_partials: Arc<Mutex<SplitPartials>>,
+}
+
+/// Backend-owned scratch for split-KV paged attention. Three device buffers
+/// (out / m / l) grown together; `version` bumps on any reallocation so the
+/// CUDA-graph capture epoch can react to a pointer move. See
+/// `paged_split_partials`.
+struct SplitPartials {
+    out: CudaSlice<f32>, // [num_seqs * num_heads * num_splits * head_dim]
+    m: CudaSlice<f32>,   // [num_seqs * num_heads * num_splits]
+    l: CudaSlice<f32>,   // [num_seqs * num_heads * num_splits]
+    version: u64,
 }
 
 /// Monotonically-growing i32 device buffer. `version` increments on every
@@ -280,6 +307,8 @@ impl CudaBackend {
             // Paged attention (decode)
             paged_attention_f32: load_f32("paged_attention_f32")?,
             paged_attention_f16: load_f16("paged_attention_f16")?,
+            paged_attention_f16_split: load_f16("paged_attention_f16_split")?,
+            paged_attention_f16_combine: load_f16("paged_attention_f16_combine")?,
             scatter_kv_f32: load_f32("scatter_kv_f32")?,
             scatter_kv_f16: load_f16("scatter_kv_f16")?,
             argmax_f32: load_f32("argmax_f32")?,
@@ -314,6 +343,15 @@ impl CudaBackend {
         let flash_lse_buf = stream
             .alloc_zeros::<f32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc flash_lse: {e}")))?;
+        let split_out = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_out: {e}")))?;
+        let split_m = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_m: {e}")))?;
+        let split_l = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_l: {e}")))?;
 
         Ok(Self {
             ctx,
@@ -358,6 +396,12 @@ impl CudaBackend {
                 host: vec![0i32; initial_scratch_cap],
             })),
             flash_lse: Arc::new(Mutex::new(flash_lse_buf)),
+            paged_split_partials: Arc::new(Mutex::new(SplitPartials {
+                out: split_out,
+                m: split_m,
+                l: split_l,
+                version: 0,
+            })),
         })
     }
 
@@ -377,6 +421,48 @@ impl CudaBackend {
                 .map_err(|e| ForgeError::Cuda(format!("grow flash_lse: {e}")))?;
         }
         Ok(lse.device_ptr(&self.stream).0)
+    }
+
+    /// Grow the split-KV partial scratch (held in `paged_split_partials`) so the
+    /// three buffers hold at least `out_elems` / `ml_elems` f32 respectively.
+    /// `out_elems` = num_seqs*num_heads*num_splits*head_dim, `ml_elems` =
+    /// num_seqs*num_heads*num_splits. Grows geometrically and bumps `version`
+    /// (→ `decode_capture_epoch`) on any reallocation so a captured decode graph
+    /// that baked the old device pointers is invalidated and re-captured. The
+    /// caller holds the lock through the subsequent kernel launches that read the
+    /// buffers, keeping the pointers stable for the launch.
+    fn ensure_split_partials(
+        p: &mut SplitPartials,
+        stream: &Arc<CudaStream>,
+        out_elems: usize,
+        ml_elems: usize,
+    ) -> Result<()> {
+        let mut grew = false;
+        if p.out.len() < out_elems {
+            let new_cap = out_elems.max(p.out.len() * 3 / 2).max(16);
+            p.out = stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow paged_split_out: {e}")))?;
+            grew = true;
+        }
+        if p.m.len() < ml_elems {
+            let new_cap = ml_elems.max(p.m.len() * 3 / 2).max(16);
+            p.m = stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow paged_split_m: {e}")))?;
+            grew = true;
+        }
+        if p.l.len() < ml_elems {
+            let new_cap = ml_elems.max(p.l.len() * 3 / 2).max(16);
+            p.l = stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow paged_split_l: {e}")))?;
+            grew = true;
+        }
+        if grew {
+            p.version = p.version.wrapping_add(1);
+        }
+        Ok(())
     }
 
     /// Upload raw block-quantized bytes to the device and wrap them in a
@@ -466,6 +552,16 @@ impl CudaBackend {
     /// Version of the scatter slot_mapping scratch (bumps on grow).
     pub fn scatter_slot_mapping_version(&self) -> u64 {
         self.scatter_slot_mapping
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
+    }
+
+    /// Version of the split-KV paged-attention partial scratch (bumps on grow).
+    /// Folded into `decode_capture_epoch` so a partial-buffer reallocation
+    /// (pointer move on the captured decode path) triggers re-capture.
+    pub fn paged_split_partials_version(&self) -> u64 {
+        self.paged_split_partials
             .lock()
             .map(|g| g.version)
             .unwrap_or(0)
@@ -925,29 +1021,105 @@ impl CudaBackend {
                 Ok(())
             }
             DType::F16 => {
+                // Split-KV flash-decoding. Pick num_splits from the longest seq
+                // in the batch so the (num_seqs * num_heads * num_splits)-block
+                // grid saturates the device even at batch=1; short seqs get empty
+                // splits (the kernel emits identity partials for them). ~512 KV
+                // per split is the lightllm/vLLM sweet spot; clamp to [1, 16].
+                let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0).max(0) as usize;
+                let num_splits = if max_kv_len == 0 {
+                    1
+                } else {
+                    max_kv_len.div_ceil(512).clamp(1, 16)
+                };
+                let num_splits_i32 = num_splits as i32;
+
                 let q_slice = q.f16_slice()?;
                 let k_slice = k_pool.f16_slice()?;
                 let v_slice = v_pool.f16_slice()?;
-                let out_slice = out.f16_slice_mut()?;
-                let mut builder = self
-                    .stream
-                    .launch_builder(&self.kernels.paged_attention_f16);
-                builder.arg(out_slice);
-                builder.arg(q_slice);
-                builder.arg(k_slice);
-                builder.arg(v_slice);
-                builder.arg(block_tables_dev);
-                builder.arg(kv_lens_dev);
-                builder.arg(&scale);
-                builder.arg(&num_heads_i32);
-                builder.arg(&num_kv_heads_i32);
-                builder.arg(&head_dim_i32);
-                builder.arg(&block_size_i32);
-                builder.arg(&max_blocks_i32);
-                unsafe {
-                    builder
-                        .launch(launch_cfg)
-                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                // Persistent f32 partial scratch (stable pointers across captured
+                // replays; grow bumps version → decode_capture_epoch). Lock is
+                // held through both launches that read these buffers.
+                let out_elems = batch_size * num_heads * num_splits * head_dim;
+                let ml_elems = batch_size * num_heads * num_splits;
+                let mut partials = self
+                    .paged_split_partials
+                    .lock()
+                    .map_err(|_| ForgeError::Cuda("paged_split_partials mutex poisoned".into()))?;
+                Self::ensure_split_partials(&mut partials, &self.stream, out_elems, ml_elems)?;
+
+                // 1) Main split kernel: grid (num_seqs, num_heads, num_splits).
+                //    Block is head_dim rounded up to a multiple of 32 so warp
+                //    shuffles see full warps (thread d owns out[d]; padding
+                //    threads contribute 0 to the dot reduction). One output dim
+                //    per thread → no atomicAdd. Shared mem = (num_warps + 1) f32
+                //    for the per-token dot reduction.
+                let split_block_dim = (head_dim as u32).div_ceil(32) * 32;
+                let num_warps = split_block_dim / 32;
+                let split_cfg = LaunchConfig {
+                    grid_dim: (batch_size as u32, num_heads as u32, num_splits as u32),
+                    block_dim: (split_block_dim, 1, 1),
+                    shared_mem_bytes: (num_warps + 1) * 4,
+                };
+                {
+                    // Disjoint &mut borrows of the three partial buffers (the
+                    // builder needs &mut for each output arg).
+                    let SplitPartials {
+                        out: p_out,
+                        m: p_m,
+                        l: p_l,
+                        ..
+                    } = &mut *partials;
+                    let mut builder = self
+                        .stream
+                        .launch_builder(&self.kernels.paged_attention_f16_split);
+                    builder.arg(p_out);
+                    builder.arg(p_m);
+                    builder.arg(p_l);
+                    builder.arg(q_slice);
+                    builder.arg(k_slice);
+                    builder.arg(v_slice);
+                    builder.arg(block_tables_dev);
+                    builder.arg(kv_lens_dev);
+                    builder.arg(&scale);
+                    builder.arg(&num_heads_i32);
+                    builder.arg(&num_kv_heads_i32);
+                    builder.arg(&head_dim_i32);
+                    builder.arg(&block_size_i32);
+                    builder.arg(&max_blocks_i32);
+                    builder.arg(&num_splits_i32);
+                    unsafe {
+                        builder
+                            .launch(split_cfg)
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
+                }
+
+                // 2) Combine kernel: grid (num_seqs, num_heads), head_dim threads.
+                //    Merges the num_splits partials per (seq, head) into final out.
+                let combine_cfg = LaunchConfig {
+                    grid_dim: (batch_size as u32, num_heads as u32, 1),
+                    block_dim: (head_dim as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                {
+                    let out_slice = out.f16_slice_mut()?;
+                    let mut builder = self
+                        .stream
+                        .launch_builder(&self.kernels.paged_attention_f16_combine);
+                    builder.arg(out_slice);
+                    builder.arg(&partials.out);
+                    builder.arg(&partials.m);
+                    builder.arg(&partials.l);
+                    builder.arg(&num_heads_i32);
+                    builder.arg(&head_dim_i32);
+                    builder.arg(&num_splits_i32);
+                    unsafe {
+                        builder
+                            .launch(combine_cfg)
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
                 }
                 Ok(())
             }
@@ -3868,5 +4040,6 @@ impl Backend for CudaBackend {
             .wrapping_add(sin)
             .wrapping_add(self.embedding_scratch_version())
             .wrapping_add(self.scatter_slot_mapping_version())
+            .wrapping_add(self.paged_split_partials_version())
     }
 }
