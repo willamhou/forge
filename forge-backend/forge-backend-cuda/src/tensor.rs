@@ -6,6 +6,10 @@ pub(crate) enum TensorData {
     F32(CudaSlice<f32>),
     F16(CudaSlice<half::f16>),
     BF16(CudaSlice<half::bf16>),
+    /// Raw block-quantized bytes (e.g. Q8_0). Layout is dtype-defined; the
+    /// quantized GEMV kernels reinterpret these bytes per block. `len()`
+    /// reports the byte count, not the logical element count.
+    Quant(CudaSlice<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +45,17 @@ impl CudaTensor {
             data: TensorData::BF16(data),
             shape,
             dtype: DType::BF16,
+        }
+    }
+
+    /// Build a block-quantized tensor from raw device bytes. `shape` is the
+    /// logical (dequantized) element shape; `dtype` must be a quantized dtype
+    /// (`DType::is_quantized()`), which defines the byte layout of `bytes`.
+    pub(crate) fn quant_data(bytes: CudaSlice<u8>, shape: Vec<usize>, dtype: DType) -> Self {
+        Self {
+            data: TensorData::Quant(bytes),
+            shape,
+            dtype,
         }
     }
 
@@ -108,11 +123,24 @@ impl CudaTensor {
         }
     }
 
+    /// Raw quantized byte slice. Errors unless the tensor is block-quantized.
+    pub(crate) fn quant_slice(&self) -> Result<&CudaSlice<u8>> {
+        match &self.data {
+            TensorData::Quant(s) => Ok(s),
+            _ => Err(ForgeError::InvalidArgument(format!(
+                "expected quantized tensor, got {:?}",
+                self.dtype
+            ))),
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         match &self.data {
             TensorData::F32(s) => s.len(),
             TensorData::F16(s) => s.len(),
             TensorData::BF16(s) => s.len(),
+            // NOTE: byte count, not logical element count, for quantized data.
+            TensorData::Quant(s) => s.len(),
         }
     }
 }

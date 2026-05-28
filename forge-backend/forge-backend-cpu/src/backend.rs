@@ -142,6 +142,20 @@ impl Backend for CpuBackend {
         Ok(CpuTensor::new(c, vec![m, n]))
     }
 
+    /// Quantized matmul is CUDA-only for now. The CPU backend keeps weights as
+    /// f32 internally and has no Q8_0 storage/dequant path; Step 1 only
+    /// validates the CUDA kernel. A dequant fallback can be added later.
+    fn matmul_quant_into(
+        &self,
+        _out: &mut CpuTensor,
+        _a: &CpuTensor,
+        _w: &CpuTensor,
+    ) -> Result<()> {
+        Err(ForgeError::InvalidArgument(
+            "quantized matmul not supported on CPU backend".into(),
+        ))
+    }
+
     fn add(&self, a: &CpuTensor, b: &CpuTensor) -> Result<CpuTensor> {
         validate_same_shape(a, b)?;
         let data: Vec<f32> = a

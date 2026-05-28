@@ -202,6 +202,29 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Quantized matmul into a caller-provided output buffer:
+    /// `out = a · wᵀ`.
+    ///
+    /// - `a`: f16 activation, shape `[m, k]` (row-major)
+    /// - `w`: block-quantized weight, shape `[n, k]` (row-major; row `j` is the
+    ///   weight for output column `j`, stored as `k / block` quant blocks)
+    /// - `out`: f16, shape `[m, n]` (row-major)
+    ///
+    /// This is the memory-traffic-reduced decode GEMV: the weight is read in
+    /// its quantized form and dequantized on the fly. Backends that lack a
+    /// quantized kernel (CPU today) return [`crate::ForgeError::InvalidArgument`];
+    /// the default impl does the same so backends opt in explicitly.
+    fn matmul_quant_into(
+        &self,
+        _out: &mut Self::Tensor,
+        _a: &Self::Tensor,
+        _w: &Self::Tensor,
+    ) -> Result<()> {
+        Err(crate::ForgeError::InvalidArgument(
+            "matmul_quant_into not supported on this backend".into(),
+        ))
+    }
+
     /// Element-wise add, writing into a caller-provided output buffer.
     /// Out shape + dtype must match both inputs.
     /// See [`Self::matmul_into`] for the capture-stability contract.

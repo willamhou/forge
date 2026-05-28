@@ -70,6 +70,8 @@ struct KernelFunctions {
     sample_gumbel_f16: CudaFunction,
     sample_perrow_f32: CudaFunction,
     sample_perrow_f16: CudaFunction,
+    // Quantized GEMV (Q8_0 weight, f16 activation/output)
+    gemv_q8_0_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -197,7 +199,7 @@ impl CudaBackend {
 
         // Compile F16 kernels — requires cuda_fp16.h from CUDA toolkit
         let f16_src = format!(
-            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F16_SRC,
             forge_kernels::norm::F16_SRC,
             forge_kernels::positional::F16_SRC,
@@ -206,6 +208,7 @@ impl CudaBackend {
             forge_kernels::decode_attention::F16_SRC,
             forge_kernels::paged_attention::F16_SRC,
             forge_kernels::sampling::F16_SRC,
+            forge_kernels::quantized::F16_SRC,
         );
         let cuda_include = Self::find_cuda_include()?;
         let ptx_f16 = cudarc::nvrtc::compile_ptx_with_opts(
@@ -285,6 +288,7 @@ impl CudaBackend {
             sample_gumbel_f16: load_f16("sample_gumbel_f16")?,
             sample_perrow_f32: load_f32("sample_perrow_f32")?,
             sample_perrow_f16: load_f16("sample_perrow_f16")?,
+            gemv_q8_0_f16: load_f16("gemv_q8_0_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -373,6 +377,41 @@ impl CudaBackend {
                 .map_err(|e| ForgeError::Cuda(format!("grow flash_lse: {e}")))?;
         }
         Ok(lse.device_ptr(&self.stream).0)
+    }
+
+    /// Upload raw block-quantized bytes to the device and wrap them in a
+    /// `Quant` tensor. `shape` is the logical (dequantized) element shape and
+    /// `dtype` must be quantized (`DType::is_quantized()`); the byte count is
+    /// validated against `dtype.quant_block()`.
+    pub fn copy_from_host_quant(
+        &self,
+        bytes: &[u8],
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<CudaTensor> {
+        let (elems_per_block, bytes_per_block) = dtype.quant_block().ok_or_else(|| {
+            ForgeError::InvalidArgument(format!(
+                "copy_from_host_quant: {dtype:?} is not a quantized dtype"
+            ))
+        })?;
+        let numel: usize = shape.iter().product();
+        if !numel.is_multiple_of(elems_per_block) {
+            return Err(ForgeError::InvalidArgument(format!(
+                "copy_from_host_quant: numel {numel} not a multiple of block size {elems_per_block} for {dtype:?}"
+            )));
+        }
+        let expected_bytes = (numel / elems_per_block) * bytes_per_block;
+        if bytes.len() != expected_bytes {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![expected_bytes],
+                got: vec![bytes.len()],
+            });
+        }
+        let slice = self
+            .stream
+            .memcpy_stod(bytes)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        Ok(CudaTensor::quant_data(slice, shape.to_vec(), dtype))
     }
 
     /// Shared handle to the CUDA context. Used by callers that need to
@@ -1226,6 +1265,88 @@ impl Backend for CudaBackend {
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
+    }
+
+    /// Quantized matmul: `out = a · wᵀ` where `a` is f16 `[m, k]`, `w` is a
+    /// block-quantized weight `[n, k]` (row `j` stored as `k/32` Q8_0 blocks),
+    /// and `out` is f16 `[m, n]`. Runs the `gemv_q8_0_f16` kernel with one
+    /// thread per output element (correctness-first; see kernel comments).
+    fn matmul_quant_into(
+        &self,
+        out: &mut CudaTensor,
+        a: &CudaTensor,
+        w: &CudaTensor,
+    ) -> Result<()> {
+        let a_shape = a.shape();
+        let w_shape = w.shape();
+        if a_shape.len() != 2 || w_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "matmul_quant_into: a and w must be 2D".into(),
+            ));
+        }
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = w_shape[0];
+        if w_shape[1] != k {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![n, k],
+                got: w_shape.to_vec(),
+            });
+        }
+        if a.dtype() != DType::F16 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_quant_into: a must be F16, got {:?}",
+                a.dtype()
+            )));
+        }
+        match w.dtype() {
+            DType::Q8_0 => {}
+            other => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "matmul_quant_into: w must be Q8_0, got {other:?}"
+                )));
+            }
+        }
+        if !k.is_multiple_of(32) {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_quant_into: k={k} must be a multiple of 32 (Q8_0 block size)"
+            )));
+        }
+        let expected_out = vec![m, n];
+        if out.shape() != expected_out.as_slice() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: expected_out,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != DType::F16 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_quant_into: out must be F16, got {:?}",
+                out.dtype()
+            )));
+        }
+
+        let m_u = m as u32;
+        let n_u = n as u32;
+        let k_u = k as u32;
+        let total = (m * n) as u32;
+
+        let a_slice = a.f16_slice()?;
+        let w_slice = w.quant_slice()?;
+        let o_slice = out.f16_slice_mut()?;
+        let mut builder = self.stream.launch_builder(&self.kernels.gemv_q8_0_f16);
+        builder.arg(o_slice);
+        builder.arg(a_slice);
+        builder.arg(w_slice);
+        builder.arg(&m_u);
+        builder.arg(&n_u);
+        builder.arg(&k_u);
+        unsafe {
+            builder
+                .launch(LaunchConfig::for_num_elems(total))
+                .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn add(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
