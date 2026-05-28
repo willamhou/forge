@@ -18,13 +18,13 @@ use forge_core::{Backend, ModelConfig};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_kvcache::paged_cache::PagedKvCache;
 use forge_loader::{LlamaConfig, SafeTensorsLoader};
-use forge_transformer::load_model;
 use forge_runtime::constraints::fsm::TokenVocab;
 use forge_runtime::engine::Engine;
 use forge_scheduler::{ContinuousBatchingScheduler, SchedulerConfig};
 use forge_server::api::openai::{self, AppState};
 use forge_server::chat_template::ChatTemplate;
 use forge_server::tokenizer::ForgeTokenizer;
+use forge_transformer::load_model;
 
 #[derive(Parser)]
 #[command(name = "forge-server", about = "Forge LLM Inference Server")]

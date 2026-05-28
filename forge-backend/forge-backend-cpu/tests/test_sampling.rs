@@ -33,7 +33,10 @@ fn gumbel_deterministic_and_low_temp_is_argmax() {
     // Low temperature collapses to argmax.
     let greedy = backend.argmax(&logits).unwrap();
     for step in 0..16u32 {
-        assert_eq!(backend.sample_gumbel(&logits, 0.01, 1, step).unwrap(), greedy);
+        assert_eq!(
+            backend.sample_gumbel(&logits, 0.01, 1, step).unwrap(),
+            greedy
+        );
     }
 }
 
@@ -84,7 +87,10 @@ fn sample_min_p_filters_low_prob_tokens() {
             break;
         }
     }
-    assert!(seen_other, "without min_p, low-prob tokens should sometimes win");
+    assert!(
+        seen_other,
+        "without min_p, low-prob tokens should sometimes win"
+    );
 }
 
 #[test]
@@ -115,7 +121,11 @@ fn sample_top_p_restricts_to_nucleus() {
         let s = backend
             .sample(&logits, &[1.0], &[0.0], &[0], &[0.9], &[3], &[step])
             .unwrap();
-        assert_eq!(s, vec![0], "top_p=0.9 must keep only the peak (step {step})");
+        assert_eq!(
+            s,
+            vec![0],
+            "top_p=0.9 must keep only the peak (step {step})"
+        );
     }
 }
 

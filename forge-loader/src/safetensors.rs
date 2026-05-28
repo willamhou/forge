@@ -15,11 +15,7 @@ impl SafeTensorsLoader {
     pub fn new(model_dir: &Path) -> Result<Self> {
         let mut files: Vec<_> = std::fs::read_dir(model_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "safetensors")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
             .map(|e| e.path())
             .collect();
         files.sort();
@@ -42,8 +38,8 @@ impl SafeTensorsLoader {
         // Build tensor name -> file index mapping
         let mut tensor_index = HashMap::new();
         for (idx, mmap) in mmaps.iter().enumerate() {
-            let tensors = SafeTensors::deserialize(mmap)
-                .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
+            let tensors =
+                SafeTensors::deserialize(mmap).map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
             for name in tensors.names() {
                 tensor_index.insert(name.to_string(), idx);
             }
@@ -57,9 +53,10 @@ impl SafeTensorsLoader {
 
     /// Load a specific tensor by name.
     pub fn load_tensor<B: Backend>(&self, name: &str, backend: &B) -> Result<B::Tensor> {
-        let idx = self.tensor_index.get(name).ok_or_else(|| {
-            ForgeError::ModelLoad(format!("Tensor '{}' not found", name))
-        })?;
+        let idx = self
+            .tensor_index
+            .get(name)
+            .ok_or_else(|| ForgeError::ModelLoad(format!("Tensor '{}' not found", name)))?;
         let tensors = SafeTensors::deserialize(&self.mmaps[*idx])
             .map_err(|e| ForgeError::ModelLoad(e.to_string()))?;
         let view = tensors

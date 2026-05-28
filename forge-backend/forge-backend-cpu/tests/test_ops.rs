@@ -29,12 +29,8 @@ fn test_matmul_shape_mismatch() {
 #[test]
 fn test_add() {
     let backend = CpuBackend::new();
-    let a = backend
-        .copy_from_host_f32(&[1.0, 2.0, 3.0], &[3])
-        .unwrap();
-    let b = backend
-        .copy_from_host_f32(&[4.0, 5.0, 6.0], &[3])
-        .unwrap();
+    let a = backend.copy_from_host_f32(&[1.0, 2.0, 3.0], &[3]).unwrap();
+    let b = backend.copy_from_host_f32(&[4.0, 5.0, 6.0], &[3]).unwrap();
     let c = backend.add(&a, &b).unwrap();
     assert_eq!(backend.copy_to_host_f32(&c).unwrap(), vec![5.0, 7.0, 9.0]);
 }
@@ -42,12 +38,8 @@ fn test_add() {
 #[test]
 fn test_mul() {
     let backend = CpuBackend::new();
-    let a = backend
-        .copy_from_host_f32(&[2.0, 3.0, 4.0], &[3])
-        .unwrap();
-    let b = backend
-        .copy_from_host_f32(&[5.0, 6.0, 7.0], &[3])
-        .unwrap();
+    let a = backend.copy_from_host_f32(&[2.0, 3.0, 4.0], &[3]).unwrap();
+    let b = backend.copy_from_host_f32(&[5.0, 6.0, 7.0], &[3]).unwrap();
     let c = backend.mul(&a, &b).unwrap();
     assert_eq!(
         backend.copy_to_host_f32(&c).unwrap(),
@@ -58,9 +50,7 @@ fn test_mul() {
 #[test]
 fn test_mul_scalar() {
     let backend = CpuBackend::new();
-    let a = backend
-        .copy_from_host_f32(&[1.0, 2.0, 3.0], &[3])
-        .unwrap();
+    let a = backend.copy_from_host_f32(&[1.0, 2.0, 3.0], &[3]).unwrap();
     let c = backend.mul_scalar(&a, 2.5).unwrap();
     assert_eq!(backend.copy_to_host_f32(&c).unwrap(), vec![2.5, 5.0, 7.5]);
 }
@@ -68,9 +58,7 @@ fn test_mul_scalar() {
 #[test]
 fn test_silu() {
     let backend = CpuBackend::new();
-    let x = backend
-        .copy_from_host_f32(&[0.0, 1.0, -1.0], &[3])
-        .unwrap();
+    let x = backend.copy_from_host_f32(&[0.0, 1.0, -1.0], &[3]).unwrap();
     let out = backend.silu(&x).unwrap();
     let result = backend.copy_to_host_f32(&out).unwrap();
     assert!((result[0] - 0.0).abs() < 1e-4);
@@ -91,10 +79,7 @@ fn test_embedding() {
         .unwrap();
     let out = backend.embedding(&weight, &[2, 0, 3]).unwrap();
     let result = backend.copy_to_host_f32(&out).unwrap();
-    assert_eq!(
-        result,
-        vec![7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0]
-    );
+    assert_eq!(result, vec![7.0, 8.0, 9.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0]);
 }
 
 #[test]
@@ -162,10 +147,7 @@ fn test_rms_norm() {
 fn test_rms_norm_multi_row() {
     let backend = CpuBackend::new();
     let x = backend
-        .copy_from_host_f32(
-            &[1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0],
-            &[2, 4],
-        )
+        .copy_from_host_f32(&[1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0], &[2, 4])
         .unwrap();
     let w = backend
         .copy_from_host_f32(&[1.0, 1.0, 1.0, 1.0], &[4])
@@ -213,12 +195,8 @@ fn test_rope() {
     let x = backend
         .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 1, 4])
         .unwrap();
-    let cos = backend
-        .copy_from_host_f32(&[1.0, 1.0], &[1, 2])
-        .unwrap();
-    let sin = backend
-        .copy_from_host_f32(&[0.0, 0.0], &[1, 2])
-        .unwrap();
+    let cos = backend.copy_from_host_f32(&[1.0, 1.0], &[1, 2]).unwrap();
+    let sin = backend.copy_from_host_f32(&[0.0, 0.0], &[1, 2]).unwrap();
     let out = backend.rope(&x, &cos, &sin).unwrap();
     let result = backend.copy_to_host_f32(&out).unwrap();
     for (i, (&got, &exp)) in result.iter().zip([1.0, 2.0, 3.0, 4.0].iter()).enumerate() {
@@ -317,14 +295,10 @@ fn test_fused_residual_rms_norm() {
     let res = backend
         .copy_from_host_f32(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3])
         .unwrap();
-    let w = backend
-        .copy_from_host_f32(&[1.0, 1.0, 1.0], &[3])
-        .unwrap();
+    let w = backend.copy_from_host_f32(&[1.0, 1.0, 1.0], &[3]).unwrap();
     let ref_sum = backend.add(&x, &res).unwrap();
     let ref_norm = backend.rms_norm(&ref_sum, &w, 1e-5).unwrap();
-    let (fused_norm, fused_res) = backend
-        .fused_residual_rms_norm(&x, &res, &w, 1e-5)
-        .unwrap();
+    let (fused_norm, fused_res) = backend.fused_residual_rms_norm(&x, &res, &w, 1e-5).unwrap();
     for (a, b) in ref_norm.data().iter().zip(fused_norm.data().iter()) {
         assert!((a - b).abs() < 1e-5, "norm mismatch: {} vs {}", a, b);
     }
@@ -424,5 +398,8 @@ fn test_multi_head_attention_causal_mask() {
     let c = backend.copy_to_host_f32(&causal).unwrap();
     let nc = backend.copy_to_host_f32(&non_causal).unwrap();
 
-    assert_ne!(c, nc, "causal and non-causal should produce different results");
+    assert_ne!(
+        c, nc,
+        "causal and non-causal should produce different results"
+    );
 }

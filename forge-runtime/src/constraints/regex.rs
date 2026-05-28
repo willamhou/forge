@@ -2,15 +2,15 @@
 
 use std::collections::HashSet;
 
-use regex_automata::dfa::dense;
+use regex_automata::Anchored;
 use regex_automata::dfa::Automaton;
+use regex_automata::dfa::dense;
 use regex_automata::util::primitives::StateID;
 use regex_automata::util::start;
-use regex_automata::Anchored;
 
 use forge_core::{ForgeError, Result};
 
-use super::fsm::{CharDfa, TokenVocab, build_token_index, TokenFsmIndex};
+use super::fsm::{CharDfa, TokenFsmIndex, TokenVocab, build_token_index};
 
 /// Maximum allowed regex pattern length to prevent abuse.
 const MAX_PATTERN_LEN: usize = 8192;
@@ -48,9 +48,7 @@ impl RegexDfa {
                     .dfa_size_limit(Some(MAX_DFA_SIZE)),
             )
             .build(pattern)
-            .map_err(|e| {
-                ForgeError::Internal(format!("regex DFA compilation error: {e}"))
-            })?;
+            .map_err(|e| ForgeError::Internal(format!("regex DFA compilation error: {e}")))?;
 
         // Get start state with anchored config (matches start of input)
         let start_config = start::Config::new().anchored(Anchored::Yes);

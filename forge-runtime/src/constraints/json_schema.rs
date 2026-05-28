@@ -44,9 +44,9 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         };
     }
 
-    let obj = schema.as_object().ok_or_else(|| {
-        ForgeError::InvalidArgument("schema must be an object or boolean".into())
-    })?;
+    let obj = schema
+        .as_object()
+        .ok_or_else(|| ForgeError::InvalidArgument("schema must be an object or boolean".into()))?;
 
     // Handle enum — filter values by all active constraints (type, minLength, etc.).
     if let Some(enum_values) = obj.get("enum") {
@@ -101,7 +101,10 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
         for t in type_arr {
             if let Some(t_str) = t.as_str() {
                 let mut sub = obj.clone();
-                sub.insert("type".to_string(), serde_json::Value::String(t_str.to_string()));
+                sub.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(t_str.to_string()),
+                );
                 alternatives.push(schema_node_to_regex(&serde_json::Value::Object(sub))?);
             } else {
                 return Err(ForgeError::InvalidArgument(format!(
@@ -137,20 +140,14 @@ fn schema_node_to_regex(schema: &serde_json::Value) -> Result<String> {
 }
 
 /// Convert a string schema to regex, respecting minLength, maxLength, pattern.
-fn string_schema_to_regex(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String> {
-    let min_len = obj
-        .get("minLength")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+fn string_schema_to_regex(obj: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
+    let min_len = obj.get("minLength").and_then(|v| v.as_u64()).unwrap_or(0);
     let max_len = obj.get("maxLength").and_then(|v| v.as_u64());
 
     if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
         // Validate the inner pattern compiles independently to prevent injection
-        regex_automata::dfa::dense::DFA::new(pattern).map_err(|e| {
-            ForgeError::InvalidArgument(format!("invalid string pattern: {e}"))
-        })?;
+        regex_automata::dfa::dense::DFA::new(pattern)
+            .map_err(|e| ForgeError::InvalidArgument(format!("invalid string pattern: {e}")))?;
         // JSON Schema `pattern` must fully match the string content.
         // When minLength/maxLength are also present, DFA-based regex engines
         // cannot intersect pattern matching with length counting (no
@@ -187,31 +184,20 @@ fn string_schema_to_regex(
 /// Numeric bounds (minimum, maximum, exclusiveMinimum, exclusiveMaximum) cannot
 /// be faithfully expressed as DFA-compatible regex patterns. Rather than silently
 /// ignoring these constraints, we reject schemas that use them.
-fn integer_schema_to_regex(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String> {
+fn integer_schema_to_regex(obj: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
     reject_numeric_bounds(obj)?;
     Ok(INTEGER.to_string())
 }
 
 /// Convert a number schema to regex, rejecting unsupported bound constraints.
-fn number_schema_to_regex(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String> {
+fn number_schema_to_regex(obj: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
     reject_numeric_bounds(obj)?;
     Ok(NUMBER.to_string())
 }
 
 /// Reject schemas that use numeric bound keywords we cannot enforce in regex.
-fn reject_numeric_bounds(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<()> {
-    const BOUND_KEYS: &[&str] = &[
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-    ];
+fn reject_numeric_bounds(obj: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    const BOUND_KEYS: &[&str] = &["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"];
     for &key in BOUND_KEYS {
         if obj.contains_key(key) {
             return Err(ForgeError::InvalidArgument(format!(
@@ -224,19 +210,14 @@ fn reject_numeric_bounds(
 }
 
 /// Convert an array schema to regex.
-fn array_schema_to_regex(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String> {
+fn array_schema_to_regex(obj: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
     let item_regex = if let Some(items) = obj.get("items") {
         schema_node_to_regex(items)?
     } else {
         any_json_value()
     };
 
-    let min_items = obj
-        .get("minItems")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let min_items = obj.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let max_items = obj.get("maxItems").and_then(|v| v.as_u64());
 
     if min_items == 0 && max_items.is_none() {
@@ -256,9 +237,7 @@ fn array_schema_to_regex(
             } else {
                 String::new()
             };
-            Ok(format!(
-                r"\[{WS}({item_regex}{additional})?{WS}\]"
-            ))
+            Ok(format!(r"\[{WS}({item_regex}{additional})?{WS}\]"))
         } else {
             // min..=max items
             let required_extra = if min_items > 1 {
@@ -301,9 +280,7 @@ const MAX_PERMUTATION_PROPERTIES: usize = 6;
 /// For small property counts (<= 6) we enumerate all valid permutations.
 /// For larger schemas we fall back to fixed property order to avoid
 /// factorial blowup in regex size.
-fn object_schema_to_regex(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String> {
+fn object_schema_to_regex(obj: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
     let properties = obj.get("properties").and_then(|v| v.as_object());
     let required: std::collections::HashSet<&str> = obj
         .get("required")
@@ -319,9 +296,7 @@ fn object_schema_to_regex(
             for (key, value_schema) in props.iter() {
                 let value_regex = schema_node_to_regex(value_schema)?;
                 let escaped_key = regex_escape(key);
-                let prop_pattern = format!(
-                    r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#
-                );
+                let prop_pattern = format!(r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#);
                 prop_patterns.push(prop_pattern);
                 is_required.push(required.contains(key.as_str()));
             }
@@ -332,9 +307,7 @@ fn object_schema_to_regex(
                 if !props.contains_key(*key) {
                     let escaped_key = regex_escape(key);
                     let value_regex = any_json_value();
-                    let prop_pattern = format!(
-                        r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#
-                    );
+                    let prop_pattern = format!(r#"{WS}"{escaped_key}"{WS}:{WS}{value_regex}"#);
                     prop_patterns.push(prop_pattern);
                     is_required.push(true);
                 }
@@ -519,9 +492,9 @@ fn permutations(items: &[usize], result: &mut Vec<Vec<usize>>) {
 
 /// Convert an enum to regex (alternation of literal values).
 fn enum_to_regex(values: &serde_json::Value) -> Result<String> {
-    let arr = values.as_array().ok_or_else(|| {
-        ForgeError::InvalidArgument("enum must be an array".into())
-    })?;
+    let arr = values
+        .as_array()
+        .ok_or_else(|| ForgeError::InvalidArgument("enum must be an array".into()))?;
 
     if arr.is_empty() {
         return Err(ForgeError::InvalidArgument(
@@ -529,10 +502,7 @@ fn enum_to_regex(values: &serde_json::Value) -> Result<String> {
         ));
     }
 
-    let alternatives: Vec<String> = arr
-        .iter()
-        .map(|v| json_value_to_regex_literal(v))
-        .collect();
+    let alternatives: Vec<String> = arr.iter().map(|v| json_value_to_regex_literal(v)).collect();
 
     Ok(format!("({})", alternatives.join("|")))
 }
@@ -545,9 +515,9 @@ fn constrained_enum_to_regex(
     values: &serde_json::Value,
     schema: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
-    let arr = values.as_array().ok_or_else(|| {
-        ForgeError::InvalidArgument("enum must be an array".into())
-    })?;
+    let arr = values
+        .as_array()
+        .ok_or_else(|| ForgeError::InvalidArgument("enum must be an array".into()))?;
 
     let filtered: Vec<String> = arr
         .iter()
@@ -706,14 +676,11 @@ fn json_value_matches_type(value: &serde_json::Value, type_constraint: &serde_js
 
 /// Convert anyOf/oneOf to regex (alternation).
 fn any_of_to_regex(schemas: &serde_json::Value) -> Result<String> {
-    let arr = schemas.as_array().ok_or_else(|| {
-        ForgeError::InvalidArgument("anyOf/oneOf must be an array".into())
-    })?;
+    let arr = schemas
+        .as_array()
+        .ok_or_else(|| ForgeError::InvalidArgument("anyOf/oneOf must be an array".into()))?;
 
-    let alternatives: Result<Vec<String>> = arr
-        .iter()
-        .map(schema_node_to_regex)
-        .collect();
+    let alternatives: Result<Vec<String>> = arr.iter().map(schema_node_to_regex).collect();
 
     Ok(format!("({})", alternatives?.join("|")))
 }
@@ -839,10 +806,9 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
                 }
                 // Lower-bound constraints: take the maximum (most restrictive).
                 "minLength" | "minimum" | "exclusiveMinimum" | "minItems" | "minProperties" => {
-                    if let (Some(existing), Some(new_val)) = (
-                        merged.get(key).and_then(|v| v.as_f64()),
-                        value.as_f64(),
-                    ) {
+                    if let (Some(existing), Some(new_val)) =
+                        (merged.get(key).and_then(|v| v.as_f64()), value.as_f64())
+                    {
                         if new_val > existing {
                             merged.insert(key.clone(), value.clone());
                         }
@@ -852,10 +818,9 @@ fn all_of_to_regex(schemas: &[serde_json::Value]) -> Result<String> {
                 }
                 // Upper-bound constraints: take the minimum (most restrictive).
                 "maxLength" | "maximum" | "exclusiveMaximum" | "maxItems" | "maxProperties" => {
-                    if let (Some(existing), Some(new_val)) = (
-                        merged.get(key).and_then(|v| v.as_f64()),
-                        value.as_f64(),
-                    ) {
+                    if let (Some(existing), Some(new_val)) =
+                        (merged.get(key).and_then(|v| v.as_f64()), value.as_f64())
+                    {
                         if new_val < existing {
                             merged.insert(key.clone(), value.clone());
                         }
@@ -910,10 +875,7 @@ fn json_value_to_regex_literal(value: &serde_json::Value) -> String {
         }
         serde_json::Value::Array(arr) => {
             let elements: Vec<String> = arr.iter().map(json_value_to_regex_literal).collect();
-            format!(
-                r"\[{WS}{}{WS}\]",
-                elements.join(&format!("{WS},{WS}"))
-            )
+            format!(r"\[{WS}{}{WS}\]", elements.join(&format!("{WS},{WS}")))
         }
         serde_json::Value::Object(obj) => {
             let entries: Vec<String> = obj
@@ -928,10 +890,7 @@ fn json_value_to_regex_literal(value: &serde_json::Value) -> String {
                     )
                 })
                 .collect();
-            format!(
-                r"\{{{WS}{}{WS}\}}",
-                entries.join(&format!("{WS},{WS}"))
-            )
+            format!(r"\{{{WS}{}{WS}\}}", entries.join(&format!("{WS},{WS}")))
         }
     }
 }
@@ -944,10 +903,7 @@ fn json_value_to_regex_literal(value: &serde_json::Value) -> String {
 /// large DFA; for unconstrained schemas this is a reasonable trade-off.
 fn any_json_value() -> String {
     // Leaf values: strings, numbers, booleans, null
-    let leaf = format!(
-        r#""{}"|{}|{}|{}"#,
-        STRING_INNER, NUMBER, BOOLEAN, NULL
-    );
+    let leaf = format!(r#""{}"|{}|{}|{}"#, STRING_INNER, NUMBER, BOOLEAN, NULL);
     // Level-0: leaf only (used as elements inside level-1 containers)
     let atom = format!("({leaf})");
     // Level-1: leaf or one-level array/object
@@ -963,8 +919,7 @@ fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^'
-            | '$' => {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
                 escaped.push('\\');
                 escaped.push(c);
             }
@@ -1051,8 +1006,8 @@ mod tests {
         }"#;
         let regex = schema_to_regex(schema).unwrap();
         let dfa = regex_automata::dfa::dense::DFA::new(&regex).unwrap();
-        use regex_automata::dfa::Automaton;
         use regex_automata::Anchored;
+        use regex_automata::dfa::Automaton;
         use regex_automata::util::start;
 
         let matches = |input: &str| -> bool {
@@ -1070,8 +1025,14 @@ mod tests {
 
         assert!(matches(r#"{}"#), "should match empty object");
         assert!(matches(r#"{"a":1}"#), "should match single optional");
-        assert!(matches(r#"{"a":1,"b":2}"#), "should match both optionals with comma");
-        assert!(!matches(r#"{"a":1"b":2}"#), "should reject missing comma between optionals");
+        assert!(
+            matches(r#"{"a":1,"b":2}"#),
+            "should match both optionals with comma"
+        );
+        assert!(
+            !matches(r#"{"a":1"b":2}"#),
+            "should reject missing comma between optionals"
+        );
     }
 
     #[test]
@@ -1089,8 +1050,8 @@ mod tests {
         }"#;
         let regex = schema_to_regex(schema).unwrap();
         let dfa = regex_automata::dfa::dense::DFA::new(&regex).unwrap();
-        use regex_automata::dfa::Automaton;
         use regex_automata::Anchored;
+        use regex_automata::dfa::Automaton;
         use regex_automata::util::start;
 
         // Helper to check if a string matches the regex

@@ -7,9 +7,9 @@ use forge_backend_cpu::CpuBackend;
 use forge_core::{Backend, DType, KvCache, Model, ModelConfig, ModelInput, SeqMetadata};
 use forge_kvcache::naive::NaiveKvCache;
 use forge_kvcache::paged_cache::PagedKvCache;
+use forge_transformer::TransformerModel;
 use forge_transformer::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
 use forge_transformer::rope::RopeFreqs;
-use forge_transformer::TransformerModel;
 
 fn tiny_config() -> ModelConfig {
     ModelConfig {

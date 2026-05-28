@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
-use axum::Router;
 use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 use tower::ServiceExt;
@@ -118,11 +118,7 @@ async fn models_endpoint_returns_list() {
     let app = create_test_app(tx);
 
     let resp = app
-        .oneshot(
-            Request::get("/v1/models")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
         .await
         .unwrap();
 
@@ -222,10 +218,7 @@ async fn streaming_completion() {
             }
         }
     }
-    assert!(
-        !content.is_empty(),
-        "streamed content should not be empty"
-    );
+    assert!(!content.is_empty(), "streamed content should not be empty");
 }
 
 #[tokio::test]

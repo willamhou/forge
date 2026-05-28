@@ -9,7 +9,9 @@ use forge_backend_cuda::CudaBackend;
 use forge_core::{Backend, DType, Tensor};
 
 fn rng_lcg(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let bits = (*seed >> 33) as u32;
     // Map to roughly (-1, 1)
     (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
@@ -89,8 +91,16 @@ fn paged_attention_cuda_matches_default_impl() {
             .map(|&id| id as usize)
             .collect();
         let kv_len = kv_lens[b] as usize;
-        k_caches.push(backend.paged_gather_kv(&k_pool, &block_ids, kv_len).unwrap());
-        v_caches.push(backend.paged_gather_kv(&v_pool, &block_ids, kv_len).unwrap());
+        k_caches.push(
+            backend
+                .paged_gather_kv(&k_pool, &block_ids, kv_len)
+                .unwrap(),
+        );
+        v_caches.push(
+            backend
+                .paged_gather_kv(&v_pool, &block_ids, kv_len)
+                .unwrap(),
+        );
     }
     let out_ref = backend
         .batched_decode_attention(
@@ -127,10 +137,7 @@ fn paged_attention_cuda_matches_default_impl() {
     // ── Single-batch sanity check ─────────────────────────────────
     // batch_size = 1 should reuse the kernel with grid_dim.x = 1.
     let q1 = backend
-        .copy_from_host_f32(
-            &q_data[..num_heads * head_dim],
-            &[1, num_heads * head_dim],
-        )
+        .copy_from_host_f32(&q_data[..num_heads * head_dim], &[1, num_heads * head_dim])
         .unwrap();
     let out1 = backend
         .paged_attention(
@@ -193,9 +200,7 @@ fn paged_attention_cuda_matches_default_impl() {
         .expect_err("num_kv_heads == 0 should be rejected, not panic");
 
     // ── Rejection: shape mismatch on q ────────────────────────────
-    let q_wrong = backend
-        .copy_from_host_f32(&q_data[..16], &[1, 16])
-        .unwrap();
+    let q_wrong = backend.copy_from_host_f32(&q_data[..16], &[1, 16]).unwrap();
     let _ = backend
         .paged_attention(
             &q_wrong,

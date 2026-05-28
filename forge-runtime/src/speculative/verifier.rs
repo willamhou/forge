@@ -31,10 +31,7 @@ pub fn verify_greedy(
     vocab_size: usize,
 ) -> VerificationResult {
     let num_positions = logits.len() / vocab_size;
-    debug_assert!(
-        num_positions >= 1,
-        "need at least 1 position in logits"
-    );
+    debug_assert!(num_positions >= 1, "need at least 1 position in logits");
 
     let mut accepted = 0;
 
@@ -67,8 +64,7 @@ pub fn verify_greedy(
         draft_tokens.len()
     );
     let bonus_pos = draft_tokens.len().min(num_positions - 1);
-    let bonus_logits =
-        &logits[bonus_pos * vocab_size..(bonus_pos + 1) * vocab_size];
+    let bonus_logits = &logits[bonus_pos * vocab_size..(bonus_pos + 1) * vocab_size];
     let correction_token = argmax_f32(bonus_logits);
 
     VerificationResult {

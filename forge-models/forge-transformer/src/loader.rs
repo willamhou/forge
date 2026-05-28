@@ -68,10 +68,26 @@ fn load_decoder_layer<B: Backend>(
     backend: &B,
 ) -> Result<LlamaDecoderLayer<B>> {
     // Attention weights (transposed at load)
-    let wq = load_linear(loader, &format!("{prefix}.self_attn.q_proj.weight"), backend)?;
-    let wk = load_linear(loader, &format!("{prefix}.self_attn.k_proj.weight"), backend)?;
-    let wv = load_linear(loader, &format!("{prefix}.self_attn.v_proj.weight"), backend)?;
-    let wo = load_linear(loader, &format!("{prefix}.self_attn.o_proj.weight"), backend)?;
+    let wq = load_linear(
+        loader,
+        &format!("{prefix}.self_attn.q_proj.weight"),
+        backend,
+    )?;
+    let wk = load_linear(
+        loader,
+        &format!("{prefix}.self_attn.k_proj.weight"),
+        backend,
+    )?;
+    let wv = load_linear(
+        loader,
+        &format!("{prefix}.self_attn.v_proj.weight"),
+        backend,
+    )?;
+    let wo = load_linear(
+        loader,
+        &format!("{prefix}.self_attn.o_proj.weight"),
+        backend,
+    )?;
 
     // Concatenate wq/wk/wv into a single wqkv tensor at load time.
     // load_linear produces [hidden, proj_size]. We need to cat along the proj dimension (dim=1),
@@ -126,8 +142,10 @@ fn load_decoder_layer<B: Backend>(
         loader.load_tensor(&format!("{prefix}.input_layernorm.weight"), backend)?;
     let input_ln = RMSNorm::new(input_ln_weight, config.rms_norm_eps);
 
-    let post_attn_ln_weight =
-        loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"), backend)?;
+    let post_attn_ln_weight = loader.load_tensor(
+        &format!("{prefix}.post_attention_layernorm.weight"),
+        backend,
+    )?;
     let post_attn_ln = RMSNorm::new(post_attn_ln_weight, config.rms_norm_eps);
 
     Ok(LlamaDecoderLayer::new(input_ln, attn, post_attn_ln, mlp))

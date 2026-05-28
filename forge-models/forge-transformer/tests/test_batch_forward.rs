@@ -3,9 +3,9 @@
 use forge_backend_cpu::CpuBackend;
 use forge_core::{Backend, DType, KvCache, Model, ModelConfig, ModelInput, SeqMetadata};
 use forge_kvcache::naive::NaiveKvCache;
+use forge_transformer::TransformerModel;
 use forge_transformer::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
 use forge_transformer::rope::RopeFreqs;
-use forge_transformer::TransformerModel;
 
 fn tiny_config() -> ModelConfig {
     ModelConfig {
@@ -42,9 +42,7 @@ fn build_tiny_model(backend: &CpuBackend) -> TransformerModel<CpuBackend> {
     let lm_head = make_weight(h, vocab);
 
     let norm = RMSNorm::new(
-        backend
-            .copy_from_host_f32(&vec![1.0; h], &[h])
-            .unwrap(),
+        backend.copy_from_host_f32(&vec![1.0; h], &[h]).unwrap(),
         config.rms_norm_eps,
     );
 
@@ -72,22 +70,26 @@ fn build_tiny_model(backend: &CpuBackend) -> TransformerModel<CpuBackend> {
     );
 
     let layer_norm = RMSNorm::new(
-        backend
-            .copy_from_host_f32(&vec![1.0; h], &[h])
-            .unwrap(),
+        backend.copy_from_host_f32(&vec![1.0; h], &[h]).unwrap(),
         config.rms_norm_eps,
     );
     let post_norm = RMSNorm::new(
-        backend
-            .copy_from_host_f32(&vec![1.0; h], &[h])
-            .unwrap(),
+        backend.copy_from_host_f32(&vec![1.0; h], &[h]).unwrap(),
         config.rms_norm_eps,
     );
 
     let layer = LlamaDecoderLayer::new(layer_norm, attn, post_norm, mlp);
     let rope = RopeFreqs::precompute(&config, 64, backend).unwrap();
 
-    TransformerModel::new(config, embed_tokens, vec![layer], norm, lm_head, rope, backend.clone())
+    TransformerModel::new(
+        config,
+        embed_tokens,
+        vec![layer],
+        norm,
+        lm_head,
+        rope,
+        backend.clone(),
+    )
 }
 
 /// Run prefill for a sequence to populate KV cache.

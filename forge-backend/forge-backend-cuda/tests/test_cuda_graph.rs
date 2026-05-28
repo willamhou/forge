@@ -8,7 +8,9 @@ use forge_backend_cuda::{CudaBackend, CudaGraphCache};
 use forge_core::{Backend, DType, Tensor};
 
 fn rng_lcg(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let bits = (*seed >> 33) as u32;
     (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
@@ -136,9 +138,7 @@ fn cuda_graph_cache_captures_and_replays_paged_attention() {
             .copy_from_host_f32(&zeros, graph_out.shape())
             .unwrap();
         backend.synchronize().unwrap();
-        let _ = backend
-            .copy_to_host_f32(&zero_t)
-            .unwrap();
+        let _ = backend.copy_to_host_f32(&zero_t).unwrap();
         // (We can't memcpy into graph_out without exposing the internal
         // slice; the replay writes over whatever was there. That's the
         // point we want to assert below.)
@@ -151,7 +151,10 @@ fn cuda_graph_cache_captures_and_replays_paged_attention() {
             .zip(prev_host.as_ref().unwrap())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
-        assert_eq!(diff, 0.0, "replay #{i} differs from previous (max diff {diff})");
+        assert_eq!(
+            diff, 0.0,
+            "replay #{i} differs from previous (max diff {diff})"
+        );
         prev_host = Some(host);
     }
 
@@ -228,10 +231,7 @@ fn cuda_graph_cache_captures_and_replays_paged_attention() {
         })
         .unwrap();
     let q_one = backend
-        .copy_from_host_f32(
-            &q_data[..num_heads * head_dim],
-            &[1, num_heads * head_dim],
-        )
+        .copy_from_host_f32(&q_data[..num_heads * head_dim], &[1, num_heads * head_dim])
         .unwrap();
     let kv_one: Vec<i32> = vec![10];
     let bt_one: Vec<i32> = vec![0, 1, 2];

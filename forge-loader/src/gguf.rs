@@ -66,9 +66,7 @@ impl GgmlType {
             12 => Ok(GgmlType::Q4K),
             13 => Ok(GgmlType::Q5K),
             14 => Ok(GgmlType::Q6K),
-            _ => Err(ForgeError::ModelLoad(format!(
-                "Unknown GGML type: {v}"
-            ))),
+            _ => Err(ForgeError::ModelLoad(format!("Unknown GGML type: {v}"))),
         }
     }
 
@@ -88,17 +86,17 @@ impl GgmlType {
         match self {
             GgmlType::F32 => 4,
             GgmlType::F16 => 2,
-            GgmlType::Q4_0 => 18,    // 2 (scale) + 16 (4-bit × 32 / 8)
-            GgmlType::Q4_1 => 20,    // 2 (scale) + 2 (min) + 16
-            GgmlType::Q5_0 => 22,    // 2 + 4 (high bits) + 16
-            GgmlType::Q5_1 => 24,    // 2 + 2 + 4 + 16
-            GgmlType::Q8_0 => 34,    // 2 (f16 scale) + 32 (i8 × 32)
-            GgmlType::Q8_1 => 40,    // 4 (f32 scale) + 4 (f32 min) + 32
+            GgmlType::Q4_0 => 18, // 2 (scale) + 16 (4-bit × 32 / 8)
+            GgmlType::Q4_1 => 20, // 2 (scale) + 2 (min) + 16
+            GgmlType::Q5_0 => 22, // 2 + 4 (high bits) + 16
+            GgmlType::Q5_1 => 24, // 2 + 2 + 4 + 16
+            GgmlType::Q8_0 => 34, // 2 (f16 scale) + 32 (i8 × 32)
+            GgmlType::Q8_1 => 40, // 4 (f32 scale) + 4 (f32 min) + 32
             GgmlType::Q2K => 256 / 16 * 2 + 256 / 4 + 2 + 2, // simplified
-            GgmlType::Q3K => 256 / 8 * 3 + 256 / 4 + 2,      // simplified
-            GgmlType::Q4K => 144,    // 2+2+12+128 (Q4_K block for 256 elements)
-            GgmlType::Q5K => 176,    // similar
-            GgmlType::Q6K => 210,    // similar
+            GgmlType::Q3K => 256 / 8 * 3 + 256 / 4 + 2, // simplified
+            GgmlType::Q4K => 144, // 2+2+12+128 (Q4_K block for 256 elements)
+            GgmlType::Q5K => 176, // similar
+            GgmlType::Q6K => 210, // similar
         }
     }
 }
@@ -548,7 +546,12 @@ mod tests {
         let tensor_data = vec![0u8; 24];
         let data = build_test_gguf(
             &[],
-            &[("model.embed_tokens.weight", &[2, 3], GgmlType::F32, &tensor_data)],
+            &[(
+                "model.embed_tokens.weight",
+                &[2, 3],
+                GgmlType::F32,
+                &tensor_data,
+            )],
         );
 
         let tmp = tempfile::NamedTempFile::new().unwrap();

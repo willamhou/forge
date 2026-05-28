@@ -123,9 +123,7 @@ fn test_cat_dim0() {
     let a = backend
         .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
         .unwrap();
-    let b = backend
-        .copy_from_host_f32(&[5.0, 6.0], &[1, 2])
-        .unwrap();
+    let b = backend.copy_from_host_f32(&[5.0, 6.0], &[1, 2]).unwrap();
     let c = backend.cat(&[&a, &b], 0).unwrap();
     assert_eq!(c.shape(), &[3, 2]);
     let result = backend.copy_to_host_f32(&c).unwrap();
@@ -154,12 +152,8 @@ fn test_rope() {
         .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 1, 4])
         .unwrap();
     // cos = [1.0, 0.0], sin = [0.0, 1.0]
-    let cos_freqs = backend
-        .copy_from_host_f32(&[1.0, 0.0], &[1, 2])
-        .unwrap();
-    let sin_freqs = backend
-        .copy_from_host_f32(&[0.0, 1.0], &[1, 2])
-        .unwrap();
+    let cos_freqs = backend.copy_from_host_f32(&[1.0, 0.0], &[1, 2]).unwrap();
+    let sin_freqs = backend.copy_from_host_f32(&[0.0, 1.0], &[1, 2]).unwrap();
     let out = backend.rope(&x, &cos_freqs, &sin_freqs).unwrap();
     let result = backend.copy_to_host_f32(&out).unwrap();
     // out[0] = x0[0]*cos[0] - x1[0]*sin[0] = 1*1 - 3*0 = 1.0
@@ -180,7 +174,11 @@ fn test_rope() {
 fn test_copy_shape_validation() {
     let backend = CudaBackend::new(0).unwrap();
     // 4 elements but shape says 6
-    assert!(backend.copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 3]).is_err());
+    assert!(
+        backend
+            .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 3])
+            .is_err()
+    );
 }
 
 #[test]
