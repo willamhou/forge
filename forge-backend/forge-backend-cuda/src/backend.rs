@@ -1269,8 +1269,9 @@ impl Backend for CudaBackend {
 
     /// Quantized matmul: `out = a · wᵀ` where `a` is f16 `[m, k]`, `w` is a
     /// block-quantized weight `[n, k]` (row `j` stored as `k/32` Q8_0 blocks),
-    /// and `out` is f16 `[m, n]`. Runs the `gemv_q8_0_f16` kernel with one
-    /// thread per output element (correctness-first; see kernel comments).
+    /// and `out` is f16 `[m, n]`. Runs the `gemv_q8_0_f16` warp-per-output-row
+    /// kernel: one warp (32 lanes) computes one output element, splitting the k
+    /// dimension across lanes for coalesced weight reads (see kernel comments).
     fn matmul_quant_into(
         &self,
         out: &mut CudaTensor,
@@ -1329,7 +1330,18 @@ impl Backend for CudaBackend {
         let m_u = m as u32;
         let n_u = n as u32;
         let k_u = k as u32;
-        let total = (m * n) as u32;
+
+        // Warp-per-output-row: one warp (32 lanes) computes one of the m*n
+        // outputs. Each CUDA block holds WARPS_PER_BLOCK warps, so it covers
+        // WARPS_PER_BLOCK outputs; grid.x = ceil(m*n / WARPS_PER_BLOCK).
+        let warps_per_block = forge_kernels::quantized::GEMV_Q8_0_WARPS_PER_BLOCK;
+        let total_warps = (m * n) as u32;
+        let grid_x = total_warps.div_ceil(warps_per_block);
+        let launch_cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         let a_slice = a.f16_slice()?;
         let w_slice = w.quant_slice()?;
@@ -1343,7 +1355,7 @@ impl Backend for CudaBackend {
         builder.arg(&k_u);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(total))
+                .launch(launch_cfg)
                 .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         }
         Ok(())

@@ -12,6 +12,11 @@
 
 pub const F32_SRC: &str = "";
 
+// Number of warps per CUDA block in the warp-per-row GEMV. The launch side
+// (matmul_quant_into) must size grid.x = ceil(m * n / WARPS_PER_BLOCK) and
+// blockDim.x = WARPS_PER_BLOCK * 32 to match this kernel.
+pub const GEMV_Q8_0_WARPS_PER_BLOCK: u32 = 8;
+
 pub const F16_SRC: &str = r#"
 // Read the f16 scale (delta) from a 34-byte Q8_0 block. The scale is stored
 // little-endian in the first 2 bytes; reconstruct via __half bit pattern.
@@ -20,14 +25,21 @@ __device__ __forceinline__ float q8_0_block_scale(const unsigned char* block) {
     return __half2float(__ushort_as_half(bits));
 }
 
-// Simple correctness-first kernel: one thread per output element (i, j).
-// Each thread walks the k dimension in 32-element blocks, fetching the block
-// scale once and accumulating x[i,l] * (scale * q) in f32.
+// Warp-per-output-row Q8_0 GEMV. One warp (32 lanes) computes one output
+// element out[i, j] = sum_l x[i, l] * dequant(W[j, l]); the warp index over
+// the grid selects the (i, j) pair (row-major: warp w -> i = w / n, j = w % n).
 //
-//   out[i*n + j] = sum_l x[i*k + l] * dequant(W[j, l])
+// The 32 lanes split the k dimension by 32-element blocks: lane `l` handles
+// the weight blocks l, l+32, l+64, ... of row j. Because consecutive lanes
+// touch consecutive 34-byte blocks, the per-step weight reads across the warp
+// are contiguous in memory (coalesced) — the key win over the old
+// one-thread-per-output kernel, which had each thread stride a full row.
 //
 // wq is the quantized [n, k] weight: row j starts at byte offset
 // j * (k/32) * 34, and within the row each block covers 32 contiguous l's.
+//
+// m is typically 1 (single-sequence decode) and small in batch decode, so the
+// (i, j) warp mapping keeps every warp busy regardless of m.
 extern "C" __global__ void gemv_q8_0_f16(
     __half* out,
     const __half* x,
@@ -36,19 +48,22 @@ extern "C" __global__ void gemv_q8_0_f16(
     unsigned int n,
     unsigned int k
 ) {
-    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = m * n;
-    if (tid >= total) return;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const unsigned int total = m * n;
+    if (warp_id >= total) return;
 
-    unsigned int i = tid / n;  // activation row
-    unsigned int j = tid % n;  // weight row (output column)
+    const unsigned int i = warp_id / n;  // activation row
+    const unsigned int j = warp_id % n;  // weight row (output column)
 
     const unsigned int blocks_per_row = k / 32u;
     const unsigned char* row = wq + (size_t)j * blocks_per_row * 34u;
     const __half* xrow = x + (size_t)i * k;
 
+    // Each lane accumulates the blocks it owns. Consecutive lanes (and thus the
+    // warp's load instruction) read consecutive blocks -> coalesced weight reads.
     float acc = 0.0f;
-    for (unsigned int b = 0; b < blocks_per_row; ++b) {
+    for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
         const unsigned char* block = row + (size_t)b * 34u;
         float scale = q8_0_block_scale(block);
         const signed char* quants = (const signed char*)(block + 2);
@@ -60,6 +75,14 @@ extern "C" __global__ void gemv_q8_0_f16(
         }
     }
 
-    out[(size_t)i * n + j] = __float2half(acc);
+    // Warp-reduce the 32 partial sums; lane 0 holds the full dot product.
+    #pragma unroll
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (lane == 0u) {
+        out[(size_t)i * n + j] = __float2half(acc);
+    }
 }
 "#;
