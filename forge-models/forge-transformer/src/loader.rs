@@ -1,8 +1,9 @@
-use forge_core::{Backend, ModelConfig, Result};
+use forge_core::{Backend, DType, ModelConfig, Result, Tensor};
 use forge_loader::SafeTensorsLoader;
 
 use crate::layers::{LlamaAttention, LlamaDecoderLayer, LlamaMLP, RMSNorm};
 use crate::model::TransformerModel;
+use crate::quantized_linear::QuantizedLinear;
 use crate::rope::RopeFreqs;
 
 /// Load a Llama model from SafeTensors files.
@@ -10,17 +11,25 @@ use crate::rope::RopeFreqs;
 /// HuggingFace stores linear weights as `[out_features, in_features]`.
 /// Our `matmul(x, W)` needs `[in_features, out_features]`, so all linear
 /// weights are transposed at load time.
+///
+/// When `quantize` is true, every large linear (QKV / O / gate / up / down /
+/// lm_head) gains an additional Q8_0 copy in its *original* `[out, in]`
+/// orientation, used by the decode GEMV (`matmul_quant_into`). The FP16 copy
+/// (`[in, out]`) is unchanged, so prefill is bit-for-bit identical. With
+/// `quantize` false, no quantization happens and behavior is byte-identical to
+/// before this path existed.
 pub fn load_transformer<B: Backend + Clone>(
     loader: &SafeTensorsLoader,
     config: ModelConfig,
     backend: &B,
+    quantize: bool,
 ) -> Result<TransformerModel<B>> {
     let embed_tokens = loader.load_tensor("model.embed_tokens.weight", backend)?;
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("model.layers.{i}");
-        let layer = load_decoder_layer(loader, &prefix, &config, backend)?;
+        let layer = load_decoder_layer(loader, &prefix, &config, backend, quantize)?;
         layers.push(layer);
     }
 
@@ -36,7 +45,8 @@ pub fn load_transformer<B: Backend + Clone>(
     } else {
         loader.load_tensor("model.embed_tokens.weight", backend)?
     };
-    let lm_head = backend.transpose(&lm_head_raw, 0, 1)?;
+    let lm_head_f16 = backend.transpose(&lm_head_raw, 0, 1)?; // [hidden, vocab]
+    let lm_head = make_quantized_linear(lm_head_f16, backend, quantize)?;
 
     let rope_freqs = RopeFreqs::precompute(&config, config.max_position_embeddings, backend)?;
 
@@ -51,14 +61,54 @@ pub fn load_transformer<B: Backend + Clone>(
     ))
 }
 
-/// Load and transpose a linear weight: [out, in] -> [in, out].
+/// Build a [`QuantizedLinear`] from an FP16 `[in, out]` weight (the transposed
+/// prefill layout). When `quantize` is true, also derives the Q8_0 decode copy
+/// in `[out, in]` orientation by transposing back, downloading to host f16, and
+/// quantizing. When false, returns an FP16-only linear (no quantization).
+///
+/// The Q8_0 GEMV blocks the `in` (k) dimension into groups of 32; if `in` is
+/// not a multiple of 32 the block layout would straddle output rows, so we skip
+/// quantization for that weight and fall back to FP16 decode (a safety net —
+/// all Llama/Qwen dims are multiples of 32 in practice).
+fn make_quantized_linear<B: Backend>(
+    w_f16: B::Tensor,
+    backend: &B,
+    quantize: bool,
+) -> Result<QuantizedLinear<B>> {
+    if !quantize {
+        return Ok(QuantizedLinear::new_f16(w_f16));
+    }
+    let shape = w_f16.shape();
+    debug_assert_eq!(shape.len(), 2, "linear weight must be 2D");
+    let in_dim = shape[0];
+    let out_dim = shape[1];
+
+    if !in_dim.is_multiple_of(32) {
+        // `in` (the Q8_0 block dim) is not block-aligned — keep FP16 only.
+        return Ok(QuantizedLinear::new_f16(w_f16));
+    }
+
+    // [in, out] -> [out, in] (the original GGUF/HF orientation the GEMV wants).
+    let w_oi = backend.transpose(&w_f16, 0, 1)?;
+    // Download row-major [out, in] to host and convert f32 -> f16.
+    let host_f32 = backend.copy_to_host_f32(&w_oi)?;
+    let host_f16: Vec<half::f16> = host_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+    let bytes = backend.quantize_q8_0_host(&host_f16)?;
+    let w_quant = backend.copy_from_host_quant(&bytes, &[out_dim, in_dim], DType::Q8_0)?;
+    Ok(QuantizedLinear::new(w_f16, Some(w_quant)))
+}
+
+/// Load + transpose a linear weight ([out, in] -> [in, out]) and wrap it in a
+/// [`QuantizedLinear`] (with an optional Q8_0 decode copy when `quantize`).
 fn load_linear<B: Backend>(
     loader: &SafeTensorsLoader,
     name: &str,
     backend: &B,
-) -> Result<B::Tensor> {
+    quantize: bool,
+) -> Result<QuantizedLinear<B>> {
     let raw = loader.load_tensor(name, backend)?;
-    backend.transpose(&raw, 0, 1)
+    let w_f16 = backend.transpose(&raw, 0, 1)?;
+    make_quantized_linear(w_f16, backend, quantize)
 }
 
 fn load_decoder_layer<B: Backend>(
@@ -66,37 +116,42 @@ fn load_decoder_layer<B: Backend>(
     prefix: &str,
     config: &ModelConfig,
     backend: &B,
+    quantize: bool,
 ) -> Result<LlamaDecoderLayer<B>> {
-    // Attention weights (transposed at load)
-    let wq = load_linear(
-        loader,
-        &format!("{prefix}.self_attn.q_proj.weight"),
-        backend,
+    // Attention weights (transposed at load). q/k/v are loaded as FP16
+    // [hidden, proj] then cat'd into wqkv; wo is a standalone QuantizedLinear.
+    let wq = backend.transpose(
+        &loader.load_tensor(&format!("{prefix}.self_attn.q_proj.weight"), backend)?,
+        0,
+        1,
     )?;
-    let wk = load_linear(
-        loader,
-        &format!("{prefix}.self_attn.k_proj.weight"),
-        backend,
+    let wk = backend.transpose(
+        &loader.load_tensor(&format!("{prefix}.self_attn.k_proj.weight"), backend)?,
+        0,
+        1,
     )?;
-    let wv = load_linear(
-        loader,
-        &format!("{prefix}.self_attn.v_proj.weight"),
-        backend,
+    let wv = backend.transpose(
+        &loader.load_tensor(&format!("{prefix}.self_attn.v_proj.weight"), backend)?,
+        0,
+        1,
     )?;
     let wo = load_linear(
         loader,
         &format!("{prefix}.self_attn.o_proj.weight"),
         backend,
+        quantize,
     )?;
 
     // Concatenate wq/wk/wv into a single wqkv tensor at load time.
-    // load_linear produces [hidden, proj_size]. We need to cat along the proj dimension (dim=1),
-    // but cat only supports dim=0, so: transpose → cat along dim=0 → transpose back.
+    // The transposes above produce [hidden, proj_size]. We need to cat along the
+    // proj dimension (dim=1), but cat only supports dim=0, so: transpose → cat
+    // along dim=0 → transpose back.
     let wq_t = backend.transpose(&wq, 0, 1)?; // [q_proj, hidden]
     let wk_t = backend.transpose(&wk, 0, 1)?; // [kv_proj, hidden]
     let wv_t = backend.transpose(&wv, 0, 1)?; // [kv_proj, hidden]
     let cat_t = backend.cat(&[&wq_t, &wk_t, &wv_t], 0)?; // [q+2*kv, hidden]
-    let wqkv = backend.transpose(&cat_t, 0, 1)?; // [hidden, q+2*kv]
+    let wqkv_f16 = backend.transpose(&cat_t, 0, 1)?; // [hidden, q+2*kv]
+    let wqkv = make_quantized_linear(wqkv_f16, backend, quantize)?;
 
     // Optional QKV bias (Qwen2-family). If q_proj.bias is present, all three
     // (q/k/v) are; concatenate into a single [q+2*kv] bias vector matching the
@@ -132,9 +187,24 @@ fn load_decoder_layer<B: Backend>(
         LlamaAttention::new_with_bias(wqkv, qkv_bias, wo, config).with_qk_norm(q_norm, k_norm);
 
     // MLP weights (transposed at load)
-    let gate_proj = load_linear(loader, &format!("{prefix}.mlp.gate_proj.weight"), backend)?;
-    let up_proj = load_linear(loader, &format!("{prefix}.mlp.up_proj.weight"), backend)?;
-    let down_proj = load_linear(loader, &format!("{prefix}.mlp.down_proj.weight"), backend)?;
+    let gate_proj = load_linear(
+        loader,
+        &format!("{prefix}.mlp.gate_proj.weight"),
+        backend,
+        quantize,
+    )?;
+    let up_proj = load_linear(
+        loader,
+        &format!("{prefix}.mlp.up_proj.weight"),
+        backend,
+        quantize,
+    )?;
+    let down_proj = load_linear(
+        loader,
+        &format!("{prefix}.mlp.down_proj.weight"),
+        backend,
+        quantize,
+    )?;
     let mlp = LlamaMLP::new(gate_proj, up_proj, down_proj);
 
     // LayerNorm weights (1D, no transpose needed)

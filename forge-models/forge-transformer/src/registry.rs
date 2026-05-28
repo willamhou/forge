@@ -27,17 +27,22 @@ pub const SUPPORTED_ARCHITECTURES: &[&str] = &[
 /// Build a model for the given HF architecture string (`config.architectures`).
 /// `arch = None` (architecture absent from config.json) is treated as a
 /// Llama-family model. Unknown architectures are rejected.
+///
+/// `quantize` enables the Q8_0 quantized-decode path (an extra Q8_0 weight copy
+/// for decode GEMV; prefill stays FP16). With it false the load is byte-for-byte
+/// identical to the unquantized path.
 pub fn load_model<B: Backend + Clone>(
     arch: Option<&str>,
     loader: &SafeTensorsLoader,
     config: ModelConfig,
     backend: &B,
+    quantize: bool,
 ) -> Result<TransformerModel<B>> {
     match arch {
         None
         | Some(
             "LlamaForCausalLM" | "Qwen2ForCausalLM" | "Qwen3ForCausalLM" | "MistralForCausalLM",
-        ) => load_transformer(loader, config, backend),
+        ) => load_transformer(loader, config, backend, quantize),
         Some(other) => Err(ForgeError::InvalidArgument(format!(
             "unsupported model architecture {other:?}; supported: {SUPPORTED_ARCHITECTURES:?}"
         ))),

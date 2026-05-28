@@ -86,6 +86,33 @@ pub trait Backend: Send + Sync + 'static {
     fn copy_from_host_bf16(&self, data: &[half::bf16], shape: &[usize]) -> Result<Self::Tensor>;
     fn copy_to_host_f32(&self, tensor: &Self::Tensor) -> Result<Vec<f32>>;
 
+    /// Host-side quantize an f16 weight buffer into GGUF-compatible Q8_0 blocks
+    /// (32 elements / 34 bytes per block). Used by the quantized-decode weight
+    /// loader. Backends without a quantized-decode path (CPU today) return
+    /// [`crate::ForgeError::InvalidArgument`]; the default impl does the same so
+    /// backends opt in explicitly. Only ever called when quantized decode is
+    /// enabled — with it off, no backend method below is touched.
+    fn quantize_q8_0_host(&self, _data: &[half::f16]) -> Result<Vec<u8>> {
+        Err(crate::ForgeError::InvalidArgument(
+            "quantize_q8_0_host not supported on this backend".into(),
+        ))
+    }
+
+    /// Upload raw block-quantized bytes to the device and wrap them in a
+    /// quantized tensor. `shape` is the logical (dequantized) element shape and
+    /// `dtype` must be quantized ([`DType::is_quantized`]). Pairs with
+    /// [`Self::quantize_q8_0_host`]; same opt-in contract.
+    fn copy_from_host_quant(
+        &self,
+        _bytes: &[u8],
+        _shape: &[usize],
+        _dtype: DType,
+    ) -> Result<Self::Tensor> {
+        Err(crate::ForgeError::InvalidArgument(
+            "copy_from_host_quant not supported on this backend".into(),
+        ))
+    }
+
     // Synchronization
     fn synchronize(&self) -> Result<()>;
 

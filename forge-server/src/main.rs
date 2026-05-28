@@ -73,6 +73,13 @@ struct Cli {
     /// Comma-separated batch-size buckets to capture decode graphs for.
     #[arg(long, default_value = "1,2,4,8,16,32")]
     cuda_graph_buckets: String,
+
+    /// Quantize linear weights to Q8_0 for the decode path (CUDA only). Decode
+    /// GEMVs read the quantized weight (~1.5x faster, near-lossless); prefill
+    /// still uses the FP16 weight. Off by default — when off, behavior is
+    /// identical to the unquantized path. Adds a few seconds to model load.
+    #[arg(long, default_value = "false")]
+    quantize_decode: bool,
 }
 
 /// Parse a comma-separated list of positive batch-size buckets.
@@ -153,7 +160,13 @@ async fn run_server<B: Backend + Clone>(
     // --- Load model weights (registry dispatches by architecture) ---
     info!("Loading model from {}...", cli.model_path.display());
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
-    let model = load_model(arch.as_deref(), &loader, model_config.clone(), &backend)?;
+    let model = load_model(
+        arch.as_deref(),
+        &loader,
+        model_config.clone(),
+        &backend,
+        cli.quantize_decode,
+    )?;
     info!("Model loaded successfully");
 
     // --- Load tokenizer ---

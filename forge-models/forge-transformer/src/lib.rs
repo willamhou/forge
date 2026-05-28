@@ -9,6 +9,7 @@ pub mod layers;
 pub mod loader;
 pub mod model;
 pub mod persistent_buffers;
+pub mod quantized_linear;
 pub mod registry;
 pub mod rope;
 

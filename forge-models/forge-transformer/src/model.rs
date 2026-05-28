@@ -5,6 +5,7 @@ use forge_core::{
 
 use crate::layers::{LlamaDecoderLayer, RMSNorm};
 use crate::persistent_buffers::{LlamaDecodeState, LlamaPersistentBuffers, StagedDecodeMeta};
+use crate::quantized_linear::QuantizedLinear;
 use crate::rope::RopeFreqs;
 
 pub struct TransformerModel<B: Backend> {
@@ -12,7 +13,7 @@ pub struct TransformerModel<B: Backend> {
     embed_tokens: B::Tensor,
     layers: Vec<LlamaDecoderLayer<B>>,
     norm: RMSNorm<B>,
-    lm_head: B::Tensor,
+    lm_head: QuantizedLinear<B>,
     rope_freqs: RopeFreqs<B>,
     backend: B,
 }
@@ -23,7 +24,7 @@ impl<B: Backend> TransformerModel<B> {
         embed_tokens: B::Tensor,
         layers: Vec<LlamaDecoderLayer<B>>,
         norm: RMSNorm<B>,
-        lm_head: B::Tensor,
+        lm_head: QuantizedLinear<B>,
         rope_freqs: RopeFreqs<B>,
         backend: B,
     ) -> Self {
@@ -83,7 +84,7 @@ impl<B: Backend + Clone> TransformerModel<B> {
         }
 
         hidden = self.norm.forward(&hidden, &self.backend)?;
-        let logits = self.backend.matmul(&hidden, &self.lm_head)?;
+        let logits = self.lm_head.matmul_prefill(&hidden, &self.backend)?;
 
         Ok(ModelOutput { logits })
     }
@@ -116,7 +117,7 @@ impl<B: Backend + Clone> TransformerModel<B> {
         }
 
         hidden = self.norm.forward(&hidden, &self.backend)?;
-        let logits = self.backend.matmul(&hidden, &self.lm_head)?;
+        let logits = self.lm_head.matmul_prefill(&hidden, &self.backend)?;
 
         Ok(ModelOutput { logits })
     }
@@ -291,10 +292,10 @@ impl<B: Backend + Clone> TransformerModel<B> {
         )?;
         self.backend
             .cast_into(&mut buffers.final_normed_cast, &buffers.final_normed)?;
-        self.backend.matmul_into(
+        self.lm_head.matmul_decode_into(
             &mut buffers.logits,
             &buffers.final_normed_cast,
-            &self.lm_head,
+            &self.backend,
         )?;
         Ok(())
     }

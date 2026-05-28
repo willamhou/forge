@@ -1107,6 +1107,20 @@ impl Backend for CudaBackend {
         Ok(CudaTensor::bf16_data(slice, shape.to_vec()))
     }
 
+    fn quantize_q8_0_host(&self, data: &[half::f16]) -> Result<Vec<u8>> {
+        Ok(crate::quant::quantize_q8_0(data))
+    }
+
+    fn copy_from_host_quant(
+        &self,
+        bytes: &[u8],
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<CudaTensor> {
+        // Delegate to the inherent method (disambiguated by Self::).
+        CudaBackend::copy_from_host_quant(self, bytes, shape, dtype)
+    }
+
     fn copy_to_host_f32(&self, tensor: &CudaTensor) -> Result<Vec<f32>> {
         match tensor.dtype() {
             DType::F32 => self
