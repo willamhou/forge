@@ -15,6 +15,13 @@ pub const F32_SRC: &str = "";
 // Number of warps per CUDA block in the warp-per-row GEMV. The launch side
 // (matmul_quant_into) must size grid.x = ceil(m * n / WARPS_PER_BLOCK) and
 // blockDim.x = WARPS_PER_BLOCK * 32 to match this kernel.
+//
+// This kernel is the single-stream (m=1) decode GEMV: it reads the weight once
+// and is memory-bound, beating cuBLAS f16 at m=1. It does NOT batch — at m>1
+// each output row re-reads the full weight (cost scales m×), so the model
+// dispatches batch decode (m>1) to the f16 GEMM instead. A quantized kernel
+// that beats cuBLAS f16 at batch needs int8 tensor cores (W8A8), not a
+// scalar-MAC GEMV; that is deliberately out of scope here.
 pub const GEMV_Q8_0_WARPS_PER_BLOCK: u32 = 8;
 
 pub const F16_SRC: &str = r#"
@@ -38,8 +45,11 @@ __device__ __forceinline__ float q8_0_block_scale(const unsigned char* block) {
 // wq is the quantized [n, k] weight: row j starts at byte offset
 // j * (k/32) * 34, and within the row each block covers 32 contiguous l's.
 //
-// m is typically 1 (single-sequence decode) and small in batch decode, so the
-// (i, j) warp mapping keeps every warp busy regardless of m.
+// This is the m=1 single-sequence decode GEMV: it reads each weight row once
+// and is memory-bound, beating cuBLAS f16 at m=1. It does NOT amortize the
+// weight across a batch — at m>1, weight row j is re-read once per activation
+// row i (cost scales m×). So the model dispatches batch decode (m>1) to the
+// f16 GEMM (see QuantizedLinear::matmul_decode_into); this kernel is for m=1.
 extern "C" __global__ void gemv_q8_0_f16(
     __half* out,
     const __half* x,

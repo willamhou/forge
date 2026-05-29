@@ -167,6 +167,9 @@ fn gemv_q8_0_matches_dequant_matmul() {
     let backend = CudaBackend::new(0).expect("CUDA backend");
 
     // m=1 (the real decode case) and m=4, with a small and a large weight.
+    // The GEMV is general over m (warp-per-output-row); the model only calls
+    // it at m=1 (batch decode dispatches to the f16 GEMM), but m=4 guards the
+    // backend op's correctness for any m.
     run_case(&backend, 1, 256, 512, 0x1111);
     run_case(&backend, 4, 256, 512, 0x2222);
     // Larger, closer to a real Qwen3 projection.

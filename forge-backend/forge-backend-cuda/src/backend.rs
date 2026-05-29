@@ -1458,6 +1458,8 @@ impl Backend for CudaBackend {
     /// and `out` is f16 `[m, n]`. Runs the `gemv_q8_0_f16` warp-per-output-row
     /// kernel: one warp (32 lanes) computes one output element, splitting the k
     /// dimension across lanes for coalesced weight reads (see kernel comments).
+    /// This is the m=1 single-stream GEMV; batch decode (m>1) is dispatched to
+    /// the f16 GEMM in `QuantizedLinear::matmul_decode_into`.
     fn matmul_quant_into(
         &self,
         out: &mut CudaTensor,
@@ -1521,7 +1523,7 @@ impl Backend for CudaBackend {
         // outputs. Each CUDA block holds WARPS_PER_BLOCK warps, so it covers
         // WARPS_PER_BLOCK outputs; grid.x = ceil(m*n / WARPS_PER_BLOCK).
         let warps_per_block = forge_kernels::quantized::GEMV_Q8_0_WARPS_PER_BLOCK;
-        let total_warps = (m * n) as u32;
+        let total_warps = m_u * n_u;
         let grid_x = total_warps.div_ceil(warps_per_block);
         let launch_cfg = LaunchConfig {
             grid_dim: (grid_x, 1, 1),

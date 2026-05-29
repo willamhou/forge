@@ -51,21 +51,38 @@ impl<B: Backend> QuantizedLinear<B> {
 
     /// Decode projection into a caller-provided buffer.
     ///
-    /// - With a quantized copy: `matmul_quant_into(out[m, out], x[m, in],
-    ///   w_quant[out, in])`. This is the launch-only, static-weight decode GEMV
-    ///   — capture-safe (the quant weight is uploaded once at load and never
-    ///   moves or grows).
-    /// - Without one (flag off): falls back to the FP16 `matmul_into(out, x,
-    ///   w_f16)`, bit-for-bit identical to the pre-quantization decode path.
+    /// Dispatch by batch size `m` (= `x.shape()[0]`, the number of sequences
+    /// decoding this step):
+    ///
+    /// - **`m == 1` with a quantized copy** → `matmul_quant_into(out, x,
+    ///   w_quant[out, in])`. The Q8_0 GEMV reads the weight once and is
+    ///   memory-bound, beating cuBLAS f16 at single-stream decode (the quant
+    ///   payoff). Launch-only and capture-safe (the quant weight is uploaded
+    ///   once at load and never moves or grows).
+    /// - **`m > 1`** → the f16 `matmul_into(out, x, w_f16)`. The GEMV does NOT
+    ///   amortize the weight across a batch (each row re-reads it, cost scales
+    ///   `m×`), so batch decode is dramatically faster on cuBLAS's f16 GEMM,
+    ///   which reuses the weight across the batch via tensor cores. Measured on
+    ///   GB10/Qwen3-4B: at C=8 the Q8 GEMV degrades to ~173ms TPOT vs the f16
+    ///   GEMM's ~67ms. A quantized kernel that wins at batch needs int8 tensor
+    ///   cores (W8A8), not this scalar-MAC GEMV.
+    /// - **No quantized copy (flag off)** → f16 `matmul_into`, bit-for-bit
+    ///   identical to the pre-quantization decode path.
+    ///
+    /// Note: with quant on, a sequence decoded alone (`m==1`, Q8 weights) vs
+    /// batched (`m>1`, f16 weights) sees slightly different numerics — both
+    /// valid for a precision-for-speed option, but greedy output can depend on
+    /// batch composition.
     pub fn matmul_decode_into(
         &self,
         out: &mut B::Tensor,
         x: &B::Tensor,
         backend: &B,
     ) -> Result<()> {
+        let m = x.shape().first().copied().unwrap_or(0);
         match &self.w_quant {
-            Some(wq) => backend.matmul_quant_into(out, x, wq),
-            None => backend.matmul_into(out, x, &self.w_f16),
+            Some(wq) if m == 1 => backend.matmul_quant_into(out, x, wq),
+            _ => backend.matmul_into(out, x, &self.w_f16),
         }
     }
 
