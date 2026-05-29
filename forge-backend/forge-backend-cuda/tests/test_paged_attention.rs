@@ -547,14 +547,14 @@ fn paged_attention_cuda_matches_default_impl() {
         )
         .expect_err("block_id beyond pool size must fail");
 
-    // ── Split-KV multi-split + 4-warp coverage ──────────────────────────
+    // ── Split-KV multi-split + full-head_dim coverage ───────────────────
     //
-    // The shapes above use head_dim=32 (1 warp) and kv_len < 512 → num_splits=1,
-    // so they never exercise the flash-decoding combine step or the 4-warp dot
-    // reduction. Re-run with the real Qwen decode geometry: head_dim=128
-    // (4 warps), GQA group 4, and a kv_len of 1500 that crosses many blocks and
-    // forces num_splits = ceil(1500/512) = 3. Compare the F16 split-KV kernel
-    // against the F32 gather + batched_decode_attention reference.
+    // The shapes above use head_dim=32 (1 dim/lane) and kv_len < 512 →
+    // num_splits=1, so they never exercise the flash-decoding combine step or
+    // the 4-dims/lane path. Re-run with the real Qwen decode geometry:
+    // head_dim=128 (4 dims/lane), GQA group 4, and a kv_len of 1500 that crosses
+    // many blocks and forces num_splits = ceil(1500/512) = 3. Compare the F16
+    // split-KV kernel against the F32 gather + batched_decode_attention reference.
     {
         let s_num_heads = 8;
         let s_num_kv_heads = 2; // group size 4

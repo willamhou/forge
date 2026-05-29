@@ -1021,6 +1021,13 @@ impl CudaBackend {
                 Ok(())
             }
             DType::F16 => {
+                // The split kernel lays head_dim across a warp's 32 lanes with up
+                // to PA_MAX_DIMS_PER_LANE=4 dims/lane, so it supports head_dim<=128.
+                if head_dim > 128 {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "paged_attention_into: split-KV F16 path supports head_dim<=128, got {head_dim}"
+                    )));
+                }
                 // Split-KV flash-decoding. Pick num_splits from the longest seq
                 // in the batch so the (num_seqs * num_heads * num_splits)-block
                 // grid saturates the device even at batch=1; short seqs get empty
@@ -1049,18 +1056,19 @@ impl CudaBackend {
                     .map_err(|_| ForgeError::Cuda("paged_split_partials mutex poisoned".into()))?;
                 Self::ensure_split_partials(&mut partials, &self.stream, out_elems, ml_elems)?;
 
-                // 1) Main split kernel: grid (num_seqs, num_heads, num_splits).
-                //    Block is head_dim rounded up to a multiple of 32 so warp
-                //    shuffles see full warps (thread d owns out[d]; padding
-                //    threads contribute 0 to the dot reduction). One output dim
-                //    per thread → no atomicAdd. Shared mem = (num_warps + 1) f32
-                //    for the per-token dot reduction.
-                let split_block_dim = (head_dim as u32).div_ceil(32) * 32;
-                let num_warps = split_block_dim / 32;
+                // 1) Main split kernel: grid (num_seqs, num_heads, num_splits),
+                //    block = SPLIT_NWARPS warps. Token-parallel: each warp sweeps a
+                //    strided subset of the split's KV with an in-warp shuffle dot
+                //    (no per-token barrier), then the warps' partials are merged
+                //    once at the end. Shared mem holds the per-warp merge state:
+                //    per-warp m + l + acc[head_dim] = (2*nwarps + nwarps*head_dim) f32.
+                let nwarps = forge_kernels::paged_attention::SPLIT_NWARPS;
+                let split_block_dim = nwarps * 32;
+                let split_shared = (2 * nwarps + nwarps * head_dim as u32) * 4;
                 let split_cfg = LaunchConfig {
                     grid_dim: (batch_size as u32, num_heads as u32, num_splits as u32),
                     block_dim: (split_block_dim, 1, 1),
-                    shared_mem_bytes: (num_warps + 1) * 4,
+                    shared_mem_bytes: split_shared,
                 };
                 {
                     // Disjoint &mut borrows of the three partial buffers (the
