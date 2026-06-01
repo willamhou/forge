@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+    LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use forge_core::{
@@ -43,6 +45,10 @@ struct KernelFunctions {
     embedding_f16: CudaFunction,
     rope_f16: CudaFunction,
     transpose_f16: CudaFunction,
+    /// Specialized small-m transpose for the cuBLASLt col-major matmul output.
+    /// Read coalesced into shared, write coalesced — naive `transpose_f16` wrote
+    /// with stride n which on the Lt path was eating ~5 ms of the algo win.
+    transpose_narrow_f16: CudaFunction,
     split_qkv_f32: CudaFunction,
     cast_f16_to_f32: CudaFunction,
     cast_f32_to_f16: CudaFunction,
@@ -89,6 +95,29 @@ pub struct CudaBackend {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) blas: Arc<CudaBlas>,
+    /// Lazily-initialized cuBLASLt path for the f16 matmul. cuBLASLt's
+    /// heuristic, when fed a native row-major-equivalent descriptor
+    /// (transa=transb=T over the row-major buffers interpreted as col-major
+    /// transposes), picks `nvjet_sm121_*_tmaAB` on Blackwell — same kernel
+    /// pega selects on the same workload. Classic `CudaBlas::gemm` with the
+    /// swap trick lands on `cutlass_80_wmma_*` (Ampere-era), which costs
+    /// 1.5–1.8× more on the attn_proj / down_proj decode shapes. Result of
+    /// the native call lands col-major, so we transpose via `transpose_f16`
+    /// into the caller's row-major output buffer — see `matmul_into_lt_f16`.
+    ///
+    /// We hold the raw `cublasLtHandle_t` + a 32 MiB workspace + a per-shape
+    /// cache of `(matmul_desc, a/b/c layouts, algo)`. cudarc's `Matmul::matmul`
+    /// runs `cublasLtMatmulAlgoGetHeuristic` AS PART OF EVERY CALL — fine for a
+    /// microbench, ruinous in a hot decode loop where ~5 unique shapes get hit
+    /// 36×K times per second. Caching the heuristic per shape gets us the
+    /// algo-level win the microbench promised (nvjet vs cutlass) without
+    /// burning ~100–500 μs per matmul on a re-search the answer can't change.
+    ///
+    /// Lazy because the 32 MiB workspace allocation isn't free and parallel
+    /// `cargo test` had us racing N × 32 MB simultaneous allocations into
+    /// out-of-memory / spurious `CUBLAS_STATUS_EXECUTION_FAILED` errors on
+    /// classic GEMM calls in other tests sharing the device.
+    pub(crate) blas_lt: Arc<Mutex<Option<LtCache>>>,
     kernels: Arc<KernelFunctions>,
     _module_f32: Arc<CudaModule>,
     _module_f16: Arc<CudaModule>,
@@ -140,6 +169,193 @@ pub struct CudaBackend {
     /// `decode_capture_epoch` so the engine re-captures when the geometry
     /// (num_seqs*num_heads*num_splits) outgrows the current allocation.
     paged_split_partials: Arc<Mutex<SplitPartials>>,
+    /// Persistent device scratch for the cuBLASLt f16 matmul path. The native
+    /// descriptor writes a col-major (m,n) result; we read it back as the
+    /// row-major [n,m] bytes and `transpose_f16` it into the caller's [m,n]
+    /// output. This buffer holds that intermediate. Grows monotonically (max
+    /// over all batch-decode GEMM output sizes); bumps `version` on grow so
+    /// `decode_capture_epoch` triggers re-capture if a captured graph baked
+    /// the prior pointer.
+    matmul_lt_scratch: Arc<Mutex<MatmulLtScratch>>,
+}
+
+/// Backend-owned f16 scratch for the cuBLASLt matmul path's col-major
+/// intermediate output. See `matmul_lt_scratch`.
+struct MatmulLtScratch {
+    buf: CudaSlice<half::f16>,
+    version: u64,
+}
+
+/// Raw cuBLASLt handle + 32 MiB workspace + per-shape cache. We bypass
+/// cudarc's safe `CudaBlasLT` / `Matmul` wrappers entirely because they
+/// re-run the heuristic search on every call (creating fresh layouts/desc/pref
+/// each time, then `cublasLtMatmulAlgoGetHeuristic`) — which costs 100–500 μs
+/// per call and completely consumes the algo-level win the native descriptor
+/// gives us. Cache hits go straight to `cublasLtMatmul` with pre-built handles.
+///
+/// `LtCache` is created on first use of the Lt path; subsequent matmuls on the
+/// same `(m, k, n)` reuse the cached entry. The cached pointers (layouts,
+/// desc) are heap-managed by cuBLASLt; `Drop` calls the matching destroy fns.
+pub(crate) struct LtCache {
+    handle: lt_sys::cublasLtHandle_t,
+    workspace: CudaSlice<u8>,
+    workspace_size: usize,
+    /// Keyed on the GEMM dims (m, k, n) — same dims hit the same descriptor +
+    /// layouts, so they hit the same heuristic answer. 5 shapes × 36 layers in
+    /// Qwen3-4B means this table is tiny.
+    shapes: HashMap<(usize, usize, usize), LtShape>,
+}
+
+/// Per-shape cached cuBLASLt resources: descriptor (transposes baked in), the
+/// three matrix-layout objects, and the heuristic's chosen algorithm.
+#[derive(Clone, Copy)]
+struct LtShape {
+    matmul_desc: lt_sys::cublasLtMatmulDesc_t,
+    a_layout: lt_sys::cublasLtMatrixLayout_t,
+    b_layout: lt_sys::cublasLtMatrixLayout_t,
+    c_layout: lt_sys::cublasLtMatrixLayout_t,
+    algo: lt_sys::cublasLtMatmulAlgo_t,
+}
+
+// SAFETY: cuBLASLt's handle and descriptor objects are thread-safe per the
+// CUDA docs; we only ever mutate the `shapes` HashMap behind a Mutex. The raw
+// pointers and POD algo struct are Send + Sync by themselves.
+unsafe impl Send for LtCache {}
+unsafe impl Sync for LtCache {}
+unsafe impl Send for LtShape {}
+unsafe impl Sync for LtShape {}
+
+impl Drop for LtCache {
+    fn drop(&mut self) {
+        // Destroy per-shape resources first, then the handle.
+        for (_, s) in self.shapes.drain() {
+            unsafe {
+                let _ = lt_result::destroy_matmul_desc(s.matmul_desc);
+                let _ = lt_result::destroy_matrix_layout(s.a_layout);
+                let _ = lt_result::destroy_matrix_layout(s.b_layout);
+                let _ = lt_result::destroy_matrix_layout(s.c_layout);
+            }
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                let _ = lt_result::destroy_handle(self.handle);
+            }
+        }
+    }
+}
+
+impl LtCache {
+    /// Allocate the handle + 32 MiB workspace (4 MiB on pre-Hopper, mirroring
+    /// cudarc's `Workspace::new` policy). Called lazily on first Lt matmul.
+    fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt bind_to_thread: {e:?}")))?;
+        let handle = lt_result::create_handle()
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt create_handle: {e:?}")))?;
+        let major = stream
+            .context()
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt query SM: {e:?}")))?;
+        let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 };
+        let workspace = unsafe { stream.alloc::<u8>(workspace_size) }
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt workspace alloc: {e:?}")))?;
+        Ok(Self {
+            handle,
+            workspace,
+            workspace_size,
+            shapes: HashMap::new(),
+        })
+    }
+
+    /// Return cached `LtShape` for `(m, k, n)`, building it on miss.
+    ///
+    /// All of forge's Lt-path matmuls use the same descriptor recipe — f16
+    /// matrices, f32 compute, transa=transb=T, transc=F, no epilogue — so
+    /// only the matrix DIMS vary. We bake the transposes into the descriptor
+    /// once and run the heuristic exactly once per shape.
+    fn shape(&mut self, m: usize, k: usize, n: usize) -> Result<LtShape> {
+        if let Some(s) = self.shapes.get(&(m, k, n)) {
+            return Ok(*s);
+        }
+        let matrix_type = lt_sys::cudaDataType_t::CUDA_R_16F;
+        let compute_type = lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+        let scale_type = lt_sys::cudaDataType_t::CUDA_R_32F;
+
+        // With transa=T: A is stored as (k, m) col-major, lda = k.
+        // With transb=T: B is stored as (n, k) col-major, ldb = n.
+        // C (output) is (m, n) col-major, ldc = m.
+        // See `examples/cublaslt_decode_gemm_probe.rs` for the derivation.
+        let a_layout = lt_result::create_matrix_layout(matrix_type, k as u64, m as u64, k as i64)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt a_layout: {e:?}")))?;
+        let b_layout = lt_result::create_matrix_layout(matrix_type, n as u64, k as u64, n as i64)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt b_layout: {e:?}")))?;
+        let c_layout = lt_result::create_matrix_layout(matrix_type, m as u64, n as u64, m as i64)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt c_layout: {e:?}")))?;
+
+        let matmul_desc = lt_result::create_matmul_desc(compute_type, scale_type)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt matmul_desc: {e:?}")))?;
+        let one_i32: i32 = 1;
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                matmul_desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&one_i32) as *const _ as *const _,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt set TRANSA: {e:?}")))?;
+            lt_result::set_matmul_desc_attribute(
+                matmul_desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&one_i32) as *const _ as *const _,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt set TRANSB: {e:?}")))?;
+        }
+
+        // Preference is throwaway (heuristic-only); destroy after use.
+        let pref = lt_result::create_matmul_pref()
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt matmul_pref: {e:?}")))?;
+        unsafe {
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&self.workspace_size) as *const _ as *const _,
+                std::mem::size_of::<usize>(),
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt set workspace pref: {e:?}")))?;
+        }
+
+        let heuristic = unsafe {
+            lt_result::get_matmul_algo_heuristic(
+                self.handle,
+                matmul_desc,
+                a_layout,
+                b_layout,
+                c_layout,
+                c_layout,
+                pref,
+            )
+        }
+        .map_err(|e| ForgeError::Cuda(format!("cublaslt heuristic: {e:?}")))?;
+
+        unsafe {
+            let _ = lt_result::destroy_matmul_pref(pref);
+        }
+
+        let shape = LtShape {
+            matmul_desc,
+            a_layout,
+            b_layout,
+            c_layout,
+            algo: heuristic.algo,
+        };
+        self.shapes.insert((m, k, n), shape);
+        Ok(shape)
+    }
 }
 
 /// Backend-owned scratch for split-KV paged attention. Three device buffers
@@ -291,6 +507,7 @@ impl CudaBackend {
             embedding_f16: load_f16("embedding_f16")?,
             rope_f16: load_f16("rope_f16")?,
             transpose_f16: load_f16("transpose_f16")?,
+            transpose_narrow_f16: load_f16("transpose_narrow_f16")?,
             cast_f16_to_f32: load_f16("cast_f16_to_f32")?,
             cast_f32_to_f16: load_f16("cast_f32_to_f16")?,
             split_qkv_f16: load_f16("split_qkv_f16")?,
@@ -352,11 +569,15 @@ impl CudaBackend {
         let split_l = stream
             .alloc_zeros::<f32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_l: {e}")))?;
+        let matmul_lt_buf = stream
+            .alloc_zeros::<half::f16>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc matmul_lt_scratch: {e}")))?;
 
         Ok(Self {
             ctx,
             stream,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(Mutex::new(None)),
             decode_inputs_prestaged: Arc::new(AtomicBool::new(false)),
             kernels: Arc::new(kernels),
             _module_f32: module_f32,
@@ -400,6 +621,10 @@ impl CudaBackend {
                 out: split_out,
                 m: split_m,
                 l: split_l,
+                version: 0,
+            })),
+            matmul_lt_scratch: Arc::new(Mutex::new(MatmulLtScratch {
+                buf: matmul_lt_buf,
                 version: 0,
             })),
         })
@@ -565,6 +790,155 @@ impl CudaBackend {
             .lock()
             .map(|g| g.version)
             .unwrap_or(0)
+    }
+
+    /// Version of the cuBLASLt f16 matmul scratch (bumps on grow). Folded into
+    /// `decode_capture_epoch` so a scratch reallocation invalidates any
+    /// captured decode graph that baked the prior pointer.
+    pub fn matmul_lt_scratch_version(&self) -> u64 {
+        self.matmul_lt_scratch.lock().map(|g| g.version).unwrap_or(0)
+    }
+
+    /// f16 matmul via cuBLASLt's heuristic (which picks `nvjet_sm121_*_tmaAB`
+    /// on Blackwell for these shapes — same kernel pega gets) followed by a
+    /// transpose back into row-major. Called from `matmul_into` for batched
+    /// decode shapes where the heuristic difference vs classic cuBLAS is
+    /// material (M ≥ 2 and N ≤ 32768; see the dispatch comment there).
+    ///
+    /// Math: `out[m,n] = a[m,k] · b[k,n]`, all row-major.
+    ///
+    /// The cuBLASLt call uses the **native descriptor** (transa=transb=T)
+    /// rather than the row-major-via-swap-trick that classic cuBLAS uses. The
+    /// heuristic table treats the two descriptor shapes as distinct: the
+    /// "native" shape (output (m,n) with small m, large n) has nvjet algos
+    /// registered; the "swap" shape (output (n,m) with small n) does not, so
+    /// the heuristic falls back to `cutlass_80`. Confirmed via nsys (see
+    /// `examples/cublaslt_decode_gemm_probe.rs`).
+    ///
+    /// The native call writes its result col-major (m,n) into a backend-owned
+    /// scratch — which is the SAME bytes as row-major [n,m]. We then run
+    /// `transpose_f16` over the scratch (rows=n, cols=m) → caller's row-major
+    /// `out[m,n]`. Transpose for the layer GEMMs (≤ 8 × 9728 f16 = 156 KB) is
+    /// ~5 μs on GB10 vs the 20–160 μs saved per GEMM.
+    pub(crate) fn matmul_into_lt_f16(
+        &self,
+        out: &mut CudaTensor,
+        a: &CudaTensor,
+        b: &CudaTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        // 1) Ensure the col-major output scratch can hold m*n f16 values.
+        let needed = m * n;
+        {
+            let mut g = self
+                .matmul_lt_scratch
+                .lock()
+                .map_err(|_| ForgeError::Cuda("matmul_lt_scratch lock poisoned".into()))?;
+            if g.buf.len() < needed {
+                let new_cap = needed.max(g.buf.len() * 3 / 2);
+                g.buf = self
+                    .stream
+                    .alloc_zeros::<half::f16>(new_cap)
+                    .map_err(|e| ForgeError::Cuda(format!("grow matmul_lt_scratch: {e}")))?;
+                g.version = g.version.wrapping_add(1);
+            }
+        }
+
+        let a_slice = a.f16_slice()?;
+        let b_slice = b.f16_slice()?;
+
+        // 2) Cached cuBLASLt matmul. The descriptor uses native column-major
+        //    transposes (transa=transb=T) which trips the heuristic into picking
+        //    `nvjet_sm121_*_tmaAB` on Blackwell. We bypass cudarc's safe wrapper
+        //    because it runs heuristic search per call (the smoking-gun source
+        //    of the previous regression). The cache keyed on (m,k,n) keeps
+        //    the heuristic to once-per-shape; steady-state calls reduce to a
+        //    single `cublasLtMatmul` invocation.
+        {
+            let mut lt_guard = self
+                .blas_lt
+                .lock()
+                .map_err(|_| ForgeError::Cuda("blas_lt lock poisoned".into()))?;
+            if lt_guard.is_none() {
+                *lt_guard = Some(LtCache::new(&self.stream)?);
+            }
+            let lt = lt_guard.as_mut().unwrap();
+            let shape = lt.shape(m, k, n)?;
+
+            let mut g = self
+                .matmul_lt_scratch
+                .lock()
+                .map_err(|_| ForgeError::Cuda("matmul_lt_scratch lock poisoned".into()))?;
+            let c_slice = &mut g.buf;
+
+            let (a_ptr, _ra) = a_slice.device_ptr(&self.stream);
+            let (b_ptr, _rb) = b_slice.device_ptr(&self.stream);
+            let (c_ptr, _rc) = c_slice.device_ptr_mut(&self.stream);
+            let (w_ptr, _rw) = lt.workspace.device_ptr_mut(&self.stream);
+
+            // f16 matmul with f32 compute → scalars are f32.
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                lt_result::matmul(
+                    lt.handle,
+                    shape.matmul_desc,
+                    &alpha as *const _ as *const _,
+                    &beta as *const _ as *const _,
+                    a_ptr as *const _,
+                    shape.a_layout,
+                    b_ptr as *const _,
+                    shape.b_layout,
+                    c_ptr as *const _,
+                    shape.c_layout,
+                    c_ptr as *mut _,
+                    shape.c_layout,
+                    &shape.algo as *const _,
+                    w_ptr as *mut _,
+                    lt.workspace_size,
+                    self.stream.cu_stream() as *mut _,
+                )
+                .map_err(|e| ForgeError::Cuda(format!("cublaslt matmul cached: {e:?}")))?;
+            }
+        }
+
+        // 3) Transpose: scratch bytes are col-major (m,n) = row-major [n,m].
+        //    Use the specialized narrow transpose — reads coalesced into
+        //    shared mem, writes coalesced out. Naive `transpose_f16` writes
+        //    with stride n which eats most of the nvjet algo win.
+        let c_out = out.f16_slice_mut()?;
+        let m_u32 = m as u32;
+        let n_u32 = n as u32;
+        // TILE_N = 128: one warp == one int4-vectorizable group; 128 elements
+        // per block keeps the shared footprint small (m * 129 * 2 ≤ 8 KiB).
+        const TILE_N: u32 = 128;
+        let grid_x = (n as u32).div_ceil(TILE_N);
+        let shared_bytes = (m as u32) * (TILE_N + 1) * std::mem::size_of::<half::f16>() as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (TILE_N, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        };
+        let g = self
+            .matmul_lt_scratch
+            .lock()
+            .map_err(|_| ForgeError::Cuda("matmul_lt_scratch lock poisoned".into()))?;
+        let mut builder = self
+            .stream
+            .launch_builder(&self.kernels.transpose_narrow_f16);
+        builder.arg(c_out);
+        builder.arg(&g.buf);
+        builder.arg(&m_u32);
+        builder.arg(&n_u32);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| ForgeError::Cuda(format!("matmul_lt_f16 transpose: {e}")))?;
+        }
+        drop(g);
+        Ok(())
     }
 
     /// Upload `slot_mapping` into the persistent device scratch. This is the
@@ -1431,6 +1805,29 @@ impl Backend for CudaBackend {
                 Ok(())
             }
             DType::F16 => {
+                // f16 dispatch. M=1 is decode-GEMV territory (classic cuBLAS
+                // picks `gemvx` and is already optimal on Blackwell). For the
+                // batched-decode shapes that dominate forge's GPU time
+                // (attn_proj / down_proj at M≥2), classic cuBLAS picks
+                // `cutlass_80_wmma_*` (Ampere-era) and is 1.5–1.8× slower than
+                // cuBLASLt's `nvjet_sm121_*_tmaAB` (Blackwell-native + TMA)
+                // for the same shapes. Route those through `matmul_into_lt_f16`.
+                //
+                // The Lt path's output lands col-major and needs a transpose
+                // back into the caller's row-major buffer; for very wide
+                // outputs (lm_head: N=151936) the matmul is bandwidth-bound so
+                // Lt buys nothing, while the transpose costs real wallclock —
+                // so we fall back to classic above LT_NATIVE_MAX_N.
+                const LT_NATIVE_MAX_N: usize = 32_768;
+                // Cap m: cuBLASLt's nvjet algo win only shows up for the small-m
+                // batch-decode shapes (≤ ~16 typical). Above that the heuristic
+                // picks an algo equivalent to classic anyway, and our specialized
+                // `transpose_narrow_f16` would blow past shared-mem limits
+                // (it carries `m * (TILE_N + 1)` halves per block).
+                const LT_NATIVE_MAX_M: usize = 32;
+                if m >= 2 && m <= LT_NATIVE_MAX_M && n <= LT_NATIVE_MAX_N {
+                    return self.matmul_into_lt_f16(out, a, b, m, k, n);
+                }
                 let a_slice = a.f16_slice()?;
                 let b_slice = b.f16_slice()?;
                 let c_slice = out.f16_slice_mut()?;
@@ -4051,5 +4448,6 @@ impl Backend for CudaBackend {
             .wrapping_add(self.embedding_scratch_version())
             .wrapping_add(self.scatter_slot_mapping_version())
             .wrapping_add(self.paged_split_partials_version())
+            .wrapping_add(self.matmul_lt_scratch_version())
     }
 }
