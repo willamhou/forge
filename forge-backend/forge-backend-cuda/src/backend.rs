@@ -185,8 +185,10 @@ pub struct CudaBackend {
     /// into the final out/softmax_lse before returning. Pure write-then-read
     /// scratch, never observed on the host. Grows geometrically; size is the
     /// max over all decode geometries the engine has seen.
-    flash_paged_oaccum: Arc<Mutex<CudaSlice<f32>>>,
-    flash_paged_lseaccum: Arc<Mutex<CudaSlice<f32>>>,
+    ///
+    /// `version` bumps on any reallocation so `decode_capture_epoch`
+    /// invalidates any captured decode graph that baked the prior pointers.
+    flash_paged_scratch: Arc<Mutex<FlashPagedScratch>>,
     /// Cached SM count of the active CUDA device. Needed by FA2's split-KV
     /// occupancy heuristic; queried once at backend init so the hot path
     /// doesn't repeat the driver call.
@@ -197,6 +199,15 @@ pub struct CudaBackend {
 /// intermediate output. See `matmul_lt_scratch`.
 struct MatmulLtScratch {
     buf: CudaSlice<half::f16>,
+    version: u64,
+}
+
+/// Backend-owned f32 split-KV scratch for the FA2 paged-decode path. See
+/// `flash_paged_scratch`. Both buffers track the same `version` since they
+/// always grow together (sized by the same geometry).
+struct FlashPagedScratch {
+    oaccum: CudaSlice<f32>,
+    lseaccum: CudaSlice<f32>,
     version: u64,
 }
 
@@ -653,8 +664,11 @@ impl CudaBackend {
                 buf: matmul_lt_buf,
                 version: 0,
             })),
-            flash_paged_oaccum: Arc::new(Mutex::new(flash_paged_oaccum_buf)),
-            flash_paged_lseaccum: Arc::new(Mutex::new(flash_paged_lseaccum_buf)),
+            flash_paged_scratch: Arc::new(Mutex::new(FlashPagedScratch {
+                oaccum: flash_paged_oaccum_buf,
+                lseaccum: flash_paged_lseaccum_buf,
+                version: 0,
+            })),
             num_sm,
         })
     }
@@ -689,26 +703,41 @@ impl CudaBackend {
         lseaccum_elems: usize,
     ) -> Result<(u64, u64)> {
         use cudarc::driver::DevicePtr;
-        let mut oaccum = self.flash_paged_oaccum.lock().unwrap();
-        if oaccum.len() < oaccum_elems {
-            let new_cap = oaccum_elems.max(oaccum.len() * 3 / 2).max(16);
-            *oaccum = self
+        let mut scratch = self.flash_paged_scratch.lock().unwrap();
+        let mut grew = false;
+        if scratch.oaccum.len() < oaccum_elems {
+            let new_cap = oaccum_elems.max(scratch.oaccum.len() * 3 / 2).max(16);
+            scratch.oaccum = self
                 .stream
                 .alloc_zeros::<f32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow flash_paged_oaccum: {e}")))?;
+            grew = true;
         }
-        let mut lseaccum = self.flash_paged_lseaccum.lock().unwrap();
-        if lseaccum.len() < lseaccum_elems {
-            let new_cap = lseaccum_elems.max(lseaccum.len() * 3 / 2).max(16);
-            *lseaccum = self
+        if scratch.lseaccum.len() < lseaccum_elems {
+            let new_cap = lseaccum_elems.max(scratch.lseaccum.len() * 3 / 2).max(16);
+            scratch.lseaccum = self
                 .stream
                 .alloc_zeros::<f32>(new_cap)
                 .map_err(|e| ForgeError::Cuda(format!("grow flash_paged_lseaccum: {e}")))?;
+            grew = true;
+        }
+        if grew {
+            scratch.version = scratch.version.wrapping_add(1);
         }
         Ok((
-            oaccum.device_ptr(&self.stream).0,
-            lseaccum.device_ptr(&self.stream).0,
+            scratch.oaccum.device_ptr(&self.stream).0,
+            scratch.lseaccum.device_ptr(&self.stream).0,
         ))
+    }
+
+    /// Grow counter for `flash_paged_scratch`. Folded into
+    /// `decode_capture_epoch` so a scratch reallocation invalidates any
+    /// captured decode graph that baked the prior pointers.
+    fn flash_paged_scratch_version(&self) -> u64 {
+        self.flash_paged_scratch
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
     }
 
     /// Grow the split-KV partial scratch (held in `paged_split_partials`) so the
@@ -4596,5 +4625,6 @@ impl Backend for CudaBackend {
             .wrapping_add(self.scatter_slot_mapping_version())
             .wrapping_add(self.paged_split_partials_version())
             .wrapping_add(self.matmul_lt_scratch_version())
+            .wrapping_add(self.flash_paged_scratch_version())
     }
 }
