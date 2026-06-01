@@ -645,4 +645,110 @@ fn paged_attention_cuda_matches_default_impl() {
             &s_ref_host[..s_ref_host.len().min(8)],
         );
     }
+
+    // ── FA2 paged-decode path (FORGE_FA2_PAGED=1) ─────────────────────────
+    //
+    // Uses Qwen-class GQA geometry (head_dim=128, num_heads=8, num_kv_heads=2)
+    // with the FA2-mandated block_size=256. With kv_len=1280 the seq spans 5
+    // blocks; FA2's split-KV heuristic decides num_splits internally. Compares
+    // against the same F32 reference path as the split-KV block above.
+    #[cfg(feature = "flash-attn")]
+    {
+        let f_num_heads = 8;
+        let f_num_kv_heads = 2;
+        let f_head_dim = 128;
+        let f_kv_dim = f_num_kv_heads * f_head_dim;
+        let f_block_size = 256; // FA2 hard requirement: % 256 == 0
+        let f_kv_len = 1280usize;
+        let f_blocks_needed = f_kv_len.div_ceil(f_block_size);
+        let f_total_blocks = f_blocks_needed + 2;
+        let f_max_blocks = f_blocks_needed;
+        let f_block_tables: Vec<i32> = (0..f_max_blocks as i32).collect();
+        let f_kv_lens: Vec<i32> = vec![f_kv_len as i32];
+
+        let f_pool_n = f_total_blocks * f_block_size * f_kv_dim;
+        let mut f_seed = 0xFA2DEC0Du64;
+        let f_k: Vec<f32> = (0..f_pool_n).map(|_| rng_lcg(&mut f_seed) * 0.2).collect();
+        let f_v: Vec<f32> = (0..f_pool_n).map(|_| rng_lcg(&mut f_seed) * 0.2).collect();
+        let f_q: Vec<f32> = (0..f_num_heads * f_head_dim)
+            .map(|_| rng_lcg(&mut f_seed) * 0.2)
+            .collect();
+
+        let f_k_pool = backend
+            .copy_from_host_f32(&f_k, &[f_total_blocks, f_block_size, f_kv_dim])
+            .unwrap();
+        let f_v_pool = backend
+            .copy_from_host_f32(&f_v, &[f_total_blocks, f_block_size, f_kv_dim])
+            .unwrap();
+        let f_q_t = backend
+            .copy_from_host_f32(&f_q, &[1, f_num_heads * f_head_dim])
+            .unwrap();
+        let f_scale = (f_head_dim as f32).powf(-0.5);
+
+        // F32 reference: gather + batched_decode_attention.
+        let f_block_ids: Vec<usize> = (0..f_blocks_needed).collect();
+        let f_kc = backend
+            .paged_gather_kv(&f_k_pool, &f_block_ids, f_kv_len)
+            .unwrap();
+        let f_vc = backend
+            .paged_gather_kv(&f_v_pool, &f_block_ids, f_kv_len)
+            .unwrap();
+        let f_ref = backend
+            .batched_decode_attention(
+                &f_q_t,
+                &[f_kc],
+                &[f_vc],
+                f_num_heads,
+                f_num_kv_heads,
+                f_head_dim,
+                f_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        let f_ref_host = backend.copy_to_host_f32(&f_ref).unwrap();
+
+        // F16 cast inputs, route through FA2 paged path via env opt-in.
+        let f_k16 = backend.cast(&f_k_pool, DType::F16).unwrap();
+        let f_v16 = backend.cast(&f_v_pool, DType::F16).unwrap();
+        let f_q16 = backend.cast(&f_q_t, DType::F16).unwrap();
+
+        // SAFETY: env-var mutation is not Send-safe in general, but cargo test
+        // for this crate runs tests in a single binary serially (no parallel
+        // backend access — see file header) so the temporary mutation is fine.
+        unsafe { std::env::set_var("FORGE_FA2_PAGED", "1") };
+        let f_out16 = backend
+            .paged_attention(
+                &f_q16,
+                &f_k16,
+                &f_v16,
+                &f_block_tables,
+                &f_kv_lens,
+                f_max_blocks,
+                f_num_heads,
+                f_num_kv_heads,
+                f_head_dim,
+                f_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        unsafe { std::env::remove_var("FORGE_FA2_PAGED") };
+
+        let f_out_f32 = backend.cast(&f_out16, DType::F32).unwrap();
+        let f_out_host = backend.copy_to_host_f32(&f_out_f32).unwrap();
+
+        let f_max_abs_val = f_ref_host.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let f_diff = f_out_host
+            .iter()
+            .zip(&f_ref_host)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        // FA2 fp16 vs reference f32: 1% is the usual FA2 fp16 error floor.
+        let f_tol = 1e-2_f32.max(f_max_abs_val * 1e-2);
+        assert!(
+            f_diff < f_tol,
+            "FA2 paged decode (head_dim=128, block_size=256) F16 vs F32 ref: max abs diff {f_diff} > tol {f_tol} (ref max abs {f_max_abs_val})\n  out[0..8] = {:?}\n  ref[0..8] = {:?}",
+            &f_out_host[..f_out_host.len().min(8)],
+            &f_ref_host[..f_ref_host.len().min(8)],
+        );
+    }
 }

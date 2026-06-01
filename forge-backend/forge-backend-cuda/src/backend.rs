@@ -177,6 +177,20 @@ pub struct CudaBackend {
     /// `decode_capture_epoch` triggers re-capture if a captured graph baked
     /// the prior pointer.
     matmul_lt_scratch: Arc<Mutex<MatmulLtScratch>>,
+    /// Persistent f32 split-KV partial scratch for the FA2 paged-decode path
+    /// (`forge_flash_attn_fwd_kvcache`). `oaccum` holds the per-split output
+    /// accumulator (shape `[num_splits_cap, b, h, seqlen_q, d_rounded]`) and
+    /// `lseaccum` holds the per-split log-sum-exp accumulator
+    /// (`[num_splits_cap, b, h, seqlen_q]`). FA2's reduction step folds them
+    /// into the final out/softmax_lse before returning. Pure write-then-read
+    /// scratch, never observed on the host. Grows geometrically; size is the
+    /// max over all decode geometries the engine has seen.
+    flash_paged_oaccum: Arc<Mutex<CudaSlice<f32>>>,
+    flash_paged_lseaccum: Arc<Mutex<CudaSlice<f32>>>,
+    /// Cached SM count of the active CUDA device. Needed by FA2's split-KV
+    /// occupancy heuristic; queried once at backend init so the hot path
+    /// doesn't repeat the driver call.
+    pub(crate) num_sm: i32,
 }
 
 /// Backend-owned f16 scratch for the cuBLASLt matmul path's col-major
@@ -572,6 +586,18 @@ impl CudaBackend {
         let matmul_lt_buf = stream
             .alloc_zeros::<half::f16>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc matmul_lt_scratch: {e}")))?;
+        let flash_paged_oaccum_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc flash_paged_oaccum: {e}")))?;
+        let flash_paged_lseaccum_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc flash_paged_lseaccum: {e}")))?;
+        let num_sm = stream
+            .context()
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .unwrap_or(16);
 
         Ok(Self {
             ctx,
@@ -627,6 +653,9 @@ impl CudaBackend {
                 buf: matmul_lt_buf,
                 version: 0,
             })),
+            flash_paged_oaccum: Arc::new(Mutex::new(flash_paged_oaccum_buf)),
+            flash_paged_lseaccum: Arc::new(Mutex::new(flash_paged_lseaccum_buf)),
+            num_sm,
         })
     }
 
@@ -646,6 +675,40 @@ impl CudaBackend {
                 .map_err(|e| ForgeError::Cuda(format!("grow flash_lse: {e}")))?;
         }
         Ok(lse.device_ptr(&self.stream).0)
+    }
+
+    /// Grow the FA2 paged-decode split scratch (`oaccum`, `lseaccum`) and
+    /// return their device pointers. The caller is responsible for sizing
+    /// based on `num_splits_cap * batch_size * num_heads * seqlen_q` and the
+    /// rounded head dim. Both buffers are persistent and write-only from the
+    /// kernel's perspective (the reduction step folds them into the final
+    /// out/softmax_lse), so reuse across calls is safe.
+    pub(crate) fn flash_paged_scratch_ptrs(
+        &self,
+        oaccum_elems: usize,
+        lseaccum_elems: usize,
+    ) -> Result<(u64, u64)> {
+        use cudarc::driver::DevicePtr;
+        let mut oaccum = self.flash_paged_oaccum.lock().unwrap();
+        if oaccum.len() < oaccum_elems {
+            let new_cap = oaccum_elems.max(oaccum.len() * 3 / 2).max(16);
+            *oaccum = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow flash_paged_oaccum: {e}")))?;
+        }
+        let mut lseaccum = self.flash_paged_lseaccum.lock().unwrap();
+        if lseaccum.len() < lseaccum_elems {
+            let new_cap = lseaccum_elems.max(lseaccum.len() * 3 / 2).max(16);
+            *lseaccum = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow flash_paged_lseaccum: {e}")))?;
+        }
+        Ok((
+            oaccum.device_ptr(&self.stream).0,
+            lseaccum.device_ptr(&self.stream).0,
+        ))
     }
 
     /// Grow the split-KV partial scratch (held in `paged_split_partials`) so the
@@ -1401,6 +1464,90 @@ impl CudaBackend {
                     return Err(ForgeError::InvalidArgument(format!(
                         "paged_attention_into: split-KV F16 path supports head_dim<=128, got {head_dim}"
                     )));
+                }
+
+                // FA2 paged decode path (opt-in via FORGE_FA2_PAGED=1) — uses
+                // `flash_fwd_kvcache` against forge's block pool. Same memory
+                // layout in both: `[num_blocks, block_size, num_kv_heads * head_dim]`
+                // and FA2's `[num_blocks, page_block_size, num_heads_k, head_dim]`
+                // are byte-equivalent.
+                //
+                // Hard gates baked into FA2 (kept here to fail loudly instead of
+                // silently falling back):
+                //   - `page_block_size % 256 == 0` (FA2 splitkv inner-loop alignment).
+                //   - `head_dim ∈ {32, 64, 96, 128, 192, 256}` (instantiated templates).
+                // The env opt-in lets us land the path safely; gating is removed
+                // once the bench validates correctness and perf.
+                #[cfg(feature = "flash-attn")]
+                {
+                    let fa2_supported_hdim = matches!(head_dim, 32 | 64 | 96 | 128 | 192 | 256);
+                    let block_size_aligned = block_size % 256 == 0;
+                    let fa2_enabled = std::env::var("FORGE_FA2_PAGED")
+                        .ok()
+                        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .is_some();
+                    if fa2_enabled && fa2_supported_hdim && block_size_aligned {
+                        use cudarc::driver::DevicePtr;
+                        // Hold the i32 scratch mutexes across the launch — the
+                        // device pointers we hand to FA2 must outlive the kernel.
+                        let bt_ptr = block_tables_dev.device_ptr(&self.stream).0;
+                        let kv_ptr = kv_lens_dev.device_ptr(&self.stream).0;
+                        let q_ptr = q.f16_slice()?.device_ptr(&self.stream).0;
+                        let k_ptr = k_pool.f16_slice()?.device_ptr(&self.stream).0;
+                        let v_ptr = v_pool.f16_slice()?.device_ptr(&self.stream).0;
+                        let out_ptr = out.f16_slice_mut()?.device_ptr(&self.stream).0;
+
+                        let seqlen_q = 1; // forge's paged_attention contract: 1 token per seq
+                        let d_rounded = if head_dim <= 128 {
+                            head_dim.div_ceil(32) * 32
+                        } else {
+                            head_dim.div_ceil(64) * 64
+                        };
+                        const FA2_NUM_SPLITS_CAP: i32 = 32;
+
+                        // Persistent softmax_lse scratch (FA2 writes always).
+                        let lse_len = batch_size * num_heads * seqlen_q;
+                        let lse_ptr = self.flash_lse_ptr(lse_len.max(1))?;
+
+                        // Persistent oaccum / lseaccum scratch.
+                        let oaccum_elems = (FA2_NUM_SPLITS_CAP as usize)
+                            * batch_size * num_heads * seqlen_q * d_rounded;
+                        let lseaccum_elems = (FA2_NUM_SPLITS_CAP as usize)
+                            * batch_size * num_heads * seqlen_q;
+                        let (oaccum_ptr, lseaccum_ptr) =
+                            self.flash_paged_scratch_ptrs(oaccum_elems, lseaccum_elems)?;
+
+                        let stream_ptr = self.stream.cu_stream() as usize as u64;
+                        unsafe {
+                            forge_flash::flash_fwd_kvcache(
+                                q_ptr,
+                                k_ptr,
+                                v_ptr,
+                                out_ptr,
+                                lse_ptr,
+                                bt_ptr,
+                                kv_ptr,
+                                batch_size as i32,
+                                seqlen_q as i32,
+                                num_blocks as i32,
+                                max_blocks_per_seq as i32,
+                                block_size as i32,
+                                num_heads as i32,
+                                num_kv_heads as i32,
+                                head_dim as i32,
+                                scale,
+                                /*is_causal=*/ false,
+                                forge_flash::FlashDType::F16,
+                                /*num_splits=*/ 0,
+                                self.num_sm,
+                                lseaccum_ptr,
+                                oaccum_ptr,
+                                FA2_NUM_SPLITS_CAP,
+                                stream_ptr,
+                            );
+                        }
+                        return Ok(());
+                    }
                 }
                 // Split-KV flash-decoding. Pick num_splits from the longest seq
                 // in the batch so the (num_seqs * num_heads * num_splits)-block
