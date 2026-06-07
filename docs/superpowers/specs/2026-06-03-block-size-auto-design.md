@@ -1,6 +1,6 @@
 # block_size auto: backend-driven default for paged KV cache
 
-**Date:** 2026-06-03 (rev 2, post Codex review round 2)
+**Date:** 2026-06-03 (rev 3, post Codex review round 3)
 **Status:** spec (pre-implementation)
 **Branch:** `feat/quantized-decode` (or follow-on)
 **Related:** `docs/plans/2026-02-23-flash-attention-v2-{design,plan}.md`,
@@ -234,20 +234,26 @@ trips one of these edge cases. The kill switch preserves zero-config
 default behaviour while keeping a documented escape hatch.
 
 Dispatch condition becomes (still inside the existing
-`#[cfg(feature = "flash-attn")]` block at `backend.rs:1510`):
+`#[cfg(feature = "flash-attn")]` block at `backend.rs:1510`). The code
+sits inside the `DType::F16 => { ... }` arm of `match q.dtype()` at
+`backend.rs:1489`, so there is no `dtype` binding in scope — pass the
+concrete `DType::F16` literally:
 
 ```rust
 let fa2_killed = std::env::var("FORGE_FA2_PAGED")
     .ok()
     .filter(|v| v == "0" || v.eq_ignore_ascii_case("false"))
     .is_some();
-if !fa2_killed && fa2_paged_eligible(head_dim, dtype, block_size) {
+if !fa2_killed && fa2_paged_eligible(head_dim, DType::F16, block_size) {
     // FA2 launch as today
 }
 ```
 
 `fa2_paged_eligible` is the same helper from §2 — no parallel
-`matches!` lists, no risk of drift.
+`matches!` lists, no risk of drift. Passing `DType::F16` directly here
+(rather than hoisting `let dtype = q.dtype()` above the match) keeps the
+arm's invariant explicit: the FA2 branch only exists in this arm by
+construction.
 
 The `cfg` wrapping is unchanged: a build without `--features flash-attn`
 continues to skip the FA2 branch entirely.
@@ -268,25 +274,38 @@ fallback** — both branches answer within 1% F16. That is not a
 correctness regression today but it removes the only assertion that
 "FA2 actually ran" once the env gate flips.
 
-The test layout becomes a **differential check**:
+The test layout becomes a **predicate + differential check**, not a
+runtime dispatch counter. No `AtomicUsize` / dispatch-counter pattern
+exists elsewhere in this codebase, and introducing one would be new
+crate-surface for the sole purpose of testing.
 
-1. With env unset (FA2 enabled by default given the shape), run
-   `paged_attention` → record `out_fa2`.
-2. With `FORGE_FA2_PAGED=0`, re-run on identical inputs → record
-   `out_fallback`.
-3. Assert **both** are within 1% F16 tol of the F32 reference (existing
-   correctness invariant).
-4. Assert `out_fa2` ≠ bit-identical to `out_fallback` **OR** add a
-   lightweight dispatch counter on `CudaBackend` (atomic incremented
-   inside the FA2 branch only) and assert its value changes after step
-   1 but not after step 2.
+1. **Predicate truth-table** in a `forge-backend-cuda` unit test
+   (gated on `feature = "flash-attn"`): expose `fa2_paged_eligible`
+   as `pub(crate)` and assert it returns `true` for the integration
+   test's shape (`head_dim=128, dtype=F16, block_size=256`) and
+   `false` for at least one disqualifying input (e.g.
+   `block_size=128`, or `dtype=F32`). Because both the dispatch site
+   (§3) and `preferred_block_size` (§2) route through this single
+   helper, asserting the predicate's truth value is **equivalent to
+   asserting "FA2 was selected"** — no side-channel atomic needed.
+2. **Differential output sanity** in
+   `tests/test_paged_attention.rs:715-734`: drop the
+   `unsafe { set_var } / remove_var` dance. With env unset, run
+   `paged_attention` → record `out_fa2`. With
+   `FORGE_FA2_PAGED=0`, rerun on identical inputs → record
+   `out_fallback`. Assert both are within 1% F16 tolerance of the F32
+   reference (the existing correctness invariant carries over to both
+   branches). Note observationally that `out_fa2 != out_fallback` on
+   this shape, but do **not** make bitwise inequality a hard assertion
+   — reductions over identical inputs are not contractually required
+   to differ.
 
-Recommended: add a `CudaBackend` test-only counter behind
-`#[cfg(any(test, feature = "fa2-dispatch-counter"))]` and read it from
-the test. Differential output check is fine as a fallback but
-`paged_attention` numerics are deterministic enough that
-`out_fa2 != out_fallback` is empirically true on the chosen shape; it
-is not a contract.
+The "FA2 ran" claim now rests on:
+- The predicate test (truth value of the canonical helper).
+- The differential test (env=0 actually exercises the fallback path,
+  exposed via the kill-switch contract from §3).
+- The shared-helper contract (§7-style rule: dispatch and preference
+  may only depend on FA2 eligibility through `fa2_paged_eligible`).
 
 **Unit tests added:**
 
@@ -304,12 +323,16 @@ is not a contract.
   - `(head_dim=48, dtype=F16) → 16` (unsupported head_dim)
   - Without `flash-attn` feature, the trait default applies (covered by
     the standard compile target without explicit override).
-- `forge-kvcache::paged_cache` scheduler-capacity sanity: existing
-  scheduler tests use `block_size=16` literals on purpose (probe
-  short-seq scheduling) and stay as-is. A new test exercises
-  `block_size=256` with a 4096-token prompt and asserts the scheduler
-  needs exactly 16 blocks
-  (`ceil(prompt_len / block_size)`), guarding the math used in
+- `forge-scheduler` scheduler-capacity sanity (test file:
+  `forge-scheduler/tests/test_scheduler.rs`, alongside the existing
+  scheduler tests). Crate rationale: `forge-kvcache` does **not**
+  depend on `forge-scheduler` — the test must live in the scheduler
+  crate, which already exercises the admission / block-reservation
+  math we want to guard. Existing tests in this file use
+  `block_size=16` literals on purpose (probe short-seq scheduling)
+  and stay as-is. A new test exercises `block_size=256` with a
+  4096-token prompt and asserts the scheduler reserves exactly 16
+  blocks (`ceil(prompt_len / block_size)`), covering
   `forge-scheduler/src/continuous.rs:211-220, 275-283`.
 
 **Unchanged tests:** scheduler short-seq tests, decode persistent test,
@@ -408,11 +431,13 @@ After implementation:
 - `cargo test -p forge-backend-cuda --features flash-attn` covers
   `preferred_block_size` truth table.
 - `cargo test -p forge-backend-cuda --features flash-attn
-  test_paged_attention` runs the differential FA2-vs-fallback check and
-  asserts the FA2 branch was actually taken (counter or differential
-  output, per §4).
-- `cargo test -p forge-kvcache` covers a new `block_size=256` scheduler
-  capacity sanity test (4096-token prompt → 16 blocks).
+  test_paged_attention` runs the differential FA2-vs-fallback
+  tolerance check, and a separate unit test asserts the
+  `fa2_paged_eligible` predicate truth-table (FA2-was-selected proved
+  via the canonical helper, not via a side-channel counter; per §4).
+- `cargo test -p forge-scheduler` covers a new `block_size=256`
+  scheduler capacity sanity test (4096-token prompt → 16 blocks
+  reserved).
 - `bash scripts/test_server.sh /path/to/qwen3-4b` works with no extra
   flags and the startup log reports
   `block_size=256 (auto), num_blocks=128 (auto), capacity=32768 tokens`.
