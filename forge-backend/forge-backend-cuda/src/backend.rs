@@ -1809,6 +1809,17 @@ impl Backend for CudaBackend {
         CudaContext::device_count().unwrap_or(0) as usize
     }
 
+    #[cfg(feature = "flash-attn")]
+    fn preferred_block_size(&self, head_dim: usize, dtype: DType) -> usize {
+        // Probe the eligibility helper with the candidate block_size 256.
+        // Helper lives in this same module — no path prefix needed.
+        if fa2_paged_eligible(head_dim, dtype, 256) {
+            256
+        } else {
+            16
+        }
+    }
+
     fn allocate(&self, shape: &[usize], dtype: DType) -> Result<CudaTensor> {
         let numel = CudaTensor::numel_from_shape(shape);
         match dtype {
@@ -4688,5 +4699,17 @@ mod tests_block_size_auto {
         // hits UnsupportedDtype at backend.rs:1684. Keep preference aligned.
         assert!(!fa2_paged_eligible(128, DType::BF16, 256));
         assert!(!fa2_paged_eligible(128, DType::F32, 256));
+    }
+
+    /// CudaBackend's `preferred_block_size` override defers to
+    /// `fa2_paged_eligible` with the candidate `256`. We can't construct
+    /// a CudaBackend in this unit test (it needs a device), so this
+    /// asserts the predicate matrix the override depends on.
+    #[test]
+    fn override_helper_probe_matrix() {
+        assert!(fa2_paged_eligible(128, DType::F16, 256));
+        assert!(fa2_paged_eligible(64, DType::F16, 256));
+        assert!(!fa2_paged_eligible(128, DType::F32, 256));
+        assert!(!fa2_paged_eligible(48, DType::F16, 256));
     }
 }
