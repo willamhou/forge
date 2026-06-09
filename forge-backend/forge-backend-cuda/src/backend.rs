@@ -17,6 +17,31 @@ use forge_core::{
 use crate::decode_graph::DecodeGraphRunner;
 use crate::tensor::CudaTensor;
 
+/// Head dims for which FA2 templates are instantiated in
+/// `forge-flash/csrc/flash_attn/src/flash_fwd_launch_template.h`.
+#[cfg(feature = "flash-attn")]
+const FA2_SUPPORTED_HEAD_DIMS: [usize; 6] = [32, 64, 96, 128, 192, 256];
+
+/// Canonical FA2 paged-decode eligibility predicate.
+///
+/// Both `CudaBackend::preferred_block_size` (probes with candidate
+/// `block_size = 256`) and the dispatch gate in `paged_attention_into_impl`
+/// route through this function. Mirrors dispatch reality: only the
+/// `DType::F16` arm currently reaches the FA2 branch — BF16 / F32 hit
+/// `UnsupportedDtype` at the match-default arm. When BF16 support is added
+/// to the dispatch later, widen the `dtype` clause here once and both call
+/// sites pick it up.
+#[cfg(feature = "flash-attn")]
+pub(crate) fn fa2_paged_eligible(
+    head_dim: usize,
+    dtype: forge_core::DType,
+    block_size: usize,
+) -> bool {
+    matches!(dtype, forge_core::DType::F16)
+        && FA2_SUPPORTED_HEAD_DIMS.contains(&head_dim)
+        && block_size % 256 == 0
+}
+
 struct KernelFunctions {
     add_f32: CudaFunction,
     add_bias_f32: CudaFunction,
@@ -888,7 +913,10 @@ impl CudaBackend {
     /// `decode_capture_epoch` so a scratch reallocation invalidates any
     /// captured decode graph that baked the prior pointer.
     pub fn matmul_lt_scratch_version(&self) -> u64 {
-        self.matmul_lt_scratch.lock().map(|g| g.version).unwrap_or(0)
+        self.matmul_lt_scratch
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
     }
 
     /// f16 matmul via cuBLASLt's heuristic (which picks `nvjet_sm121_*_tmaAB`
@@ -1540,9 +1568,12 @@ impl CudaBackend {
 
                         // Persistent oaccum / lseaccum scratch.
                         let oaccum_elems = (FA2_NUM_SPLITS_CAP as usize)
-                            * batch_size * num_heads * seqlen_q * d_rounded;
-                        let lseaccum_elems = (FA2_NUM_SPLITS_CAP as usize)
-                            * batch_size * num_heads * seqlen_q;
+                            * batch_size
+                            * num_heads
+                            * seqlen_q
+                            * d_rounded;
+                        let lseaccum_elems =
+                            (FA2_NUM_SPLITS_CAP as usize) * batch_size * num_heads * seqlen_q;
                         let (oaccum_ptr, lseaccum_ptr) =
                             self.flash_paged_scratch_ptrs(oaccum_elems, lseaccum_elems)?;
 
@@ -4626,5 +4657,36 @@ impl Backend for CudaBackend {
             .wrapping_add(self.paged_split_partials_version())
             .wrapping_add(self.matmul_lt_scratch_version())
             .wrapping_add(self.flash_paged_scratch_version())
+    }
+}
+
+#[cfg(all(test, feature = "flash-attn"))]
+mod tests_block_size_auto {
+    use super::fa2_paged_eligible;
+    use forge_core::DType;
+
+    #[test]
+    fn fa2_eligible_qwen_class_shape() {
+        assert!(fa2_paged_eligible(128, DType::F16, 256));
+    }
+
+    #[test]
+    fn fa2_rejects_unaligned_block_size() {
+        assert!(!fa2_paged_eligible(128, DType::F16, 128));
+        assert!(!fa2_paged_eligible(128, DType::F16, 16));
+    }
+
+    #[test]
+    fn fa2_rejects_unsupported_head_dim() {
+        assert!(!fa2_paged_eligible(48, DType::F16, 256));
+        assert!(!fa2_paged_eligible(160, DType::F16, 256));
+    }
+
+    #[test]
+    fn fa2_rejects_non_f16_dtype() {
+        // Today the FA2 dispatch arm is reachable only from DType::F16; BF16
+        // hits UnsupportedDtype at backend.rs:1684. Keep preference aligned.
+        assert!(!fa2_paged_eligible(128, DType::BF16, 256));
+        assert!(!fa2_paged_eligible(128, DType::F32, 256));
     }
 }
