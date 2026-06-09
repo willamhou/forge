@@ -76,6 +76,15 @@ pub trait Backend: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn device_count(&self) -> usize;
 
+    /// Preferred KV-cache block size for this backend and model geometry.
+    ///
+    /// Backends override this when a fast attention path imposes shape
+    /// requirements (e.g. CudaBackend returns 256 when FA2 paged decode
+    /// is eligible). Default is 16, which all backends accept.
+    fn preferred_block_size(&self, _head_dim: usize, _dtype: DType) -> usize {
+        16
+    }
+
     // Allocation
     fn allocate(&self, shape: &[usize], dtype: DType) -> Result<Self::Tensor>;
     fn allocate_zeros(&self, shape: &[usize], dtype: DType) -> Result<Self::Tensor>;

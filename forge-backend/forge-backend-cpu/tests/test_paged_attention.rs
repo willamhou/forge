@@ -208,3 +208,11 @@ fn paged_attention_validates_inputs() {
         .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 2, 4, scale)
         .unwrap();
 }
+
+#[test]
+fn cpu_preferred_block_size_is_16_for_any_shape() {
+    let b = CpuBackend::new();
+    assert_eq!(b.preferred_block_size(128, DType::F16), 16);
+    assert_eq!(b.preferred_block_size(128, DType::F32), 16);
+    assert_eq!(b.preferred_block_size(64, DType::BF16), 16);
+}
