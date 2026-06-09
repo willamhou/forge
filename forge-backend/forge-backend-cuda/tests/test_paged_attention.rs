@@ -707,16 +707,38 @@ fn paged_attention_cuda_matches_default_impl() {
         backend.synchronize().unwrap();
         let f_ref_host = backend.copy_to_host_f32(&f_ref).unwrap();
 
-        // F16 cast inputs, route through FA2 paged path via env opt-in.
+        // F16 cast inputs. Differential check: first the default path
+        // (FA2 paged when shape is eligible; env unset), then the
+        // kill-switch fallback (FORGE_FA2_PAGED=0 forces split-KV).
         let f_k16 = backend.cast(&f_k_pool, DType::F16).unwrap();
         let f_v16 = backend.cast(&f_v_pool, DType::F16).unwrap();
         let f_q16 = backend.cast(&f_q_t, DType::F16).unwrap();
 
-        // SAFETY: env-var mutation is not Send-safe in general, but cargo test
-        // for this crate runs tests in a single binary serially (no parallel
-        // backend access — see file header) so the temporary mutation is fine.
-        unsafe { std::env::set_var("FORGE_FA2_PAGED", "1") };
-        let f_out16 = backend
+        // Default behaviour: env unset → FA2 branch runs because the shape
+        // (head_dim=128, dtype=F16, block_size=256) is FA2-eligible.
+        let f_out_fa2 = backend
+            .paged_attention(
+                &f_q16,
+                &f_k16,
+                &f_v16,
+                &f_block_tables,
+                &f_kv_lens,
+                f_max_blocks,
+                f_num_heads,
+                f_num_kv_heads,
+                f_head_dim,
+                f_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+
+        // Kill switch: FORGE_FA2_PAGED=0 forces the split-KV fallback. Same
+        // inputs; output must still match the F32 reference within 1% F16 tol.
+        // SAFETY: cargo test for this crate runs tests in a single binary
+        // serially (no parallel backend access — see file header), so the
+        // temporary env-var mutation is fine.
+        unsafe { std::env::set_var("FORGE_FA2_PAGED", "0") };
+        let f_out_fallback = backend
             .paged_attention(
                 &f_q16,
                 &f_k16,
@@ -733,22 +755,23 @@ fn paged_attention_cuda_matches_default_impl() {
         backend.synchronize().unwrap();
         unsafe { std::env::remove_var("FORGE_FA2_PAGED") };
 
-        let f_out_f32 = backend.cast(&f_out16, DType::F32).unwrap();
-        let f_out_host = backend.copy_to_host_f32(&f_out_f32).unwrap();
-
         let f_max_abs_val = f_ref_host.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
-        let f_diff = f_out_host
-            .iter()
-            .zip(&f_ref_host)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        // FA2 fp16 vs reference f32: 1% is the usual FA2 fp16 error floor.
         let f_tol = 1e-2_f32.max(f_max_abs_val * 1e-2);
-        assert!(
-            f_diff < f_tol,
-            "FA2 paged decode (head_dim=128, block_size=256) F16 vs F32 ref: max abs diff {f_diff} > tol {f_tol} (ref max abs {f_max_abs_val})\n  out[0..8] = {:?}\n  ref[0..8] = {:?}",
-            &f_out_host[..f_out_host.len().min(8)],
-            &f_ref_host[..f_ref_host.len().min(8)],
-        );
+
+        for (label, out16) in [("FA2", &f_out_fa2), ("fallback", &f_out_fallback)] {
+            let out_f32 = backend.cast(out16, DType::F32).unwrap();
+            let out_host = backend.copy_to_host_f32(&out_f32).unwrap();
+            let diff = out_host
+                .iter()
+                .zip(&f_ref_host)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                diff < f_tol,
+                "paged decode {label} (head_dim=128, block_size=256) F16 vs F32 ref: max abs diff {diff} > tol {f_tol} (ref max abs {f_max_abs_val})\n  out[0..8] = {:?}\n  ref[0..8] = {:?}",
+                &out_host[..out_host.len().min(8)],
+                &f_ref_host[..f_ref_host.len().min(8)],
+            );
+        }
     }
 }

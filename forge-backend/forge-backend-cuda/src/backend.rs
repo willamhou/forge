@@ -1523,27 +1523,30 @@ impl CudaBackend {
                     )));
                 }
 
-                // FA2 paged decode path (opt-in via FORGE_FA2_PAGED=1) — uses
-                // `flash_fwd_kvcache` against forge's block pool. Same memory
-                // layout in both: `[num_blocks, block_size, num_kv_heads * head_dim]`
-                // and FA2's `[num_blocks, page_block_size, num_heads_k, head_dim]`
+                // FA2 paged decode path — uses `flash_fwd_kvcache` against
+                // forge's block pool. Same memory layout in both:
+                // `[num_blocks, block_size, num_kv_heads * head_dim]` and
+                // FA2's `[num_blocks, page_block_size, num_heads_k, head_dim]`
                 // are byte-equivalent.
                 //
-                // Hard gates baked into FA2 (kept here to fail loudly instead of
-                // silently falling back):
-                //   - `page_block_size % 256 == 0` (FA2 splitkv inner-loop alignment).
-                //   - `head_dim ∈ {32, 64, 96, 128, 192, 256}` (instantiated templates).
-                // The env opt-in lets us land the path safely; gating is removed
-                // once the bench validates correctness and perf.
+                // Default: FA2 runs whenever the shape is eligible
+                // (`fa2_paged_eligible`). Kill switch: `FORGE_FA2_PAGED=0`
+                // (or `=false`, case-insensitive) forces the split-KV
+                // fallback. Anything else, including absent variable, takes
+                // FA2. NOTE: this is a behaviour change from the previous
+                // opt-in semantics — users who had `FORGE_FA2_PAGED=on`
+                // previously saw fallback; now they see FA2.
+                //
+                // We are inside the `DType::F16 => { ... }` arm of
+                // `match q.dtype()` above, so pass `DType::F16` literally
+                // (there is no `dtype` binding in scope).
                 #[cfg(feature = "flash-attn")]
                 {
-                    let fa2_supported_hdim = matches!(head_dim, 32 | 64 | 96 | 128 | 192 | 256);
-                    let block_size_aligned = block_size % 256 == 0;
-                    let fa2_enabled = std::env::var("FORGE_FA2_PAGED")
+                    let fa2_killed = std::env::var("FORGE_FA2_PAGED")
                         .ok()
-                        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .filter(|v| v == "0" || v.eq_ignore_ascii_case("false"))
                         .is_some();
-                    if fa2_enabled && fa2_supported_hdim && block_size_aligned {
+                    if !fa2_killed && fa2_paged_eligible(head_dim, DType::F16, block_size) {
                         use cudarc::driver::DevicePtr;
                         // Hold the i32 scratch mutexes across the launch — the
                         // device pointers we hand to FA2 must outlive the kernel.
