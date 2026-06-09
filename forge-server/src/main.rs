@@ -104,6 +104,24 @@ fn parse_buckets(s: &str) -> anyhow::Result<Vec<u32>> {
     Ok(out)
 }
 
+/// CLI value that is either the literal `"auto"` (deferred to runtime
+/// resolution against the backend / model geometry) or a fixed integer.
+/// Used by `--block-size` and `--num-blocks`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AutoUsize {
+    Auto,
+    Fixed(usize),
+}
+
+pub(crate) fn parse_auto_usize(s: &str) -> Result<AutoUsize, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(AutoUsize::Auto);
+    }
+    s.parse::<usize>()
+        .map(AutoUsize::Fixed)
+        .map_err(|_| format!("expected 'auto' or a positive integer, got '{s}'"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -341,4 +359,36 @@ fn extract_token_str(config: &serde_json::Value, key: &str) -> String {
                 .or_else(|| v.get("content").and_then(|c| c.as_str()).map(String::from))
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests_auto_usize {
+    use super::{AutoUsize, parse_auto_usize};
+
+    #[test]
+    fn parses_auto_lowercase() {
+        assert!(matches!(parse_auto_usize("auto"), Ok(AutoUsize::Auto)));
+    }
+
+    #[test]
+    fn parses_auto_uppercase() {
+        assert!(matches!(parse_auto_usize("AUTO"), Ok(AutoUsize::Auto)));
+    }
+
+    #[test]
+    fn parses_fixed_integer() {
+        assert!(matches!(parse_auto_usize("256"), Ok(AutoUsize::Fixed(256))));
+    }
+
+    #[test]
+    fn parses_fixed_zero() {
+        // Parse succeeds; runtime bail lives in the resolve step (Task 6).
+        assert!(matches!(parse_auto_usize("0"), Ok(AutoUsize::Fixed(0))));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_auto_usize("abc").is_err());
+        assert!(parse_auto_usize("16x").is_err());
+    }
 }
