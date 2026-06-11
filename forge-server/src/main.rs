@@ -57,13 +57,15 @@ struct Cli {
     #[arg(long, default_value = "paged")]
     kv_cache: String,
 
-    /// Block size for paged KV cache (tokens per block)
-    #[arg(long, default_value = "16")]
-    block_size: usize,
+    /// Block size for paged KV cache. `auto` picks `Backend::preferred_block_size`
+    /// (CUDA + FA2-eligible → 256; else 16). Use an integer to override.
+    #[arg(long, default_value = "auto", value_parser = parse_auto_usize)]
+    block_size: AutoUsize,
 
-    /// Total number of KV cache blocks (paged cache only)
-    #[arg(long, default_value = "2048")]
-    num_blocks: usize,
+    /// Total number of KV cache blocks. `auto` keeps the default token
+    /// capacity (~32k) by computing `ceil(32_768 / block_size)`.
+    #[arg(long, default_value = "auto", value_parser = parse_auto_usize)]
+    num_blocks: AutoUsize,
 
     /// Enable CUDA-Graph capture for batched decode (CUDA + paged cache only;
     /// a no-op otherwise). Off by default.
@@ -122,6 +124,40 @@ pub(crate) fn parse_auto_usize(s: &str) -> Result<AutoUsize, String> {
         .map_err(|_| format!("expected 'auto' or a positive integer, got '{s}'"))
 }
 
+pub(crate) const DEFAULT_KV_TOKEN_CAPACITY: usize = 32_768;
+
+pub(crate) struct BlockConfig {
+    pub block_size: usize,
+    pub num_blocks: usize,
+}
+
+/// Resolve the user's `--block-size` / `--num-blocks` choices against the
+/// backend's preferred default and the fixed-token-capacity invariant.
+///
+/// - `Auto` block_size → `backend_preferred`.
+/// - `Auto` num_blocks → `ceil(DEFAULT_KV_TOKEN_CAPACITY / block_size)`.
+/// - `Fixed(0)` for either flag → bail with a helpful message.
+pub(crate) fn resolve_block_config(
+    block_size: AutoUsize,
+    num_blocks: AutoUsize,
+    backend_preferred: usize,
+) -> anyhow::Result<BlockConfig> {
+    let block_size = match block_size {
+        AutoUsize::Fixed(0) => anyhow::bail!("--block-size must be >= 1"),
+        AutoUsize::Fixed(n) => n,
+        AutoUsize::Auto => backend_preferred,
+    };
+    let num_blocks = match num_blocks {
+        AutoUsize::Fixed(0) => anyhow::bail!("--num-blocks must be >= 1"),
+        AutoUsize::Fixed(n) => n,
+        AutoUsize::Auto => DEFAULT_KV_TOKEN_CAPACITY.div_ceil(block_size).max(1),
+    };
+    Ok(BlockConfig {
+        block_size,
+        num_blocks,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -129,10 +165,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-
-    if cli.block_size == 0 {
-        anyhow::bail!("--block-size must be >= 1");
-    }
 
     // --- Load config ---
     let config_path = cli.model_path.join("config.json");
@@ -199,23 +231,41 @@ async fn run_server<B: Backend + Clone>(
     let chat_template = load_chat_template(&cli.model_path)?;
     info!("Chat template loaded");
 
+    // --- Resolve --block-size / --num-blocks (after backend is in scope) ---
+    let block_cfg = resolve_block_config(
+        cli.block_size,
+        cli.num_blocks,
+        backend.preferred_block_size(model_config.head_dim, model_config.dtype),
+    )?;
+    let block_size = block_cfg.block_size;
+    let num_blocks = block_cfg.num_blocks;
+    let block_label = match cli.block_size {
+        AutoUsize::Auto => "auto",
+        AutoUsize::Fixed(_) => "set",
+    };
+    let nb_label = match cli.num_blocks {
+        AutoUsize::Auto => "auto",
+        AutoUsize::Fixed(_) => "set",
+    };
+
     // --- Create engine components ---
     let kv_cache: Box<dyn forge_core::KvCache<T = B::Tensor> + Send + Sync> =
         match cli.kv_cache.as_str() {
             "paged" => {
                 let cache = PagedKvCache::new(
                     backend.clone(),
-                    cli.num_blocks,
-                    cli.block_size,
+                    num_blocks,
+                    block_size,
                     model_config.num_hidden_layers,
                     model_config.num_key_value_heads,
                     model_config.head_dim,
                     model_config.dtype,
                 )?;
                 info!(
-                    "Paged KV cache: {} blocks x {} tokens, kv_dim={}",
-                    cli.num_blocks,
-                    cli.block_size,
+                    "Paged KV cache: block_size={block_size} ({block_label}), \
+                     num_blocks={num_blocks} ({nb_label}), \
+                     capacity={} tokens, kv_dim={}",
+                    block_size * num_blocks,
                     model_config.num_key_value_heads * model_config.head_dim,
                 );
                 Box::new(cache)
@@ -390,5 +440,42 @@ mod tests_auto_usize {
     fn rejects_garbage() {
         assert!(parse_auto_usize("abc").is_err());
         assert!(parse_auto_usize("16x").is_err());
+    }
+
+    use super::resolve_block_config;
+
+    #[test]
+    fn resolve_auto_both_uses_backend_preference_and_keeps_capacity() {
+        let preferred = 256;
+        let cfg = resolve_block_config(AutoUsize::Auto, AutoUsize::Auto, preferred).unwrap();
+        assert_eq!(cfg.block_size, 256);
+        assert_eq!(cfg.num_blocks, 128); // ceil(32_768 / 256) = 128
+        assert_eq!(cfg.block_size * cfg.num_blocks, 32_768);
+    }
+
+    #[test]
+    fn resolve_explicit_block_size_overrides_backend() {
+        let cfg = resolve_block_config(AutoUsize::Fixed(16), AutoUsize::Auto, 256).unwrap();
+        assert_eq!(cfg.block_size, 16);
+        assert_eq!(cfg.num_blocks, 2_048); // 32_768 / 16
+    }
+
+    #[test]
+    fn resolve_zero_block_size_bails() {
+        let err = resolve_block_config(AutoUsize::Fixed(0), AutoUsize::Auto, 256);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_zero_num_blocks_bails() {
+        let err = resolve_block_config(AutoUsize::Auto, AutoUsize::Fixed(0), 256);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_keeps_explicit_num_blocks() {
+        let cfg = resolve_block_config(AutoUsize::Auto, AutoUsize::Fixed(4_096), 256).unwrap();
+        assert_eq!(cfg.block_size, 256);
+        assert_eq!(cfg.num_blocks, 4_096);
     }
 }
