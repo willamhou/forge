@@ -9,6 +9,54 @@ fn default_cache() -> CacheUsage {
     }
 }
 
+/// Guards the `ceil(prompt_len / block_size)` admission math in
+/// `continuous.rs` against the auto-resolved `block_size=256` default:
+/// a 4096-token prompt needs exactly 16 blocks. With 16 blocks total the
+/// prompt is admitted; with 15 it must be rejected (head-of-line rule).
+/// Together the two cases pin the ceil result to exactly 16.
+/// (This test lives in forge-scheduler because forge-kvcache has no
+/// dependency on the scheduler crate.)
+#[test]
+fn test_4096_token_prompt_needs_exactly_16_blocks_at_block_size_256() {
+    let prompt: Vec<u32> = (0..4_096).collect();
+
+    // Exactly 16 blocks available -> admitted.
+    let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
+    let cache_fits = CacheUsage {
+        total_blocks: 16,
+        used_blocks: 0,
+        block_size: 256,
+    };
+    scheduler
+        .enqueue(make_request("req-fits", prompt.clone()))
+        .unwrap();
+    let batch = scheduler.schedule(&cache_fits).unwrap();
+    assert_eq!(
+        batch.prefill_seqs.len(),
+        1,
+        "16 blocks must admit 4096 tokens"
+    );
+    assert_eq!(batch.prefill_seqs[0].token_ids.len(), 4_096);
+    assert!(batch.rejected.is_empty());
+
+    // One block short -> rejected outright (can never fit in total cache).
+    let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
+    let cache_short = CacheUsage {
+        total_blocks: 15,
+        used_blocks: 0,
+        block_size: 256,
+    };
+    scheduler
+        .enqueue(make_request("req-short", prompt))
+        .unwrap();
+    let batch = scheduler.schedule(&cache_short).unwrap();
+    assert!(
+        batch.prefill_seqs.is_empty(),
+        "15 blocks must not admit 4096 tokens"
+    );
+    assert_eq!(batch.rejected.len(), 1, "expected head-of-line rejection");
+}
+
 fn make_request(id: &str, tokens: Vec<u32>) -> InferenceRequest {
     InferenceRequest {
         request_id: id.to_string(),
