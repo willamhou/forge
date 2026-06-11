@@ -646,12 +646,13 @@ fn paged_attention_cuda_matches_default_impl() {
         );
     }
 
-    // ── FA2 paged-decode path (FORGE_FA2_PAGED=1) ─────────────────────────
+    // ── FA2 paged-decode path (default-on; FORGE_FA2_PAGED=0 = kill switch) ──
     //
     // Uses Qwen-class GQA geometry (head_dim=128, num_heads=8, num_kv_heads=2)
     // with the FA2-mandated block_size=256. With kv_len=1280 the seq spans 5
-    // blocks; FA2's split-KV heuristic decides num_splits internally. Compares
-    // against the same F32 reference path as the split-KV block above.
+    // blocks; FA2's split-KV heuristic decides num_splits internally. Runs a
+    // differential check: env unset (FA2 default) and FORGE_FA2_PAGED=0
+    // (split-KV fallback), both compared against the same F32 reference.
     #[cfg(feature = "flash-attn")]
     {
         let f_num_heads = 8;

@@ -1515,19 +1515,17 @@ impl CudaBackend {
                 Ok(())
             }
             DType::F16 => {
-                // The split kernel lays head_dim across a warp's 32 lanes with up
-                // to PA_MAX_DIMS_PER_LANE=4 dims/lane, so it supports head_dim<=128.
-                if head_dim > 128 {
-                    return Err(ForgeError::InvalidArgument(format!(
-                        "paged_attention_into: split-KV F16 path supports head_dim<=128, got {head_dim}"
-                    )));
-                }
-
                 // FA2 paged decode path — uses `flash_fwd_kvcache` against
                 // forge's block pool. Same memory layout in both:
                 // `[num_blocks, block_size, num_kv_heads * head_dim]` and
                 // FA2's `[num_blocks, page_block_size, num_heads_k, head_dim]`
                 // are byte-equivalent.
+                //
+                // Checked BEFORE the split-KV head_dim<=128 guard below:
+                // FA2 templates cover head_dim up to 256, so eligible
+                // 192/256-dim shapes must reach FA2 rather than die on the
+                // split-KV limit (`fa2_paged_eligible` and this dispatch
+                // must agree — see the helper's doc).
                 //
                 // Default: FA2 runs whenever the shape is eligible
                 // (`fa2_paged_eligible`). Kill switch: `FORGE_FA2_PAGED=0`
@@ -1611,6 +1609,18 @@ impl CudaBackend {
                         }
                         return Ok(());
                     }
+                }
+                // The split kernel lays head_dim across a warp's 32 lanes with up
+                // to PA_MAX_DIMS_PER_LANE=4 dims/lane, so it supports head_dim<=128.
+                // (head_dim 192/256 is only reachable through the FA2 branch above;
+                // with FA2 unavailable, killed, or block_size unaligned, those dims
+                // have no paged F16 path.)
+                if head_dim > 128 {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "paged_attention_into: split-KV F16 path supports head_dim<=128, got {head_dim}; \
+                         head_dim 192/256 requires the FA2 path (flash-attn feature, block_size % 256 == 0, \
+                         FORGE_FA2_PAGED not set to 0)"
+                    )));
                 }
                 // Split-KV flash-decoding. Pick num_splits from the longest seq
                 // in the batch so the (num_seqs * num_heads * num_splits)-block
@@ -4682,6 +4692,15 @@ mod tests_block_size_auto {
     #[test]
     fn fa2_eligible_qwen_class_shape() {
         assert!(fa2_paged_eligible(128, DType::F16, 256));
+    }
+
+    /// head_dim 192/256 are FA2-template-supported and must be eligible —
+    /// the dispatch site checks FA2 *before* the split-KV head_dim<=128
+    /// guard so these dims reach FA2 rather than dying on the split limit.
+    #[test]
+    fn fa2_eligible_large_head_dims() {
+        assert!(fa2_paged_eligible(192, DType::F16, 256));
+        assert!(fa2_paged_eligible(256, DType::F16, 256));
     }
 
     #[test]
