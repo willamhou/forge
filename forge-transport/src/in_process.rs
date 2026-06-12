@@ -20,10 +20,7 @@ impl InProcessTransport {
     }
 
     /// Submit an inference request and get a channel for receiving events.
-    pub async fn submit(
-        &self,
-        req: InferenceRequest,
-    ) -> Result<mpsc::Receiver<EngineEvent>> {
+    pub async fn submit(&self, req: InferenceRequest) -> Result<mpsc::Receiver<EngineEvent>> {
         let (event_tx, event_rx) = mpsc::channel(256);
         let engine_req = EngineRequest {
             inference_req: req,

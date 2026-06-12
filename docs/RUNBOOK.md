@@ -142,10 +142,39 @@ curl -s http://localhost:8080/v1/chat/completions \
 **Symptom:** `ForgeError::OutOfMemory(...)`.
 
 **Actions:**
-1. Reduce `--num-blocks` (default 2048) to lower KV cache memory
+1. Reduce `--num-blocks` (default `auto` ≈ 32k token capacity) to lower KV cache memory
 2. Reduce `max_tokens` in requests
 3. Use a smaller model
 4. Reduce `--max-batch-size` to limit concurrent sequences
+
+### When to override `--block-size`
+
+The default is `auto`, which resolves to 256 on CUDA + FA2-eligible
+models (head_dim ∈ {32, 64, 96, 128, 192, 256}, F16) and to 16
+otherwise. The startup log shows the resolved value:
+`Paged KV cache: block_size=256 (auto), num_blocks=128 (auto), ...`.
+
+Set the flag explicitly when:
+
+- **CPU backend debugging.** `--block-size 16` keeps per-sequence KV
+  allocation small; 256 is wasteful when there is no FA2 to consume it.
+- **Short-context benchmarking.** At `block_size=256` an active sequence
+  can carry up to 255 tokens of internal fragmentation in its tail block
+  (vs 15 at the old default). For very short generations the working-set
+  waste can matter; pin `--block-size 16`.
+- **Reproducing FA2 vs split-KV comparisons.** Lock 16 and 256
+  explicitly rather than relying on the auto default.
+
+### `FORGE_FA2_PAGED=0` kill switch
+
+The FA2 paged-decode dispatch path has no runtime fallback. If a new
+model geometry triggers a CUDA error from inside `flash_fwd_kvcache`,
+set `FORGE_FA2_PAGED=0` (or `=false`, case-insensitive) to force the
+split-KV fallback without changing the block size.
+
+Note the semantics flip from the original opt-in: any value other than
+`0` / `false` (including `=1`, `=on`, `=enabled`, or absence) leaves FA2
+**enabled**. The only disabling values are `=0` and `=false`.
 
 ### Request rejected with "prompt exceeds max_prefill_tokens"
 

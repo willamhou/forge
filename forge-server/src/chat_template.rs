@@ -26,11 +26,7 @@ impl ChatTemplate {
         Self::with_tokens(template_str, "", "")
     }
 
-    pub fn with_tokens(
-        template_str: &str,
-        bos_token: &str,
-        eos_token: &str,
-    ) -> Result<Self> {
+    pub fn with_tokens(template_str: &str, bos_token: &str, eos_token: &str) -> Result<Self> {
         let mut env = Environment::new();
         // HF chat templates (Qwen3, Llama-3, …) call Python string methods like
         // `.startswith()` / `.endswith()`. minijinja doesn't implement these

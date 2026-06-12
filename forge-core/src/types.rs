@@ -9,6 +9,9 @@ pub enum DType {
     I4,
     Q4K,
     Q8K,
+    /// GGUF-compatible Q8_0: 32 elements per block, 34 bytes per block
+    /// (f16 scale + 32 × i8). See [`DType::quant_block`].
+    Q8_0,
 }
 
 impl DType {
@@ -19,7 +22,24 @@ impl DType {
             DType::I8 => 1,
             DType::I4 => 1, // packed: 2 values per byte, but min alloc is 1 byte
             DType::Q4K | DType::Q8K => 1, // block-quantized, varies
+            DType::Q8_0 => 1, // block-quantized: 34 bytes / 32 elements
         }
+    }
+
+    /// Block layout for block-quantized dtypes: `(elements_per_block, bytes_per_block)`.
+    ///
+    /// Returns `None` for non-quantized dtypes. Q8_0 packs 32 elements into a
+    /// 34-byte block (2-byte f16 scale + 32 × i8), matching GGUF `block_q8_0`.
+    pub fn quant_block(&self) -> Option<(usize, usize)> {
+        match self {
+            DType::Q8_0 => Some((32, 34)),
+            _ => None,
+        }
+    }
+
+    /// Whether this dtype is block-quantized (has a [`DType::quant_block`] layout).
+    pub fn is_quantized(&self) -> bool {
+        self.quant_block().is_some()
     }
 }
 

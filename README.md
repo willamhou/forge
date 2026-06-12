@@ -67,8 +67,8 @@ cargo run --release -- --model-path /path/to/model --port 8080
 | `--max-batch-size` | 256 | Max concurrent sequences |
 | `--max-prefill-tokens` | 4096 | Max prefill tokens per step |
 | `--device` | 0 | CUDA device ordinal |
-| `--block-size` | 16 | Paged cache block size (tokens) |
-| `--num-blocks` | 2048 | Total KV cache blocks |
+| `--block-size` | auto | Paged cache block size (tokens). `auto` picks 256 when CUDA + FA2 + F16 model conditions hold, else 16. Integer overrides. |
+| `--num-blocks` | auto | Total KV cache blocks. `auto` keeps ~32k token capacity: `ceil(32768 / block_size)`. |
 
 ## API
 

@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     let backend = CudaBackend::new(cli.device)?;
     let loader = SafeTensorsLoader::new(&cli.model_path)?;
-    let model = load_transformer(&loader, config.clone(), &backend)?;
+    let model = load_transformer(&loader, config.clone(), &backend, false)?;
     println!(
         "== graph_decode spike: {} layers ==",
         config.num_hidden_layers

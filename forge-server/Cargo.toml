@@ -6,7 +6,10 @@ license.workspace = true
 
 [features]
 default = ["cuda"]
-cuda = ["dep:forge-backend-cuda"]
+# `cuda` enables FlashAttention v2 for the prefill path (multi_head_attention);
+# decode uses paged attention and is unaffected. FA2 is a big prefill speedup
+# (the naive fallback materialises the full [seq, seq] scores).
+cuda = ["dep:forge-backend-cuda", "forge-backend-cuda/flash-attn"]
 
 [dependencies]
 forge-core.workspace = true

@@ -37,7 +37,11 @@ fn paged_pool_device_roundtrip() {
         &src_a[..],
         "blocks 0+1 should hold src_a"
     );
-    assert_eq!(&pool_after_a[12..24], &[0.0_f32; 12], "blocks 2+3 untouched");
+    assert_eq!(
+        &pool_after_a[12..24],
+        &[0.0_f32; 12],
+        "blocks 2+3 untouched"
+    );
 
     // ── Test 2: scattered write into non-contiguous slots ─────────────
     //
@@ -47,7 +51,9 @@ fn paged_pool_device_roundtrip() {
     //   slot 7 = block 3, position 1
     //   slot 5 = block 2, position 1
     // Mapping is NOT monotonic → coalescing must NOT merge runs.
-    let src_b: Vec<f32> = vec![100.0, 101.0, 102.0, 200.0, 201.0, 202.0, 300.0, 301.0, 302.0];
+    let src_b: Vec<f32> = vec![
+        100.0, 101.0, 102.0, 200.0, 201.0, 202.0, 300.0, 301.0, 302.0,
+    ];
     let src_b_t = backend
         .copy_from_host_f32(&src_b, &[3, 3])
         .expect("src_b upload");
@@ -130,8 +136,9 @@ fn paged_pool_device_roundtrip() {
         .expect("F16 pool alloc");
 
     // Build an F16 source: 4 tokens of kv_dim=3.
-    let src_f16_data: Vec<half::f16> =
-        (0..12).map(|i| half::f16::from_f32(i as f32 * 0.25)).collect();
+    let src_f16_data: Vec<half::f16> = (0..12)
+        .map(|i| half::f16::from_f32(i as f32 * 0.25))
+        .collect();
     let src_f16 = backend
         .copy_from_host_f16(&src_f16_data, &[4, 3])
         .expect("F16 src upload");
@@ -151,8 +158,7 @@ fn paged_pool_device_roundtrip() {
     // Cast back to F32 for value comparison.
     let gathered_as_f32 = backend.cast(&gathered_f16, DType::F32).unwrap();
     let g_f32 = backend.copy_to_host_f32(&gathered_as_f32).unwrap();
-    let expected_f32: Vec<f32> =
-        src_f16_data.iter().map(|h| h.to_f32()).collect();
+    let expected_f32: Vec<f32> = src_f16_data.iter().map(|h| h.to_f32()).collect();
     for (i, (got, want)) in g_f32.iter().zip(&expected_f32).enumerate() {
         assert!(
             (got - want).abs() < 1e-3,
@@ -161,9 +167,7 @@ fn paged_pool_device_roundtrip() {
     }
 
     // Mixed dtype rejected (F32 src into F16 pool).
-    let src_wrong_dtype = backend
-        .copy_from_host_f32(&[0.0; 12], &[4, 3])
-        .unwrap();
+    let src_wrong_dtype = backend.copy_from_host_f32(&[0.0; 12], &[4, 3]).unwrap();
     let _ = backend
         .paged_write_kv(&mut pool_f16, &src_wrong_dtype, &[0, 1, 2, 3])
         .expect_err("F32 src into F16 pool should fail");

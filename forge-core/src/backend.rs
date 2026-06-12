@@ -76,6 +76,15 @@ pub trait Backend: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn device_count(&self) -> usize;
 
+    /// Preferred KV-cache block size for this backend and model geometry.
+    ///
+    /// Backends override this when a fast attention path imposes shape
+    /// requirements (e.g. CudaBackend returns 256 when FA2 paged decode
+    /// is eligible). Default is 16, which all backends accept.
+    fn preferred_block_size(&self, _head_dim: usize, _dtype: DType) -> usize {
+        16
+    }
+
     // Allocation
     fn allocate(&self, shape: &[usize], dtype: DType) -> Result<Self::Tensor>;
     fn allocate_zeros(&self, shape: &[usize], dtype: DType) -> Result<Self::Tensor>;
@@ -85,6 +94,33 @@ pub trait Backend: Send + Sync + 'static {
     fn copy_from_host_f16(&self, data: &[half::f16], shape: &[usize]) -> Result<Self::Tensor>;
     fn copy_from_host_bf16(&self, data: &[half::bf16], shape: &[usize]) -> Result<Self::Tensor>;
     fn copy_to_host_f32(&self, tensor: &Self::Tensor) -> Result<Vec<f32>>;
+
+    /// Host-side quantize an f16 weight buffer into GGUF-compatible Q8_0 blocks
+    /// (32 elements / 34 bytes per block). Used by the quantized-decode weight
+    /// loader. Backends without a quantized-decode path (CPU today) return
+    /// [`crate::ForgeError::InvalidArgument`]; the default impl does the same so
+    /// backends opt in explicitly. Only ever called when quantized decode is
+    /// enabled — with it off, no backend method below is touched.
+    fn quantize_q8_0_host(&self, _data: &[half::f16]) -> Result<Vec<u8>> {
+        Err(crate::ForgeError::InvalidArgument(
+            "quantize_q8_0_host not supported on this backend".into(),
+        ))
+    }
+
+    /// Upload raw block-quantized bytes to the device and wrap them in a
+    /// quantized tensor. `shape` is the logical (dequantized) element shape and
+    /// `dtype` must be quantized ([`DType::is_quantized`]). Pairs with
+    /// [`Self::quantize_q8_0_host`]; same opt-in contract.
+    fn copy_from_host_quant(
+        &self,
+        _bytes: &[u8],
+        _shape: &[usize],
+        _dtype: DType,
+    ) -> Result<Self::Tensor> {
+        Err(crate::ForgeError::InvalidArgument(
+            "copy_from_host_quant not supported on this backend".into(),
+        ))
+    }
 
     // Synchronization
     fn synchronize(&self) -> Result<()>;
@@ -200,6 +236,29 @@ pub trait Backend: Send + Sync + 'static {
         }
         *out = self.matmul(a, b)?;
         Ok(())
+    }
+
+    /// Quantized matmul into a caller-provided output buffer:
+    /// `out = a · wᵀ`.
+    ///
+    /// - `a`: f16 activation, shape `[m, k]` (row-major)
+    /// - `w`: block-quantized weight, shape `[n, k]` (row-major; row `j` is the
+    ///   weight for output column `j`, stored as `k / block` quant blocks)
+    /// - `out`: f16, shape `[m, n]` (row-major)
+    ///
+    /// This is the memory-traffic-reduced decode GEMV: the weight is read in
+    /// its quantized form and dequantized on the fly. Backends that lack a
+    /// quantized kernel (CPU today) return [`crate::ForgeError::InvalidArgument`];
+    /// the default impl does the same so backends opt in explicitly.
+    fn matmul_quant_into(
+        &self,
+        _out: &mut Self::Tensor,
+        _a: &Self::Tensor,
+        _w: &Self::Tensor,
+    ) -> Result<()> {
+        Err(crate::ForgeError::InvalidArgument(
+            "matmul_quant_into not supported on this backend".into(),
+        ))
     }
 
     /// Element-wise add, writing into a caller-provided output buffer.
@@ -1259,7 +1318,12 @@ pub trait Backend: Send + Sync + 'static {
         {
             return Err(crate::ForgeError::InvalidArgument(format!(
                 "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
-                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
+                temps.len(),
+                min_ps.len(),
+                top_ks.len(),
+                top_ps.len(),
+                seeds.len(),
+                steps.len()
             )));
         }
         let host = self.copy_to_host_f32(logits)?;
@@ -1409,4 +1473,13 @@ pub trait Backend: Send + Sync + 'static {
     fn decode_capture_epoch(&self) -> u64 {
         0
     }
+
+    /// Hint that the decode input scratch (token indices, RoPE cos/sin, paged
+    /// block tables / kv lens) has already been uploaded by
+    /// `stage_decode_inputs` for the current step. While set, capture-path ops
+    /// (`embedding_into`, RoPE, `paged_attention_into`) skip their own H2D
+    /// upload of that same data — eliminating redundant memcpy nodes from the
+    /// captured decode graph (and redundant copies on the eager path). The
+    /// caller must clear it after the decode forward. Default: no-op.
+    fn set_decode_inputs_prestaged(&self, _prestaged: bool) {}
 }

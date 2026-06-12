@@ -5,6 +5,6 @@ pub mod gguf;
 pub mod gguf_dequant;
 pub mod safetensors;
 
+pub use self::safetensors::SafeTensorsLoader;
 pub use config::LlamaConfig;
 pub use gguf::GgufLoader;
-pub use self::safetensors::SafeTensorsLoader;

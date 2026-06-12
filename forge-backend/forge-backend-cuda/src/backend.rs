@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+    LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use forge_core::{
@@ -13,6 +16,31 @@ use forge_core::{
 
 use crate::decode_graph::DecodeGraphRunner;
 use crate::tensor::CudaTensor;
+
+/// Head dims for which FA2 templates are instantiated in
+/// `forge-flash/csrc/flash_attn/src/flash_fwd_launch_template.h`.
+#[cfg(feature = "flash-attn")]
+const FA2_SUPPORTED_HEAD_DIMS: [usize; 6] = [32, 64, 96, 128, 192, 256];
+
+/// Canonical FA2 paged-decode eligibility predicate.
+///
+/// Both `CudaBackend::preferred_block_size` (probes with candidate
+/// `block_size = 256`) and the dispatch gate in `paged_attention_into_impl`
+/// route through this function. Mirrors dispatch reality: only the
+/// `DType::F16` arm currently reaches the FA2 branch — BF16 / F32 hit
+/// `UnsupportedDtype` at the match-default arm. When BF16 support is added
+/// to the dispatch later, widen the `dtype` clause here once and both call
+/// sites pick it up.
+#[cfg(feature = "flash-attn")]
+pub(crate) fn fa2_paged_eligible(
+    head_dim: usize,
+    dtype: forge_core::DType,
+    block_size: usize,
+) -> bool {
+    matches!(dtype, forge_core::DType::F16)
+        && FA2_SUPPORTED_HEAD_DIMS.contains(&head_dim)
+        && block_size % 256 == 0
+}
 
 struct KernelFunctions {
     add_f32: CudaFunction,
@@ -42,6 +70,10 @@ struct KernelFunctions {
     embedding_f16: CudaFunction,
     rope_f16: CudaFunction,
     transpose_f16: CudaFunction,
+    /// Specialized small-m transpose for the cuBLASLt col-major matmul output.
+    /// Read coalesced into shared, write coalesced — naive `transpose_f16` wrote
+    /// with stride n which on the Lt path was eating ~5 ms of the algo win.
+    transpose_narrow_f16: CudaFunction,
     split_qkv_f32: CudaFunction,
     cast_f16_to_f32: CudaFunction,
     cast_f32_to_f16: CudaFunction,
@@ -58,7 +90,13 @@ struct KernelFunctions {
     batched_decode_attention_f16: CudaFunction,
     // Paged attention (decode)
     paged_attention_f32: CudaFunction,
+    /// Naive single-pass F16 paged attention. Superseded on the decode path by
+    /// the split-KV pair below (kept loaded as a numerical reference / fallback).
+    #[allow(dead_code)]
     paged_attention_f16: CudaFunction,
+    // Split-KV flash-decoding (fast F16 decode attention)
+    paged_attention_f16_split: CudaFunction,
+    paged_attention_f16_combine: CudaFunction,
 
     scatter_kv_f32: CudaFunction,
     scatter_kv_f16: CudaFunction,
@@ -69,6 +107,8 @@ struct KernelFunctions {
     sample_gumbel_f16: CudaFunction,
     sample_perrow_f32: CudaFunction,
     sample_perrow_f16: CudaFunction,
+    // Quantized GEMV (Q8_0 weight, f16 activation/output)
+    gemv_q8_0_f16: CudaFunction,
 }
 
 // CudaBackend is Clone for sharing with components like NaiveKvCache,
@@ -80,6 +120,29 @@ pub struct CudaBackend {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) blas: Arc<CudaBlas>,
+    /// Lazily-initialized cuBLASLt path for the f16 matmul. cuBLASLt's
+    /// heuristic, when fed a native row-major-equivalent descriptor
+    /// (transa=transb=T over the row-major buffers interpreted as col-major
+    /// transposes), picks `nvjet_sm121_*_tmaAB` on Blackwell — same kernel
+    /// pega selects on the same workload. Classic `CudaBlas::gemm` with the
+    /// swap trick lands on `cutlass_80_wmma_*` (Ampere-era), which costs
+    /// 1.5–1.8× more on the attn_proj / down_proj decode shapes. Result of
+    /// the native call lands col-major, so we transpose via `transpose_f16`
+    /// into the caller's row-major output buffer — see `matmul_into_lt_f16`.
+    ///
+    /// We hold the raw `cublasLtHandle_t` + a 32 MiB workspace + a per-shape
+    /// cache of `(matmul_desc, a/b/c layouts, algo)`. cudarc's `Matmul::matmul`
+    /// runs `cublasLtMatmulAlgoGetHeuristic` AS PART OF EVERY CALL — fine for a
+    /// microbench, ruinous in a hot decode loop where ~5 unique shapes get hit
+    /// 36×K times per second. Caching the heuristic per shape gets us the
+    /// algo-level win the microbench promised (nvjet vs cutlass) without
+    /// burning ~100–500 μs per matmul on a re-search the answer can't change.
+    ///
+    /// Lazy because the 32 MiB workspace allocation isn't free and parallel
+    /// `cargo test` had us racing N × 32 MB simultaneous allocations into
+    /// out-of-memory / spurious `CUBLAS_STATUS_EXECUTION_FAILED` errors on
+    /// classic GEMM calls in other tests sharing the device.
+    pub(crate) blas_lt: Arc<Mutex<Option<LtCache>>>,
     kernels: Arc<KernelFunctions>,
     _module_f32: Arc<CudaModule>,
     _module_f16: Arc<CudaModule>,
@@ -105,6 +168,255 @@ pub struct CudaBackend {
     /// op can be recorded in a captured graph (the old `paged_write_kv`
     /// host-loop bakes destinations into memcpy nodes — not replay-safe).
     scatter_slot_mapping: Arc<Mutex<I32Scratch>>,
+    /// When true, the decode input scratch (token indices, RoPE cos/sin, paged
+    /// block tables / kv lens) was already uploaded by `stage_decode_inputs`
+    /// this step, so `embedding_into` / RoPE / `paged_attention_into` skip their
+    /// own redundant H2D upload of that data. Set around the captured
+    /// `compute_decode` forward; off everywhere else (prefill / eager `forward`
+    /// still upload normally). Eliminates redundant memcpy nodes that otherwise
+    /// bloat the captured decode graph and slow every replay.
+    decode_inputs_prestaged: Arc<AtomicBool>,
+    /// Persistent device scratch for FlashAttention's softmax log-sum-exp output.
+    /// FA2 always writes a `[batch, num_heads, seqlen_q]` f32 LSE buffer; in
+    /// forward-only inference we never read it back, so we hand the kernel this
+    /// reused backend-owned buffer instead of `cudaMalloc`/`cudaFree`-ing per
+    /// call. That per-call free also forced a `cudaStreamSynchronize` after every
+    /// layer's attention, serializing prefill — eliminating it restores CPU/GPU
+    /// overlap. Grows monotonically; never freed until the backend drops.
+    flash_lse: Arc<Mutex<CudaSlice<f32>>>,
+    /// Persistent device scratch for the split-KV (flash-decoding) paged
+    /// attention partials. The main `paged_attention_f16_split` kernel writes
+    /// per-(seq,head,split) {out, running-max m, running-sum l} here, and the
+    /// `paged_attention_f16_combine` kernel reads them back. Pure write-then-read
+    /// scratch (never observed by the host), but because the attention runs on
+    /// the captured `compute_decode` path, the buffers must have STABLE device
+    /// pointers across replays — a grow bumps `version`, which feeds
+    /// `decode_capture_epoch` so the engine re-captures when the geometry
+    /// (num_seqs*num_heads*num_splits) outgrows the current allocation.
+    paged_split_partials: Arc<Mutex<SplitPartials>>,
+    /// Persistent device scratch for the cuBLASLt f16 matmul path. The native
+    /// descriptor writes a col-major (m,n) result; we read it back as the
+    /// row-major [n,m] bytes and `transpose_f16` it into the caller's [m,n]
+    /// output. This buffer holds that intermediate. Grows monotonically (max
+    /// over all batch-decode GEMM output sizes); bumps `version` on grow so
+    /// `decode_capture_epoch` triggers re-capture if a captured graph baked
+    /// the prior pointer.
+    matmul_lt_scratch: Arc<Mutex<MatmulLtScratch>>,
+    /// Persistent f32 split-KV partial scratch for the FA2 paged-decode path
+    /// (`forge_flash_attn_fwd_kvcache`). `oaccum` holds the per-split output
+    /// accumulator (shape `[num_splits_cap, b, h, seqlen_q, d_rounded]`) and
+    /// `lseaccum` holds the per-split log-sum-exp accumulator
+    /// (`[num_splits_cap, b, h, seqlen_q]`). FA2's reduction step folds them
+    /// into the final out/softmax_lse before returning. Pure write-then-read
+    /// scratch, never observed on the host. Grows geometrically; size is the
+    /// max over all decode geometries the engine has seen.
+    ///
+    /// `version` bumps on any reallocation so `decode_capture_epoch`
+    /// invalidates any captured decode graph that baked the prior pointers.
+    flash_paged_scratch: Arc<Mutex<FlashPagedScratch>>,
+    /// Cached SM count of the active CUDA device. Needed by FA2's split-KV
+    /// occupancy heuristic; queried once at backend init so the hot path
+    /// doesn't repeat the driver call.
+    pub(crate) num_sm: i32,
+}
+
+/// Backend-owned f16 scratch for the cuBLASLt matmul path's col-major
+/// intermediate output. See `matmul_lt_scratch`.
+struct MatmulLtScratch {
+    buf: CudaSlice<half::f16>,
+    version: u64,
+}
+
+/// Backend-owned f32 split-KV scratch for the FA2 paged-decode path. See
+/// `flash_paged_scratch`. Both buffers track the same `version` since they
+/// always grow together (sized by the same geometry).
+struct FlashPagedScratch {
+    oaccum: CudaSlice<f32>,
+    lseaccum: CudaSlice<f32>,
+    version: u64,
+}
+
+/// Raw cuBLASLt handle + 32 MiB workspace + per-shape cache. We bypass
+/// cudarc's safe `CudaBlasLT` / `Matmul` wrappers entirely because they
+/// re-run the heuristic search on every call (creating fresh layouts/desc/pref
+/// each time, then `cublasLtMatmulAlgoGetHeuristic`) — which costs 100–500 μs
+/// per call and completely consumes the algo-level win the native descriptor
+/// gives us. Cache hits go straight to `cublasLtMatmul` with pre-built handles.
+///
+/// `LtCache` is created on first use of the Lt path; subsequent matmuls on the
+/// same `(m, k, n)` reuse the cached entry. The cached pointers (layouts,
+/// desc) are heap-managed by cuBLASLt; `Drop` calls the matching destroy fns.
+pub(crate) struct LtCache {
+    handle: lt_sys::cublasLtHandle_t,
+    workspace: CudaSlice<u8>,
+    workspace_size: usize,
+    /// Keyed on the GEMM dims (m, k, n) — same dims hit the same descriptor +
+    /// layouts, so they hit the same heuristic answer. 5 shapes × 36 layers in
+    /// Qwen3-4B means this table is tiny.
+    shapes: HashMap<(usize, usize, usize), LtShape>,
+}
+
+/// Per-shape cached cuBLASLt resources: descriptor (transposes baked in), the
+/// three matrix-layout objects, and the heuristic's chosen algorithm.
+#[derive(Clone, Copy)]
+struct LtShape {
+    matmul_desc: lt_sys::cublasLtMatmulDesc_t,
+    a_layout: lt_sys::cublasLtMatrixLayout_t,
+    b_layout: lt_sys::cublasLtMatrixLayout_t,
+    c_layout: lt_sys::cublasLtMatrixLayout_t,
+    algo: lt_sys::cublasLtMatmulAlgo_t,
+}
+
+// SAFETY: cuBLASLt's handle and descriptor objects are thread-safe per the
+// CUDA docs; we only ever mutate the `shapes` HashMap behind a Mutex. The raw
+// pointers and POD algo struct are Send + Sync by themselves.
+unsafe impl Send for LtCache {}
+unsafe impl Sync for LtCache {}
+unsafe impl Send for LtShape {}
+unsafe impl Sync for LtShape {}
+
+impl Drop for LtCache {
+    fn drop(&mut self) {
+        // Destroy per-shape resources first, then the handle.
+        for (_, s) in self.shapes.drain() {
+            unsafe {
+                let _ = lt_result::destroy_matmul_desc(s.matmul_desc);
+                let _ = lt_result::destroy_matrix_layout(s.a_layout);
+                let _ = lt_result::destroy_matrix_layout(s.b_layout);
+                let _ = lt_result::destroy_matrix_layout(s.c_layout);
+            }
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                let _ = lt_result::destroy_handle(self.handle);
+            }
+        }
+    }
+}
+
+impl LtCache {
+    /// Allocate the handle + 32 MiB workspace (4 MiB on pre-Hopper, mirroring
+    /// cudarc's `Workspace::new` policy). Called lazily on first Lt matmul.
+    fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt bind_to_thread: {e:?}")))?;
+        let handle = lt_result::create_handle()
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt create_handle: {e:?}")))?;
+        let major = stream
+            .context()
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt query SM: {e:?}")))?;
+        let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 };
+        let workspace = unsafe { stream.alloc::<u8>(workspace_size) }
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt workspace alloc: {e:?}")))?;
+        Ok(Self {
+            handle,
+            workspace,
+            workspace_size,
+            shapes: HashMap::new(),
+        })
+    }
+
+    /// Return cached `LtShape` for `(m, k, n)`, building it on miss.
+    ///
+    /// All of forge's Lt-path matmuls use the same descriptor recipe — f16
+    /// matrices, f32 compute, transa=transb=T, transc=F, no epilogue — so
+    /// only the matrix DIMS vary. We bake the transposes into the descriptor
+    /// once and run the heuristic exactly once per shape.
+    fn shape(&mut self, m: usize, k: usize, n: usize) -> Result<LtShape> {
+        if let Some(s) = self.shapes.get(&(m, k, n)) {
+            return Ok(*s);
+        }
+        let matrix_type = lt_sys::cudaDataType_t::CUDA_R_16F;
+        let compute_type = lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+        let scale_type = lt_sys::cudaDataType_t::CUDA_R_32F;
+
+        // With transa=T: A is stored as (k, m) col-major, lda = k.
+        // With transb=T: B is stored as (n, k) col-major, ldb = n.
+        // C (output) is (m, n) col-major, ldc = m.
+        // See `examples/cublaslt_decode_gemm_probe.rs` for the derivation.
+        let a_layout = lt_result::create_matrix_layout(matrix_type, k as u64, m as u64, k as i64)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt a_layout: {e:?}")))?;
+        let b_layout = lt_result::create_matrix_layout(matrix_type, n as u64, k as u64, n as i64)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt b_layout: {e:?}")))?;
+        let c_layout = lt_result::create_matrix_layout(matrix_type, m as u64, n as u64, m as i64)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt c_layout: {e:?}")))?;
+
+        let matmul_desc = lt_result::create_matmul_desc(compute_type, scale_type)
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt matmul_desc: {e:?}")))?;
+        let one_i32: i32 = 1;
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                matmul_desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&one_i32) as *const _ as *const _,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt set TRANSA: {e:?}")))?;
+            lt_result::set_matmul_desc_attribute(
+                matmul_desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&one_i32) as *const _ as *const _,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt set TRANSB: {e:?}")))?;
+        }
+
+        // Preference is throwaway (heuristic-only); destroy after use.
+        let pref = lt_result::create_matmul_pref()
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt matmul_pref: {e:?}")))?;
+        unsafe {
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&self.workspace_size) as *const _ as *const _,
+                std::mem::size_of::<usize>(),
+            )
+            .map_err(|e| ForgeError::Cuda(format!("cublaslt set workspace pref: {e:?}")))?;
+        }
+
+        let heuristic = unsafe {
+            lt_result::get_matmul_algo_heuristic(
+                self.handle,
+                matmul_desc,
+                a_layout,
+                b_layout,
+                c_layout,
+                c_layout,
+                pref,
+            )
+        }
+        .map_err(|e| ForgeError::Cuda(format!("cublaslt heuristic: {e:?}")))?;
+
+        unsafe {
+            let _ = lt_result::destroy_matmul_pref(pref);
+        }
+
+        let shape = LtShape {
+            matmul_desc,
+            a_layout,
+            b_layout,
+            c_layout,
+            algo: heuristic.algo,
+        };
+        self.shapes.insert((m, k, n), shape);
+        Ok(shape)
+    }
+}
+
+/// Backend-owned scratch for split-KV paged attention. Three device buffers
+/// (out / m / l) grown together; `version` bumps on any reallocation so the
+/// CUDA-graph capture epoch can react to a pointer move. See
+/// `paged_split_partials`.
+struct SplitPartials {
+    out: CudaSlice<f32>, // [num_seqs * num_heads * num_splits * head_dim]
+    m: CudaSlice<f32>,   // [num_seqs * num_heads * num_splits]
+    l: CudaSlice<f32>,   // [num_seqs * num_heads * num_splits]
+    version: u64,
 }
 
 /// Monotonically-growing i32 device buffer. `version` increments on every
@@ -180,7 +492,7 @@ impl CudaBackend {
 
         // Compile F16 kernels — requires cuda_fp16.h from CUDA toolkit
         let f16_src = format!(
-            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "#include <cuda_fp16.h>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             forge_kernels::elementwise::F16_SRC,
             forge_kernels::norm::F16_SRC,
             forge_kernels::positional::F16_SRC,
@@ -189,6 +501,7 @@ impl CudaBackend {
             forge_kernels::decode_attention::F16_SRC,
             forge_kernels::paged_attention::F16_SRC,
             forge_kernels::sampling::F16_SRC,
+            forge_kernels::quantized::F16_SRC,
         );
         let cuda_include = Self::find_cuda_include()?;
         let ptx_f16 = cudarc::nvrtc::compile_ptx_with_opts(
@@ -244,6 +557,7 @@ impl CudaBackend {
             embedding_f16: load_f16("embedding_f16")?,
             rope_f16: load_f16("rope_f16")?,
             transpose_f16: load_f16("transpose_f16")?,
+            transpose_narrow_f16: load_f16("transpose_narrow_f16")?,
             cast_f16_to_f32: load_f16("cast_f16_to_f32")?,
             cast_f32_to_f16: load_f16("cast_f32_to_f16")?,
             split_qkv_f16: load_f16("split_qkv_f16")?,
@@ -260,6 +574,8 @@ impl CudaBackend {
             // Paged attention (decode)
             paged_attention_f32: load_f32("paged_attention_f32")?,
             paged_attention_f16: load_f16("paged_attention_f16")?,
+            paged_attention_f16_split: load_f16("paged_attention_f16_split")?,
+            paged_attention_f16_combine: load_f16("paged_attention_f16_combine")?,
             scatter_kv_f32: load_f32("scatter_kv_f32")?,
             scatter_kv_f16: load_f16("scatter_kv_f16")?,
             argmax_f32: load_f32("argmax_f32")?,
@@ -268,6 +584,7 @@ impl CudaBackend {
             sample_gumbel_f16: load_f16("sample_gumbel_f16")?,
             sample_perrow_f32: load_f32("sample_perrow_f32")?,
             sample_perrow_f16: load_f16("sample_perrow_f16")?,
+            gemv_q8_0_f16: load_f16("gemv_q8_0_f16")?,
         };
 
         // Initial scratch capacity. Grown on demand.
@@ -290,11 +607,40 @@ impl CudaBackend {
         let slot_mapping_buf = stream
             .alloc_zeros::<i32>(initial_scratch_cap)
             .map_err(|e| ForgeError::Cuda(format!("alloc scatter_slot_mapping: {e}")))?;
+        let flash_lse_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc flash_lse: {e}")))?;
+        let split_out = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_out: {e}")))?;
+        let split_m = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_m: {e}")))?;
+        let split_l = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc paged_split_l: {e}")))?;
+        let matmul_lt_buf = stream
+            .alloc_zeros::<half::f16>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc matmul_lt_scratch: {e}")))?;
+        let flash_paged_oaccum_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc flash_paged_oaccum: {e}")))?;
+        let flash_paged_lseaccum_buf = stream
+            .alloc_zeros::<f32>(initial_scratch_cap)
+            .map_err(|e| ForgeError::Cuda(format!("alloc flash_paged_lseaccum: {e}")))?;
+        let num_sm = stream
+            .context()
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .unwrap_or(16);
 
         Ok(Self {
             ctx,
             stream,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(Mutex::new(None)),
+            decode_inputs_prestaged: Arc::new(AtomicBool::new(false)),
             kernels: Arc::new(kernels),
             _module_f32: module_f32,
             _module_f16: module_f16,
@@ -332,7 +678,168 @@ impl CudaBackend {
                 version: 0,
                 host: vec![0i32; initial_scratch_cap],
             })),
+            flash_lse: Arc::new(Mutex::new(flash_lse_buf)),
+            paged_split_partials: Arc::new(Mutex::new(SplitPartials {
+                out: split_out,
+                m: split_m,
+                l: split_l,
+                version: 0,
+            })),
+            matmul_lt_scratch: Arc::new(Mutex::new(MatmulLtScratch {
+                buf: matmul_lt_buf,
+                version: 0,
+            })),
+            flash_paged_scratch: Arc::new(Mutex::new(FlashPagedScratch {
+                oaccum: flash_paged_oaccum_buf,
+                lseaccum: flash_paged_lseaccum_buf,
+                version: 0,
+            })),
+            num_sm,
         })
+    }
+
+    /// Grow the FlashAttention LSE scratch to hold at least `needed` f32 and
+    /// return its device pointer. The buffer is backend-owned and persistent, so
+    /// the pointer stays valid for a kernel launched on `self.stream`. Caller
+    /// hands the pointer straight to the FA2 FFI. Grows geometrically; the LSE
+    /// is write-only scratch in forward-only inference, so reuse is safe.
+    pub(crate) fn flash_lse_ptr(&self, needed: usize) -> Result<u64> {
+        use cudarc::driver::DevicePtr;
+        let mut lse = self.flash_lse.lock().unwrap();
+        if lse.len() < needed {
+            let new_cap = needed.max(lse.len() * 3 / 2).max(16);
+            *lse = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow flash_lse: {e}")))?;
+        }
+        Ok(lse.device_ptr(&self.stream).0)
+    }
+
+    /// Grow the FA2 paged-decode split scratch (`oaccum`, `lseaccum`) and
+    /// return their device pointers. The caller is responsible for sizing
+    /// based on `num_splits_cap * batch_size * num_heads * seqlen_q` and the
+    /// rounded head dim. Both buffers are persistent and write-only from the
+    /// kernel's perspective (the reduction step folds them into the final
+    /// out/softmax_lse), so reuse across calls is safe.
+    pub(crate) fn flash_paged_scratch_ptrs(
+        &self,
+        oaccum_elems: usize,
+        lseaccum_elems: usize,
+    ) -> Result<(u64, u64)> {
+        use cudarc::driver::DevicePtr;
+        let mut scratch = self.flash_paged_scratch.lock().unwrap();
+        let mut grew = false;
+        if scratch.oaccum.len() < oaccum_elems {
+            let new_cap = oaccum_elems.max(scratch.oaccum.len() * 3 / 2).max(16);
+            scratch.oaccum = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow flash_paged_oaccum: {e}")))?;
+            grew = true;
+        }
+        if scratch.lseaccum.len() < lseaccum_elems {
+            let new_cap = lseaccum_elems.max(scratch.lseaccum.len() * 3 / 2).max(16);
+            scratch.lseaccum = self
+                .stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow flash_paged_lseaccum: {e}")))?;
+            grew = true;
+        }
+        if grew {
+            scratch.version = scratch.version.wrapping_add(1);
+        }
+        Ok((
+            scratch.oaccum.device_ptr(&self.stream).0,
+            scratch.lseaccum.device_ptr(&self.stream).0,
+        ))
+    }
+
+    /// Grow counter for `flash_paged_scratch`. Folded into
+    /// `decode_capture_epoch` so a scratch reallocation invalidates any
+    /// captured decode graph that baked the prior pointers.
+    fn flash_paged_scratch_version(&self) -> u64 {
+        self.flash_paged_scratch
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
+    }
+
+    /// Grow the split-KV partial scratch (held in `paged_split_partials`) so the
+    /// three buffers hold at least `out_elems` / `ml_elems` f32 respectively.
+    /// `out_elems` = num_seqs*num_heads*num_splits*head_dim, `ml_elems` =
+    /// num_seqs*num_heads*num_splits. Grows geometrically and bumps `version`
+    /// (→ `decode_capture_epoch`) on any reallocation so a captured decode graph
+    /// that baked the old device pointers is invalidated and re-captured. The
+    /// caller holds the lock through the subsequent kernel launches that read the
+    /// buffers, keeping the pointers stable for the launch.
+    fn ensure_split_partials(
+        p: &mut SplitPartials,
+        stream: &Arc<CudaStream>,
+        out_elems: usize,
+        ml_elems: usize,
+    ) -> Result<()> {
+        let mut grew = false;
+        if p.out.len() < out_elems {
+            let new_cap = out_elems.max(p.out.len() * 3 / 2).max(16);
+            p.out = stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow paged_split_out: {e}")))?;
+            grew = true;
+        }
+        if p.m.len() < ml_elems {
+            let new_cap = ml_elems.max(p.m.len() * 3 / 2).max(16);
+            p.m = stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow paged_split_m: {e}")))?;
+            grew = true;
+        }
+        if p.l.len() < ml_elems {
+            let new_cap = ml_elems.max(p.l.len() * 3 / 2).max(16);
+            p.l = stream
+                .alloc_zeros::<f32>(new_cap)
+                .map_err(|e| ForgeError::Cuda(format!("grow paged_split_l: {e}")))?;
+            grew = true;
+        }
+        if grew {
+            p.version = p.version.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Upload raw block-quantized bytes to the device and wrap them in a
+    /// `Quant` tensor. `shape` is the logical (dequantized) element shape and
+    /// `dtype` must be quantized (`DType::is_quantized()`); the byte count is
+    /// validated against `dtype.quant_block()`.
+    pub fn copy_from_host_quant(
+        &self,
+        bytes: &[u8],
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<CudaTensor> {
+        let (elems_per_block, bytes_per_block) = dtype.quant_block().ok_or_else(|| {
+            ForgeError::InvalidArgument(format!(
+                "copy_from_host_quant: {dtype:?} is not a quantized dtype"
+            ))
+        })?;
+        let numel: usize = shape.iter().product();
+        if !numel.is_multiple_of(elems_per_block) {
+            return Err(ForgeError::InvalidArgument(format!(
+                "copy_from_host_quant: numel {numel} not a multiple of block size {elems_per_block} for {dtype:?}"
+            )));
+        }
+        let expected_bytes = (numel / elems_per_block) * bytes_per_block;
+        if bytes.len() != expected_bytes {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![expected_bytes],
+                got: vec![bytes.len()],
+            });
+        }
+        let slice = self
+            .stream
+            .memcpy_stod(bytes)
+            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        Ok(CudaTensor::quant_data(slice, shape.to_vec(), dtype))
     }
 
     /// Shared handle to the CUDA context. Used by callers that need to
@@ -390,6 +897,168 @@ impl CudaBackend {
             .lock()
             .map(|g| g.version)
             .unwrap_or(0)
+    }
+
+    /// Version of the split-KV paged-attention partial scratch (bumps on grow).
+    /// Folded into `decode_capture_epoch` so a partial-buffer reallocation
+    /// (pointer move on the captured decode path) triggers re-capture.
+    pub fn paged_split_partials_version(&self) -> u64 {
+        self.paged_split_partials
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
+    }
+
+    /// Version of the cuBLASLt f16 matmul scratch (bumps on grow). Folded into
+    /// `decode_capture_epoch` so a scratch reallocation invalidates any
+    /// captured decode graph that baked the prior pointer.
+    pub fn matmul_lt_scratch_version(&self) -> u64 {
+        self.matmul_lt_scratch
+            .lock()
+            .map(|g| g.version)
+            .unwrap_or(0)
+    }
+
+    /// f16 matmul via cuBLASLt's heuristic (which picks `nvjet_sm121_*_tmaAB`
+    /// on Blackwell for these shapes — same kernel pega gets) followed by a
+    /// transpose back into row-major. Called from `matmul_into` for batched
+    /// decode shapes where the heuristic difference vs classic cuBLAS is
+    /// material (M ≥ 2 and N ≤ 32768; see the dispatch comment there).
+    ///
+    /// Math: `out[m,n] = a[m,k] · b[k,n]`, all row-major.
+    ///
+    /// The cuBLASLt call uses the **native descriptor** (transa=transb=T)
+    /// rather than the row-major-via-swap-trick that classic cuBLAS uses. The
+    /// heuristic table treats the two descriptor shapes as distinct: the
+    /// "native" shape (output (m,n) with small m, large n) has nvjet algos
+    /// registered; the "swap" shape (output (n,m) with small n) does not, so
+    /// the heuristic falls back to `cutlass_80`. Confirmed via nsys (see
+    /// `examples/cublaslt_decode_gemm_probe.rs`).
+    ///
+    /// The native call writes its result col-major (m,n) into a backend-owned
+    /// scratch — which is the SAME bytes as row-major [n,m]. We then run
+    /// `transpose_f16` over the scratch (rows=n, cols=m) → caller's row-major
+    /// `out[m,n]`. Transpose for the layer GEMMs (≤ 8 × 9728 f16 = 156 KB) is
+    /// ~5 μs on GB10 vs the 20–160 μs saved per GEMM.
+    pub(crate) fn matmul_into_lt_f16(
+        &self,
+        out: &mut CudaTensor,
+        a: &CudaTensor,
+        b: &CudaTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        // 1) Ensure the col-major output scratch can hold m*n f16 values.
+        let needed = m * n;
+        {
+            let mut g = self
+                .matmul_lt_scratch
+                .lock()
+                .map_err(|_| ForgeError::Cuda("matmul_lt_scratch lock poisoned".into()))?;
+            if g.buf.len() < needed {
+                let new_cap = needed.max(g.buf.len() * 3 / 2);
+                g.buf = self
+                    .stream
+                    .alloc_zeros::<half::f16>(new_cap)
+                    .map_err(|e| ForgeError::Cuda(format!("grow matmul_lt_scratch: {e}")))?;
+                g.version = g.version.wrapping_add(1);
+            }
+        }
+
+        let a_slice = a.f16_slice()?;
+        let b_slice = b.f16_slice()?;
+
+        // 2) Cached cuBLASLt matmul. The descriptor uses native column-major
+        //    transposes (transa=transb=T) which trips the heuristic into picking
+        //    `nvjet_sm121_*_tmaAB` on Blackwell. We bypass cudarc's safe wrapper
+        //    because it runs heuristic search per call (the smoking-gun source
+        //    of the previous regression). The cache keyed on (m,k,n) keeps
+        //    the heuristic to once-per-shape; steady-state calls reduce to a
+        //    single `cublasLtMatmul` invocation.
+        {
+            let mut lt_guard = self
+                .blas_lt
+                .lock()
+                .map_err(|_| ForgeError::Cuda("blas_lt lock poisoned".into()))?;
+            if lt_guard.is_none() {
+                *lt_guard = Some(LtCache::new(&self.stream)?);
+            }
+            let lt = lt_guard.as_mut().unwrap();
+            let shape = lt.shape(m, k, n)?;
+
+            let mut g = self
+                .matmul_lt_scratch
+                .lock()
+                .map_err(|_| ForgeError::Cuda("matmul_lt_scratch lock poisoned".into()))?;
+            let c_slice = &mut g.buf;
+
+            let (a_ptr, _ra) = a_slice.device_ptr(&self.stream);
+            let (b_ptr, _rb) = b_slice.device_ptr(&self.stream);
+            let (c_ptr, _rc) = c_slice.device_ptr_mut(&self.stream);
+            let (w_ptr, _rw) = lt.workspace.device_ptr_mut(&self.stream);
+
+            // f16 matmul with f32 compute → scalars are f32.
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                lt_result::matmul(
+                    lt.handle,
+                    shape.matmul_desc,
+                    &alpha as *const _ as *const _,
+                    &beta as *const _ as *const _,
+                    a_ptr as *const _,
+                    shape.a_layout,
+                    b_ptr as *const _,
+                    shape.b_layout,
+                    c_ptr as *const _,
+                    shape.c_layout,
+                    c_ptr as *mut _,
+                    shape.c_layout,
+                    &shape.algo as *const _,
+                    w_ptr as *mut _,
+                    lt.workspace_size,
+                    self.stream.cu_stream() as *mut _,
+                )
+                .map_err(|e| ForgeError::Cuda(format!("cublaslt matmul cached: {e:?}")))?;
+            }
+        }
+
+        // 3) Transpose: scratch bytes are col-major (m,n) = row-major [n,m].
+        //    Use the specialized narrow transpose — reads coalesced into
+        //    shared mem, writes coalesced out. Naive `transpose_f16` writes
+        //    with stride n which eats most of the nvjet algo win.
+        let c_out = out.f16_slice_mut()?;
+        let m_u32 = m as u32;
+        let n_u32 = n as u32;
+        // TILE_N = 128: one warp == one int4-vectorizable group; 128 elements
+        // per block keeps the shared footprint small (m * 129 * 2 ≤ 8 KiB).
+        const TILE_N: u32 = 128;
+        let grid_x = (n as u32).div_ceil(TILE_N);
+        let shared_bytes = (m as u32) * (TILE_N + 1) * std::mem::size_of::<half::f16>() as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (TILE_N, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        };
+        let g = self
+            .matmul_lt_scratch
+            .lock()
+            .map_err(|_| ForgeError::Cuda("matmul_lt_scratch lock poisoned".into()))?;
+        let mut builder = self
+            .stream
+            .launch_builder(&self.kernels.transpose_narrow_f16);
+        builder.arg(c_out);
+        builder.arg(&g.buf);
+        builder.arg(&m_u32);
+        builder.arg(&n_u32);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| ForgeError::Cuda(format!("matmul_lt_f16 transpose: {e}")))?;
+        }
+        drop(g);
+        Ok(())
     }
 
     /// Upload `slot_mapping` into the persistent device scratch. This is the
@@ -777,17 +1446,25 @@ impl CudaBackend {
         // single-threaded engine access — no recursion, no contention. Lock
         // order is stable (block_tables → kv_lens) so even if that contract
         // changes there's no deadlock risk between paged_attention calls.
+        // Skipped on the captured decode path: stage_decode_inputs already
+        // uploaded block_tables/kv_lens, so re-uploading per layer would add 2
+        // redundant memcpy graph nodes per layer.
+        let prestaged = self.decode_inputs_prestaged.load(Ordering::Relaxed);
         let mut bt_scratch = self
             .paged_block_tables
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_block_tables mutex poisoned".into()))?;
-        self.upload_i32_scratch(&mut bt_scratch, block_tables)?;
+        if !prestaged {
+            self.upload_i32_scratch(&mut bt_scratch, block_tables)?;
+        }
 
         let mut kv_scratch = self
             .paged_kv_lens
             .lock()
             .map_err(|_| ForgeError::Cuda("paged_kv_lens mutex poisoned".into()))?;
-        self.upload_i32_scratch(&mut kv_scratch, kv_lens)?;
+        if !prestaged {
+            self.upload_i32_scratch(&mut kv_scratch, kv_lens)?;
+        }
 
         let block_tables_dev = &bt_scratch.buf;
         let kv_lens_dev = &kv_scratch.buf;
@@ -838,29 +1515,213 @@ impl CudaBackend {
                 Ok(())
             }
             DType::F16 => {
+                // FA2 paged decode path — uses `flash_fwd_kvcache` against
+                // forge's block pool. Same memory layout in both:
+                // `[num_blocks, block_size, num_kv_heads * head_dim]` and
+                // FA2's `[num_blocks, page_block_size, num_heads_k, head_dim]`
+                // are byte-equivalent.
+                //
+                // Checked BEFORE the split-KV head_dim<=128 guard below:
+                // FA2 templates cover head_dim up to 256, so eligible
+                // 192/256-dim shapes must reach FA2 rather than die on the
+                // split-KV limit (`fa2_paged_eligible` and this dispatch
+                // must agree — see the helper's doc).
+                //
+                // Default: FA2 runs whenever the shape is eligible
+                // (`fa2_paged_eligible`). Kill switch: `FORGE_FA2_PAGED=0`
+                // (or `=false`, case-insensitive) forces the split-KV
+                // fallback. Anything else, including absent variable, takes
+                // FA2. NOTE: this is a behaviour change from the previous
+                // opt-in semantics — users who had `FORGE_FA2_PAGED=on`
+                // previously saw fallback; now they see FA2.
+                //
+                // We are inside the `DType::F16 => { ... }` arm of
+                // `match q.dtype()` above, so pass `DType::F16` literally
+                // (there is no `dtype` binding in scope).
+                #[cfg(feature = "flash-attn")]
+                {
+                    let fa2_killed = std::env::var("FORGE_FA2_PAGED")
+                        .ok()
+                        .filter(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                        .is_some();
+                    if !fa2_killed && fa2_paged_eligible(head_dim, DType::F16, block_size) {
+                        use cudarc::driver::DevicePtr;
+                        // Hold the i32 scratch mutexes across the launch — the
+                        // device pointers we hand to FA2 must outlive the kernel.
+                        let bt_ptr = block_tables_dev.device_ptr(&self.stream).0;
+                        let kv_ptr = kv_lens_dev.device_ptr(&self.stream).0;
+                        let q_ptr = q.f16_slice()?.device_ptr(&self.stream).0;
+                        let k_ptr = k_pool.f16_slice()?.device_ptr(&self.stream).0;
+                        let v_ptr = v_pool.f16_slice()?.device_ptr(&self.stream).0;
+                        let out_ptr = out.f16_slice_mut()?.device_ptr(&self.stream).0;
+
+                        let seqlen_q = 1; // forge's paged_attention contract: 1 token per seq
+                        let d_rounded = if head_dim <= 128 {
+                            head_dim.div_ceil(32) * 32
+                        } else {
+                            head_dim.div_ceil(64) * 64
+                        };
+                        const FA2_NUM_SPLITS_CAP: i32 = 32;
+
+                        // Persistent softmax_lse scratch (FA2 writes always).
+                        let lse_len = batch_size * num_heads * seqlen_q;
+                        let lse_ptr = self.flash_lse_ptr(lse_len.max(1))?;
+
+                        // Persistent oaccum / lseaccum scratch.
+                        let oaccum_elems = (FA2_NUM_SPLITS_CAP as usize)
+                            * batch_size
+                            * num_heads
+                            * seqlen_q
+                            * d_rounded;
+                        let lseaccum_elems =
+                            (FA2_NUM_SPLITS_CAP as usize) * batch_size * num_heads * seqlen_q;
+                        let (oaccum_ptr, lseaccum_ptr) =
+                            self.flash_paged_scratch_ptrs(oaccum_elems, lseaccum_elems)?;
+
+                        let stream_ptr = self.stream.cu_stream() as usize as u64;
+                        unsafe {
+                            forge_flash::flash_fwd_kvcache(
+                                q_ptr,
+                                k_ptr,
+                                v_ptr,
+                                out_ptr,
+                                lse_ptr,
+                                bt_ptr,
+                                kv_ptr,
+                                batch_size as i32,
+                                seqlen_q as i32,
+                                num_blocks as i32,
+                                max_blocks_per_seq as i32,
+                                block_size as i32,
+                                num_heads as i32,
+                                num_kv_heads as i32,
+                                head_dim as i32,
+                                scale,
+                                /*is_causal=*/ false,
+                                forge_flash::FlashDType::F16,
+                                /*num_splits=*/ 0,
+                                self.num_sm,
+                                lseaccum_ptr,
+                                oaccum_ptr,
+                                FA2_NUM_SPLITS_CAP,
+                                stream_ptr,
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+                // The split kernel lays head_dim across a warp's 32 lanes with up
+                // to PA_MAX_DIMS_PER_LANE=4 dims/lane, so it supports head_dim<=128.
+                // (head_dim 192/256 is only reachable through the FA2 branch above;
+                // with FA2 unavailable, killed, or block_size unaligned, those dims
+                // have no paged F16 path.)
+                if head_dim > 128 {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "paged_attention_into: split-KV F16 path supports head_dim<=128, got {head_dim}; \
+                         head_dim 192/256 requires the FA2 path (flash-attn feature, block_size % 256 == 0, \
+                         FORGE_FA2_PAGED not set to 0)"
+                    )));
+                }
+                // Split-KV flash-decoding. Pick num_splits from the longest seq
+                // in the batch so the (num_seqs * num_heads * num_splits)-block
+                // grid saturates the device even at batch=1; short seqs get empty
+                // splits (the kernel emits identity partials for them). ~512 KV
+                // per split is the lightllm/vLLM sweet spot; clamp to [1, 16].
+                let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0).max(0) as usize;
+                let num_splits = if max_kv_len == 0 {
+                    1
+                } else {
+                    max_kv_len.div_ceil(512).clamp(1, 16)
+                };
+                let num_splits_i32 = num_splits as i32;
+
                 let q_slice = q.f16_slice()?;
                 let k_slice = k_pool.f16_slice()?;
                 let v_slice = v_pool.f16_slice()?;
-                let out_slice = out.f16_slice_mut()?;
-                let mut builder = self
-                    .stream
-                    .launch_builder(&self.kernels.paged_attention_f16);
-                builder.arg(out_slice);
-                builder.arg(q_slice);
-                builder.arg(k_slice);
-                builder.arg(v_slice);
-                builder.arg(block_tables_dev);
-                builder.arg(kv_lens_dev);
-                builder.arg(&scale);
-                builder.arg(&num_heads_i32);
-                builder.arg(&num_kv_heads_i32);
-                builder.arg(&head_dim_i32);
-                builder.arg(&block_size_i32);
-                builder.arg(&max_blocks_i32);
-                unsafe {
-                    builder
-                        .launch(launch_cfg)
-                        .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+
+                // Persistent f32 partial scratch (stable pointers across captured
+                // replays; grow bumps version → decode_capture_epoch). Lock is
+                // held through both launches that read these buffers.
+                let out_elems = batch_size * num_heads * num_splits * head_dim;
+                let ml_elems = batch_size * num_heads * num_splits;
+                let mut partials = self
+                    .paged_split_partials
+                    .lock()
+                    .map_err(|_| ForgeError::Cuda("paged_split_partials mutex poisoned".into()))?;
+                Self::ensure_split_partials(&mut partials, &self.stream, out_elems, ml_elems)?;
+
+                // 1) Main split kernel: grid (num_seqs, num_heads, num_splits),
+                //    block = SPLIT_NWARPS warps. Token-parallel: each warp sweeps a
+                //    strided subset of the split's KV with an in-warp shuffle dot
+                //    (no per-token barrier), then the warps' partials are merged
+                //    once at the end. Shared mem holds the per-warp merge state:
+                //    per-warp m + l + acc[head_dim] = (2*nwarps + nwarps*head_dim) f32.
+                let nwarps = forge_kernels::paged_attention::SPLIT_NWARPS;
+                let split_block_dim = nwarps * 32;
+                let split_shared = (2 * nwarps + nwarps * head_dim as u32) * 4;
+                let split_cfg = LaunchConfig {
+                    grid_dim: (batch_size as u32, num_heads as u32, num_splits as u32),
+                    block_dim: (split_block_dim, 1, 1),
+                    shared_mem_bytes: split_shared,
+                };
+                {
+                    // Disjoint &mut borrows of the three partial buffers (the
+                    // builder needs &mut for each output arg).
+                    let SplitPartials {
+                        out: p_out,
+                        m: p_m,
+                        l: p_l,
+                        ..
+                    } = &mut *partials;
+                    let mut builder = self
+                        .stream
+                        .launch_builder(&self.kernels.paged_attention_f16_split);
+                    builder.arg(p_out);
+                    builder.arg(p_m);
+                    builder.arg(p_l);
+                    builder.arg(q_slice);
+                    builder.arg(k_slice);
+                    builder.arg(v_slice);
+                    builder.arg(block_tables_dev);
+                    builder.arg(kv_lens_dev);
+                    builder.arg(&scale);
+                    builder.arg(&num_heads_i32);
+                    builder.arg(&num_kv_heads_i32);
+                    builder.arg(&head_dim_i32);
+                    builder.arg(&block_size_i32);
+                    builder.arg(&max_blocks_i32);
+                    builder.arg(&num_splits_i32);
+                    unsafe {
+                        builder
+                            .launch(split_cfg)
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
+                }
+
+                // 2) Combine kernel: grid (num_seqs, num_heads), head_dim threads.
+                //    Merges the num_splits partials per (seq, head) into final out.
+                let combine_cfg = LaunchConfig {
+                    grid_dim: (batch_size as u32, num_heads as u32, 1),
+                    block_dim: (head_dim as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                {
+                    let out_slice = out.f16_slice_mut()?;
+                    let mut builder = self
+                        .stream
+                        .launch_builder(&self.kernels.paged_attention_f16_combine);
+                    builder.arg(out_slice);
+                    builder.arg(&partials.out);
+                    builder.arg(&partials.m);
+                    builder.arg(&partials.l);
+                    builder.arg(&num_heads_i32);
+                    builder.arg(&head_dim_i32);
+                    builder.arg(&num_splits_i32);
+                    unsafe {
+                        builder
+                            .launch(combine_cfg)
+                            .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+                    }
                 }
                 Ok(())
             }
@@ -961,6 +1822,17 @@ impl Backend for CudaBackend {
         CudaContext::device_count().unwrap_or(0) as usize
     }
 
+    #[cfg(feature = "flash-attn")]
+    fn preferred_block_size(&self, head_dim: usize, dtype: DType) -> usize {
+        // Probe the eligibility helper with the candidate block_size 256.
+        // Helper lives in this same module — no path prefix needed.
+        if fa2_paged_eligible(head_dim, dtype, 256) {
+            256
+        } else {
+            16
+        }
+    }
+
     fn allocate(&self, shape: &[usize], dtype: DType) -> Result<CudaTensor> {
         let numel = CudaTensor::numel_from_shape(shape);
         match dtype {
@@ -1018,6 +1890,20 @@ impl Backend for CudaBackend {
             .memcpy_stod(data)
             .map_err(|e| ForgeError::Cuda(e.to_string()))?;
         Ok(CudaTensor::bf16_data(slice, shape.to_vec()))
+    }
+
+    fn quantize_q8_0_host(&self, data: &[half::f16]) -> Result<Vec<u8>> {
+        Ok(crate::quant::quantize_q8_0(data))
+    }
+
+    fn copy_from_host_quant(
+        &self,
+        bytes: &[u8],
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<CudaTensor> {
+        // Delegate to the inherent method (disambiguated by Self::).
+        CudaBackend::copy_from_host_quant(self, bytes, shape, dtype)
     }
 
     fn copy_to_host_f32(&self, tensor: &CudaTensor) -> Result<Vec<f32>> {
@@ -1150,6 +2036,29 @@ impl Backend for CudaBackend {
                 Ok(())
             }
             DType::F16 => {
+                // f16 dispatch. M=1 is decode-GEMV territory (classic cuBLAS
+                // picks `gemvx` and is already optimal on Blackwell). For the
+                // batched-decode shapes that dominate forge's GPU time
+                // (attn_proj / down_proj at M≥2), classic cuBLAS picks
+                // `cutlass_80_wmma_*` (Ampere-era) and is 1.5–1.8× slower than
+                // cuBLASLt's `nvjet_sm121_*_tmaAB` (Blackwell-native + TMA)
+                // for the same shapes. Route those through `matmul_into_lt_f16`.
+                //
+                // The Lt path's output lands col-major and needs a transpose
+                // back into the caller's row-major buffer; for very wide
+                // outputs (lm_head: N=151936) the matmul is bandwidth-bound so
+                // Lt buys nothing, while the transpose costs real wallclock —
+                // so we fall back to classic above LT_NATIVE_MAX_N.
+                const LT_NATIVE_MAX_N: usize = 32_768;
+                // Cap m: cuBLASLt's nvjet algo win only shows up for the small-m
+                // batch-decode shapes (≤ ~16 typical). Above that the heuristic
+                // picks an algo equivalent to classic anyway, and our specialized
+                // `transpose_narrow_f16` would blow past shared-mem limits
+                // (it carries `m * (TILE_N + 1)` halves per block).
+                const LT_NATIVE_MAX_M: usize = 32;
+                if m >= 2 && m <= LT_NATIVE_MAX_M && n <= LT_NATIVE_MAX_N {
+                    return self.matmul_into_lt_f16(out, a, b, m, k, n);
+                }
                 let a_slice = a.f16_slice()?;
                 let b_slice = b.f16_slice()?;
                 let c_slice = out.f16_slice_mut()?;
@@ -1178,6 +2087,102 @@ impl Backend for CudaBackend {
             }
             other => Err(ForgeError::UnsupportedDtype(other)),
         }
+    }
+
+    /// Quantized matmul: `out = a · wᵀ` where `a` is f16 `[m, k]`, `w` is a
+    /// block-quantized weight `[n, k]` (row `j` stored as `k/32` Q8_0 blocks),
+    /// and `out` is f16 `[m, n]`. Runs the `gemv_q8_0_f16` warp-per-output-row
+    /// kernel: one warp (32 lanes) computes one output element, splitting the k
+    /// dimension across lanes for coalesced weight reads (see kernel comments).
+    /// This is the m=1 single-stream GEMV; batch decode (m>1) is dispatched to
+    /// the f16 GEMM in `QuantizedLinear::matmul_decode_into`.
+    fn matmul_quant_into(
+        &self,
+        out: &mut CudaTensor,
+        a: &CudaTensor,
+        w: &CudaTensor,
+    ) -> Result<()> {
+        let a_shape = a.shape();
+        let w_shape = w.shape();
+        if a_shape.len() != 2 || w_shape.len() != 2 {
+            return Err(ForgeError::InvalidArgument(
+                "matmul_quant_into: a and w must be 2D".into(),
+            ));
+        }
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = w_shape[0];
+        if w_shape[1] != k {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![n, k],
+                got: w_shape.to_vec(),
+            });
+        }
+        if a.dtype() != DType::F16 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_quant_into: a must be F16, got {:?}",
+                a.dtype()
+            )));
+        }
+        match w.dtype() {
+            DType::Q8_0 => {}
+            other => {
+                return Err(ForgeError::InvalidArgument(format!(
+                    "matmul_quant_into: w must be Q8_0, got {other:?}"
+                )));
+            }
+        }
+        if !k.is_multiple_of(32) {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_quant_into: k={k} must be a multiple of 32 (Q8_0 block size)"
+            )));
+        }
+        let expected_out = vec![m, n];
+        if out.shape() != expected_out.as_slice() {
+            return Err(ForgeError::ShapeMismatch {
+                expected: expected_out,
+                got: out.shape().to_vec(),
+            });
+        }
+        if out.dtype() != DType::F16 {
+            return Err(ForgeError::InvalidArgument(format!(
+                "matmul_quant_into: out must be F16, got {:?}",
+                out.dtype()
+            )));
+        }
+
+        let m_u = m as u32;
+        let n_u = n as u32;
+        let k_u = k as u32;
+
+        // Warp-per-output-row: one warp (32 lanes) computes one of the m*n
+        // outputs. Each CUDA block holds WARPS_PER_BLOCK warps, so it covers
+        // WARPS_PER_BLOCK outputs; grid.x = ceil(m*n / WARPS_PER_BLOCK).
+        let warps_per_block = forge_kernels::quantized::GEMV_Q8_0_WARPS_PER_BLOCK;
+        let total_warps = m_u * n_u;
+        let grid_x = total_warps.div_ceil(warps_per_block);
+        let launch_cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let a_slice = a.f16_slice()?;
+        let w_slice = w.quant_slice()?;
+        let o_slice = out.f16_slice_mut()?;
+        let mut builder = self.stream.launch_builder(&self.kernels.gemv_q8_0_f16);
+        builder.arg(o_slice);
+        builder.arg(a_slice);
+        builder.arg(w_slice);
+        builder.arg(&m_u);
+        builder.arg(&n_u);
+        builder.arg(&k_u);
+        unsafe {
+            builder
+                .launch(launch_cfg)
+                .map_err(|e| ForgeError::Cuda(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn add(&self, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor> {
@@ -1867,18 +2872,25 @@ impl Backend for CudaBackend {
             )));
         }
 
-        // Stage cos/sin into persistent scratch.
+        // Stage cos/sin into persistent scratch. Skipped on the captured decode
+        // path: stage_decode_inputs already uploaded them, and re-uploading per
+        // layer would add 2 redundant memcpy graph nodes per layer.
+        let prestaged = self.decode_inputs_prestaged.load(Ordering::Relaxed);
         let mut cos_scratch = self
             .rope_cos
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_cos mutex poisoned".into()))?;
-        self.upload_f32_scratch(&mut cos_scratch, cos_host)?;
+        if !prestaged {
+            self.upload_f32_scratch(&mut cos_scratch, cos_host)?;
+        }
 
         let mut sin_scratch = self
             .rope_sin
             .lock()
             .map_err(|_| ForgeError::Cuda("rope_sin mutex poisoned".into()))?;
-        self.upload_f32_scratch(&mut sin_scratch, sin_host)?;
+        if !prestaged {
+            self.upload_f32_scratch(&mut sin_scratch, sin_host)?;
+        }
 
         let cos_dev = &cos_scratch.buf;
         let sin_dev = &sin_scratch.buf;
@@ -2166,7 +3178,11 @@ impl Backend for CudaBackend {
             .embedding_indices
             .lock()
             .map_err(|_| ForgeError::Cuda("embedding_indices mutex poisoned".into()))?;
-        self.upload_u32_scratch(&mut indices_scratch, indices)?;
+        // Skip the upload when stage_decode_inputs already wrote these indices
+        // (captured decode path) — avoids a redundant memcpy graph node.
+        if !self.decode_inputs_prestaged.load(Ordering::Relaxed) {
+            self.upload_u32_scratch(&mut indices_scratch, indices)?;
+        }
         let indices_dev = &indices_scratch.buf;
 
         let launch_cfg = LaunchConfig {
@@ -3514,7 +4530,12 @@ impl Backend for CudaBackend {
         {
             return Err(ForgeError::InvalidArgument(format!(
                 "sample: per-row params must have {rows} entries (temps={}, min_ps={}, top_ks={}, top_ps={}, seeds={}, steps={})",
-                temps.len(), min_ps.len(), top_ks.len(), top_ps.len(), seeds.len(), steps.len()
+                temps.len(),
+                min_ps.len(),
+                top_ks.len(),
+                top_ps.len(),
+                seeds.len(),
+                steps.len()
             )));
         }
 
@@ -3640,6 +4661,11 @@ impl Backend for CudaBackend {
         )))
     }
 
+    fn set_decode_inputs_prestaged(&self, prestaged: bool) {
+        self.decode_inputs_prestaged
+            .store(prestaged, Ordering::Relaxed);
+    }
+
     fn decode_capture_epoch(&self) -> u64 {
         // Sum of every persistent decode scratch's grow-counter. Counters only
         // increment, so any scratch reallocation (which moves the device
@@ -3652,5 +4678,60 @@ impl Backend for CudaBackend {
             .wrapping_add(sin)
             .wrapping_add(self.embedding_scratch_version())
             .wrapping_add(self.scatter_slot_mapping_version())
+            .wrapping_add(self.paged_split_partials_version())
+            .wrapping_add(self.matmul_lt_scratch_version())
+            .wrapping_add(self.flash_paged_scratch_version())
+    }
+}
+
+#[cfg(all(test, feature = "flash-attn"))]
+mod tests_block_size_auto {
+    use super::fa2_paged_eligible;
+    use forge_core::DType;
+
+    #[test]
+    fn fa2_eligible_qwen_class_shape() {
+        assert!(fa2_paged_eligible(128, DType::F16, 256));
+    }
+
+    /// head_dim 192/256 are FA2-template-supported and must be eligible —
+    /// the dispatch site checks FA2 *before* the split-KV head_dim<=128
+    /// guard so these dims reach FA2 rather than dying on the split limit.
+    #[test]
+    fn fa2_eligible_large_head_dims() {
+        assert!(fa2_paged_eligible(192, DType::F16, 256));
+        assert!(fa2_paged_eligible(256, DType::F16, 256));
+    }
+
+    #[test]
+    fn fa2_rejects_unaligned_block_size() {
+        assert!(!fa2_paged_eligible(128, DType::F16, 128));
+        assert!(!fa2_paged_eligible(128, DType::F16, 16));
+    }
+
+    #[test]
+    fn fa2_rejects_unsupported_head_dim() {
+        assert!(!fa2_paged_eligible(48, DType::F16, 256));
+        assert!(!fa2_paged_eligible(160, DType::F16, 256));
+    }
+
+    #[test]
+    fn fa2_rejects_non_f16_dtype() {
+        // Today the FA2 dispatch arm is reachable only from DType::F16; BF16
+        // hits UnsupportedDtype at backend.rs:1684. Keep preference aligned.
+        assert!(!fa2_paged_eligible(128, DType::BF16, 256));
+        assert!(!fa2_paged_eligible(128, DType::F32, 256));
+    }
+
+    /// CudaBackend's `preferred_block_size` override defers to
+    /// `fa2_paged_eligible` with the candidate `256`. We can't construct
+    /// a CudaBackend in this unit test (it needs a device), so this
+    /// asserts the predicate matrix the override depends on.
+    #[test]
+    fn override_helper_probe_matrix() {
+        assert!(fa2_paged_eligible(128, DType::F16, 256));
+        assert!(fa2_paged_eligible(64, DType::F16, 256));
+        assert!(!fa2_paged_eligible(128, DType::F32, 256));
+        assert!(!fa2_paged_eligible(48, DType::F16, 256));
     }
 }

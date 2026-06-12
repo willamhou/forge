@@ -1,6 +1,6 @@
+use forge_backend_cuda::CudaBackend;
 use forge_backend_cuda::attention::naive_attention;
 use forge_backend_cuda::flash_attention::attention_fwd;
-use forge_backend_cuda::CudaBackend;
 use forge_core::{Backend, Tensor};
 
 #[test]
@@ -49,9 +49,7 @@ fn test_rms_norm_multi_row() {
 #[test]
 fn test_silu() {
     let backend = CudaBackend::new(0).unwrap();
-    let x = backend
-        .copy_from_host_f32(&[0.0, 1.0, -1.0], &[3])
-        .unwrap();
+    let x = backend.copy_from_host_f32(&[0.0, 1.0, -1.0], &[3]).unwrap();
     let out = backend.silu(&x).unwrap();
     let result = backend.copy_to_host_f32(&out).unwrap();
     // silu(x) = x * sigmoid(x)
@@ -112,22 +110,13 @@ fn test_naive_attention_single_head() {
     let backend = CudaBackend::new(0).unwrap();
     // Q, K, V: [1, 2, 1, 4] — batch=1, seq_len=2, heads=1, head_dim=4
     let q = backend
-        .copy_from_host_f32(
-            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            &[1, 2, 1, 4],
-        )
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[1, 2, 1, 4])
         .unwrap();
     let k = backend
-        .copy_from_host_f32(
-            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            &[1, 2, 1, 4],
-        )
+        .copy_from_host_f32(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[1, 2, 1, 4])
         .unwrap();
     let v = backend
-        .copy_from_host_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[1, 2, 1, 4],
-        )
+        .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 2, 1, 4])
         .unwrap();
 
     let scale = 1.0 / (4.0f32).sqrt(); // 1/sqrt(head_dim)
@@ -138,7 +127,10 @@ fn test_naive_attention_single_head() {
     // Q[0] = [1,0,0,0] should attend more to K[0] = [1,0,0,0]
     // Q[1] = [0,1,0,0] should attend more to K[1] = [0,1,0,0]
     // So output[0] should be closer to V[0] and output[1] closer to V[1]
-    assert!(result[0] < result[4], "first token output should be closer to V[0]");
+    assert!(
+        result[0] < result[4],
+        "first token output should be closer to V[0]"
+    );
     assert!(result.len() == 8);
 }
 
@@ -168,10 +160,26 @@ fn test_naive_attention_multi_head_layout() {
     let result = backend.copy_to_host_f32(&out).unwrap();
     // With single KV token per head, softmax is trivially 1.0, so output = V
     // Output layout should be: [token0_head0, token0_head1] = [10, 20, 30, 40]
-    assert!((result[0] - 10.0).abs() < 1e-3, "got {} expected 10.0", result[0]);
-    assert!((result[1] - 20.0).abs() < 1e-3, "got {} expected 20.0", result[1]);
-    assert!((result[2] - 30.0).abs() < 1e-3, "got {} expected 30.0", result[2]);
-    assert!((result[3] - 40.0).abs() < 1e-3, "got {} expected 40.0", result[3]);
+    assert!(
+        (result[0] - 10.0).abs() < 1e-3,
+        "got {} expected 10.0",
+        result[0]
+    );
+    assert!(
+        (result[1] - 20.0).abs() < 1e-3,
+        "got {} expected 20.0",
+        result[1]
+    );
+    assert!(
+        (result[2] - 30.0).abs() < 1e-3,
+        "got {} expected 30.0",
+        result[2]
+    );
+    assert!(
+        (result[3] - 40.0).abs() < 1e-3,
+        "got {} expected 40.0",
+        result[3]
+    );
 }
 
 #[test]
@@ -341,18 +349,12 @@ fn test_multi_head_attention_matches_naive() {
     let backend = CudaBackend::new(0).unwrap();
     // Q: [1, 2, 2, 4], K/V: [1, 3, 2, 4]
     let q_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
-    let q = backend
-        .copy_from_host_f32(&q_data, &[1, 2, 2, 4])
-        .unwrap();
+    let q = backend.copy_from_host_f32(&q_data, &[1, 2, 2, 4]).unwrap();
 
     let k_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.05).collect();
-    let k = backend
-        .copy_from_host_f32(&k_data, &[1, 3, 2, 4])
-        .unwrap();
+    let k = backend.copy_from_host_f32(&k_data, &[1, 3, 2, 4]).unwrap();
     let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02 + 0.1).collect();
-    let v = backend
-        .copy_from_host_f32(&v_data, &[1, 3, 2, 4])
-        .unwrap();
+    let v = backend.copy_from_host_f32(&v_data, &[1, 3, 2, 4]).unwrap();
 
     let scale = 1.0 / (4.0_f32).sqrt();
 
@@ -383,18 +385,12 @@ fn test_multi_head_attention_gqa_cuda() {
     let backend = CudaBackend::new(0).unwrap();
     // GQA: num_heads=4, num_kv_heads=2
     let q_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
-    let q = backend
-        .copy_from_host_f32(&q_data, &[1, 1, 4, 4])
-        .unwrap();
+    let q = backend.copy_from_host_f32(&q_data, &[1, 1, 4, 4]).unwrap();
 
     let k_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.05).collect();
-    let k = backend
-        .copy_from_host_f32(&k_data, &[1, 3, 2, 4])
-        .unwrap();
+    let k = backend.copy_from_host_f32(&k_data, &[1, 3, 2, 4]).unwrap();
     let v_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.02 + 0.1).collect();
-    let v = backend
-        .copy_from_host_f32(&v_data, &[1, 3, 2, 4])
-        .unwrap();
+    let v = backend.copy_from_host_f32(&v_data, &[1, 3, 2, 4]).unwrap();
 
     let scale = 1.0 / (4.0_f32).sqrt();
     let result = backend

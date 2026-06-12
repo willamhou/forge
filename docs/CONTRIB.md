@@ -76,8 +76,8 @@ cargo run --release -p forge-server -- --model-path /path/to/model --backend cpu
 | `--backend` | `cuda` | Backend: `cuda` or `cpu` |
 | `--device` | `0` | CUDA device ordinal |
 | `--kv-cache` | `paged` | KV cache type: `paged` or `naive` |
-| `--block-size` | `16` | Tokens per KV cache block (paged only) |
-| `--num-blocks` | `2048` | Total KV cache blocks (paged only) |
+| `--block-size` | `auto` | Tokens per KV cache block (paged only). `auto` → `Backend::preferred_block_size`: 256 on CUDA when FA2-eligible (head_dim ∈ {32,64,96,128,192,256}, F16), else 16. |
+| `--num-blocks` | `auto` | Total KV cache blocks (paged only). `auto` → `ceil(32768 / block_size)`, preserving the historic ~32k token capacity. |
 | `--max-batch-size` | `256` | Max sequences in a batch |
 | `--max-prefill-tokens` | `4096` | Max prefill tokens per scheduling step |
 

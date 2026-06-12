@@ -167,7 +167,9 @@ fn sample_mixed_batch_greedy_and_sampled() {
 #[test]
 fn sample_rejects_param_length_mismatch() {
     let backend = CudaBackend::new(0).unwrap();
-    let logits = backend.copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+        .unwrap();
     // 2 rows but only 1 temp.
     assert!(
         backend
@@ -210,7 +212,10 @@ fn sample_min_p_filters_low_prob_tokens() {
             break;
         }
     }
-    assert!(seen_other, "without min_p, low-prob tokens should sometimes win");
+    assert!(
+        seen_other,
+        "without min_p, low-prob tokens should sometimes win"
+    );
 }
 
 #[test]
@@ -239,7 +244,11 @@ fn sample_top_p_restricts_to_nucleus() {
         let s = backend
             .sample(&logits, &[1.0], &[0.0], &[0], &[0.9], &[3], &[step])
             .unwrap();
-        assert_eq!(s, vec![0], "top_p=0.9 must keep only the peak (step {step})");
+        assert_eq!(
+            s,
+            vec![0],
+            "top_p=0.9 must keep only the peak (step {step})"
+        );
     }
 }
 
@@ -256,7 +265,11 @@ fn sample_with_neg_inf_logit_does_not_break_filtering() {
         let s = backend
             .sample(&logits, &[1.0], &[0.0], &[0], &[0.9], &[3], &[step])
             .unwrap();
-        assert_eq!(s, vec![0], "peak must be picked, -inf token never (step {step})");
+        assert_eq!(
+            s,
+            vec![0],
+            "peak must be picked, -inf token never (step {step})"
+        );
     }
 }
 
@@ -281,5 +294,9 @@ fn sample_top_k_matches_cpu_reference() {
         );
         seen.insert(s[0]);
     }
-    assert_eq!(seen.len(), 3, "all 3 top-k tokens should appear over 400 draws");
+    assert_eq!(
+        seen.len(),
+        3,
+        "all 3 top-k tokens should appear over 400 draws"
+    );
 }

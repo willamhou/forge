@@ -36,7 +36,9 @@ fn argmax_single_row_f32() {
 #[test]
 fn argmax_1d_treated_as_one_row() {
     let backend = CudaBackend::new(0).unwrap();
-    let logits = backend.copy_from_host_f32(&[3.0, 1.0, 7.0, 2.0], &[4]).unwrap();
+    let logits = backend
+        .copy_from_host_f32(&[3.0, 1.0, 7.0, 2.0], &[4])
+        .unwrap();
     assert_eq!(backend.argmax(&logits).unwrap(), vec![2]);
 }
 

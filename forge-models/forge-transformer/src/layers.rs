@@ -1,6 +1,7 @@
 use forge_core::{Backend, ForgeError, KvCache, ModelConfig, Result, Tensor};
 
 use crate::persistent_buffers::{LlamaPersistentBuffers, StagedDecodeMeta};
+use crate::quantized_linear::QuantizedLinear;
 use crate::rope::RopeFreqs;
 
 /// RMS normalization layer.
@@ -26,13 +27,17 @@ impl<B: Backend> RMSNorm<B> {
 
 /// SiLU-gated MLP (gate_proj, up_proj, down_proj).
 pub struct LlamaMLP<B: Backend> {
-    gate_proj: B::Tensor,
-    up_proj: B::Tensor,
-    down_proj: B::Tensor,
+    gate_proj: QuantizedLinear<B>,
+    up_proj: QuantizedLinear<B>,
+    down_proj: QuantizedLinear<B>,
 }
 
 impl<B: Backend> LlamaMLP<B> {
-    pub fn new(gate_proj: B::Tensor, up_proj: B::Tensor, down_proj: B::Tensor) -> Self {
+    pub fn new(
+        gate_proj: QuantizedLinear<B>,
+        up_proj: QuantizedLinear<B>,
+        down_proj: QuantizedLinear<B>,
+    ) -> Self {
         Self {
             gate_proj,
             up_proj,
@@ -42,14 +47,14 @@ impl<B: Backend> LlamaMLP<B> {
 
     pub fn forward(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
         // gate = x @ gate_proj  — weights already transposed at load
-        let gate = backend.matmul(x, &self.gate_proj)?;
+        let gate = self.gate_proj.matmul_prefill(x, backend)?;
 
         // up = x @ up_proj
-        let up = backend.matmul(x, &self.up_proj)?;
+        let up = self.up_proj.matmul_prefill(x, backend)?;
 
         // output = (silu(gate) * up) @ down_proj — fused into one kernel
         let fused = backend.fused_silu_mul(&gate, &up)?;
-        backend.matmul(&fused, &self.down_proj)
+        self.down_proj.matmul_prefill(&fused, backend)
     }
 
     /// Persistent-buffer variant.
@@ -61,10 +66,13 @@ impl<B: Backend> LlamaMLP<B> {
     /// lets us use disjoint &mut/& borrows on buffer fields and avoids
     /// the borrow-checker conflict that an explicit `x` would create.
     pub fn forward_into(&self, buffers: &mut LlamaPersistentBuffers<B>, backend: &B) -> Result<()> {
-        backend.matmul_into(&mut buffers.gate, &buffers.normed, &self.gate_proj)?;
-        backend.matmul_into(&mut buffers.up, &buffers.normed, &self.up_proj)?;
+        self.gate_proj
+            .matmul_decode_into(&mut buffers.gate, &buffers.normed, backend)?;
+        self.up_proj
+            .matmul_decode_into(&mut buffers.up, &buffers.normed, backend)?;
         backend.fused_silu_mul_into(&mut buffers.silu_mul, &buffers.gate, &buffers.up)?;
-        backend.matmul_into(&mut buffers.mlp_out, &buffers.silu_mul, &self.down_proj)?;
+        self.down_proj
+            .matmul_decode_into(&mut buffers.mlp_out, &buffers.silu_mul, backend)?;
         Ok(())
     }
 }
@@ -75,7 +83,9 @@ impl<B: Backend> LlamaMLP<B> {
 /// KV cache is used: during prefill, K/V are appended to cache; during decode,
 /// cached K/V are retrieved so attention sees the full context.
 pub struct LlamaAttention<B: Backend> {
-    wqkv: B::Tensor, // [hidden_size, q_proj_size + 2 * kv_proj_size]
+    // wqkv: [hidden_size, q_proj_size + 2 * kv_proj_size] (FP16, prefill);
+    // its Q8_0 decode copy is [q_proj_size + 2 * kv_proj_size, hidden_size].
+    wqkv: QuantizedLinear<B>,
     /// Optional fused QKV bias `[q_proj_size + 2 * kv_proj_size]`. Present
     /// for Qwen2-family models (q/k/v_proj have bias); `None` for Llama.
     qkv_bias: Option<B::Tensor>,
@@ -84,7 +94,7 @@ pub struct LlamaAttention<B: Backend> {
     /// `head_dim` slice independently.
     q_norm: Option<RMSNorm<B>>,
     k_norm: Option<RMSNorm<B>>,
-    wo: B::Tensor,
+    wo: QuantizedLinear<B>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -94,15 +104,15 @@ pub struct LlamaAttention<B: Backend> {
 
 impl<B: Backend> LlamaAttention<B> {
     /// Construct without QKV bias (Llama).
-    pub fn new(wqkv: B::Tensor, wo: B::Tensor, config: &ModelConfig) -> Self {
+    pub fn new(wqkv: QuantizedLinear<B>, wo: QuantizedLinear<B>, config: &ModelConfig) -> Self {
         Self::new_with_bias(wqkv, None, wo, config)
     }
 
     /// Construct with an optional fused QKV bias (Qwen2 sets this).
     pub fn new_with_bias(
-        wqkv: B::Tensor,
+        wqkv: QuantizedLinear<B>,
         qkv_bias: Option<B::Tensor>,
-        wo: B::Tensor,
+        wo: QuantizedLinear<B>,
         config: &ModelConfig,
     ) -> Self {
         Self {
@@ -162,7 +172,7 @@ impl<B: Backend> LlamaAttention<B> {
 
     /// Apply the fused QKV projection (matmul + optional bias).
     fn project_qkv(&self, x: &B::Tensor, backend: &B) -> Result<B::Tensor> {
-        let qkv = backend.matmul(x, &self.wqkv)?;
+        let qkv = self.wqkv.matmul_prefill(x, backend)?;
         match &self.qkv_bias {
             Some(bias) => backend.add_bias(&qkv, bias),
             None => Ok(qkv),
@@ -238,7 +248,7 @@ impl<B: Backend> LlamaAttention<B> {
         let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
 
         // Output projection: [seq_len, num_heads * head_dim] @ wo
-        backend.matmul(&attn_out, &self.wo)
+        self.wo.matmul_prefill(&attn_out, backend)
     }
 
     /// Batched attention for decode: each sequence contributes exactly 1 token.
@@ -310,7 +320,7 @@ impl<B: Backend> LlamaAttention<B> {
                 scale,
             )?;
             let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
-            return backend.matmul(&attn_out, &self.wo);
+            return self.wo.matmul_prefill(&attn_out, backend);
         }
 
         // Fallback for non-paged caches (e.g. NaiveKvCache): retrieve full KV
@@ -335,7 +345,7 @@ impl<B: Backend> LlamaAttention<B> {
 
         // Cast + output projection
         let attn_out = backend.cast(&attn_out, self.wo.dtype())?;
-        backend.matmul(&attn_out, &self.wo)
+        self.wo.matmul_prefill(&attn_out, backend)
     }
 
     /// Persistent-buffer batched-decode forward.
@@ -366,7 +376,8 @@ impl<B: Backend> LlamaAttention<B> {
         // QKV projection + optional bias (Qwen2). Reads from buffers.normed
         // (caller convention). `add_bias_into` mutates the persistent qkv buffer
         // in place (the bias is a static weight), so it stays capture-safe.
-        backend.matmul_into(&mut buffers.qkv, &buffers.normed, &self.wqkv)?;
+        self.wqkv
+            .matmul_decode_into(&mut buffers.qkv, &buffers.normed, backend)?;
         if let Some(bias) = &self.qkv_bias {
             backend.add_bias_into(&mut buffers.qkv, bias)?;
         }
@@ -483,7 +494,8 @@ impl<B: Backend> LlamaAttention<B> {
         backend.cast_into(&mut buffers.attn_out_cast, &buffers.attn_out)?;
 
         // Output projection.
-        backend.matmul_into(&mut buffers.attn_proj, &buffers.attn_out_cast, &self.wo)?;
+        self.wo
+            .matmul_decode_into(&mut buffers.attn_proj, &buffers.attn_out_cast, backend)?;
         Ok(())
     }
 }

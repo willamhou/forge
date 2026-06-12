@@ -115,18 +115,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // through cudarc's plain end_capture returns CUDA_ERROR_INVALID_VALUE.
     // AUTO_FREE_ON_LAUNCH (=1) only affects graph-internal allocations,
     // which our captured ops never make, so it is a genuine no-op here.
-    let instantiate_flag = CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+    let instantiate_flag =
+        CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 
     // ===== Stage A: uncaptured baseline (kernels + GEMM) =====
     stream.memcpy_htod(&zeros_host, &mut buf)?;
-    run_kernels(&stream, &inc, &mul, &scale, &mut buf, kernel_cfg, n_i32, scale_value)?;
+    run_kernels(
+        &stream,
+        &inc,
+        &mul,
+        &scale,
+        &mut buf,
+        kernel_cfg,
+        n_i32,
+        scale_value,
+    )?;
     unsafe { blas.gemm(gemm_cfg, &gemm_a, &gemm_b, &mut gemm_c)? };
     stream.synchronize()?;
     let baseline_buf: Vec<f32> = stream.memcpy_dtov(&buf)?;
     let baseline_gemm: Vec<f32> = stream.memcpy_dtov(&gemm_c)?;
     println!(
         "[A baseline ] buf[0]={:.6} (expect {:.6})  gemm[0..4]={:?}",
-        baseline_buf[0], EXPECTED_BUF, &baseline_gemm[0..GEMM_DIM],
+        baseline_buf[0],
+        EXPECTED_BUF,
+        &baseline_gemm[0..GEMM_DIM],
     );
     if (baseline_buf[0] - EXPECTED_BUF).abs() > 1e-5 {
         return red("baseline buf disagrees with hand-computed value");
@@ -136,16 +148,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.memcpy_htod(&zeros_host, &mut buf)?;
     stream.synchronize()?;
     stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
-    let cap_kernels_err =
-        run_kernels(&stream, &inc, &mul, &scale, &mut buf, kernel_cfg, n_i32, scale_value);
+    let cap_kernels_err = run_kernels(
+        &stream,
+        &inc,
+        &mul,
+        &scale,
+        &mut buf,
+        kernel_cfg,
+        n_i32,
+        scale_value,
+    );
     let graph_kernels_result = stream.end_capture(instantiate_flag);
     // Check dispatch failure FIRST so the diagnostic is the real cause,
     // not the downstream STREAM_CAPTURE_INVALIDATED that end_capture would surface.
     if let Err(e) = cap_kernels_err {
         return red(&format!("kernel dispatch failed inside capture: {e}"));
     }
-    let graph_kernels = graph_kernels_result?
-        .ok_or("end_capture returned None for kernels-only capture")?;
+    let graph_kernels =
+        graph_kernels_result?.ok_or("end_capture returned None for kernels-only capture")?;
     println!("[B captureK ] kernel-only capture ok");
 
     // Replay REPLAYS× with H2D-reset before each launch. Separately measure
@@ -162,7 +182,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_direct = Instant::now();
     for _ in 0..REPLAYS {
         stream.memcpy_htod(&zeros_host, &mut buf)?;
-        run_kernels(&stream, &inc, &mul, &scale, &mut buf, kernel_cfg, n_i32, scale_value)?;
+        run_kernels(
+            &stream,
+            &inc,
+            &mul,
+            &scale,
+            &mut buf,
+            kernel_cfg,
+            n_i32,
+            scale_value,
+        )?;
     }
     stream.synchronize()?;
     let direct_us = t_direct.elapsed().as_micros() as f64 / REPLAYS as f64;
@@ -178,7 +207,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .all(|(r, b)| (r - b).abs() < 1e-5);
     println!(
         "[B replay×{:>3}] buf[0..2]={:?}  graph-only {:.1} µs  direct-equiv {:.1} µs",
-        REPLAYS, &replay_buf[0..2], replay_only_us, direct_us,
+        REPLAYS,
+        &replay_buf[0..2],
+        replay_only_us,
+        direct_us,
     );
     if !kernels_match {
         return red("replayed kernel-only graph diverges from baseline (full-buf check)");
@@ -189,12 +221,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     graph_kernels.launch()?;
     stream.synchronize()?;
     let updated: Vec<f32> = stream.memcpy_dtov(&buf)?;
-    let updated_all_match = updated
-        .iter()
-        .all(|&v| (v - EXPECTED_INPUT_5).abs() < 1e-5);
+    let updated_all_match = updated.iter().all(|&v| (v - EXPECTED_INPUT_5).abs() < 1e-5);
     println!(
         "[C h2d→replay] buf[0..2]={:?} (expect {:.6} for every element)",
-        &updated[0..2], EXPECTED_INPUT_5,
+        &updated[0..2],
+        EXPECTED_INPUT_5,
     );
     if !updated_all_match {
         return red("H2D memcpy before launch did not propagate to every element");
@@ -210,7 +241,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.synchronize()?;
     stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
     let cap_full_err = (|| -> Result<(), Box<dyn std::error::Error>> {
-        run_kernels(&stream, &inc, &mul, &scale, &mut buf, kernel_cfg, n_i32, scale_value)?;
+        run_kernels(
+            &stream,
+            &inc,
+            &mul,
+            &scale,
+            &mut buf,
+            kernel_cfg,
+            n_i32,
+            scale_value,
+        )?;
         unsafe { blas.gemm(gemm_cfg, &gemm_a, &gemm_b, &mut gemm_c)? };
         Ok(())
     })();
@@ -243,9 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_buf: Vec<f32> = stream.memcpy_dtov(&buf)?;
     let final_gemm: Vec<f32> = stream.memcpy_dtov(&gemm_c)?;
 
-    let buf_match = final_buf
-        .iter()
-        .all(|v| (v - EXPECTED_BUF).abs() < 1e-5);
+    let buf_match = final_buf.iter().all(|v| (v - EXPECTED_BUF).abs() < 1e-5);
     let gemm_vs_baseline = final_gemm
         .iter()
         .zip(&baseline_gemm)
@@ -270,7 +308,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "[D capture+G×{:>3}] buf[0..2]={:?}  gemm[0..4]={:?}",
-        REPLAYS, &final_buf[0..2], &final_gemm[0..GEMM_DIM],
+        REPLAYS,
+        &final_buf[0..2],
+        &final_gemm[0..GEMM_DIM],
     );
     println!();
     println!("✅ Task 1 decision gate = GREEN — all stages pass, proceed to Task 2.");

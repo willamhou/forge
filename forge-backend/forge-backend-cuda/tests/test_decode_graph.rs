@@ -11,7 +11,9 @@ use forge_backend_cuda::{CudaBackend, DecodeGraphRunner};
 use forge_core::{Backend, DType};
 
 fn rng(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let bits = (*seed >> 33) as u32;
     (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
@@ -56,7 +58,9 @@ fn decode_graph_runner_dispatches_buckets() {
     assert_eq!(runner.captured_count(), 0);
 
     // Build batch=2 inputs.
-    let q_data_b2: Vec<f32> = (0..2 * num_heads * head_dim).map(|_| rng(&mut seed)).collect();
+    let q_data_b2: Vec<f32> = (0..2 * num_heads * head_dim)
+        .map(|_| rng(&mut seed))
+        .collect();
     let q_b2 = backend
         .copy_from_host_f32(&q_data_b2, &[2, num_heads * head_dim])
         .unwrap();
@@ -101,7 +105,9 @@ fn decode_graph_runner_dispatches_buckets() {
     assert_eq!(runner.captured_count(), 1, "still one bucket");
 
     // ── Non-bucket batch size → fallback (closure runs, no capture) ─
-    let q_data_b3: Vec<f32> = (0..3 * num_heads * head_dim).map(|_| rng(&mut seed)).collect();
+    let q_data_b3: Vec<f32> = (0..3 * num_heads * head_dim)
+        .map(|_| rng(&mut seed))
+        .collect();
     let q_b3 = backend
         .copy_from_host_f32(&q_data_b3, &[3, num_heads * head_dim])
         .unwrap();
@@ -173,12 +179,8 @@ fn decode_graph_runner_dispatches_buckets() {
     assert_eq!(runner.captured_count(), 2);
 
     // Replays of both buckets independently.
-    runner
-        .dispatch(1, || panic!("should replay"))
-        .unwrap();
-    runner
-        .dispatch(2, || panic!("should replay"))
-        .unwrap();
+    runner.dispatch(1, || panic!("should replay")).unwrap();
+    runner.dispatch(2, || panic!("should replay")).unwrap();
     backend.synchronize().unwrap();
 
     // ── invalidate(bucket) drops just that bucket ───────────────────

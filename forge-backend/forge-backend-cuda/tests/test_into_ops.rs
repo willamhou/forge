@@ -51,7 +51,9 @@ fn into_variants_match_alloc_variants() {
     let c_alloc_f16_host = backend.copy_to_host_f32(&c_alloc_f16_f32).unwrap();
 
     let mut c_into_f16 = backend.allocate_zeros(&[m, n], DType::F16).unwrap();
-    backend.matmul_into(&mut c_into_f16, &a_f16, &b_f16).unwrap();
+    backend
+        .matmul_into(&mut c_into_f16, &a_f16, &b_f16)
+        .unwrap();
     backend.synchronize().unwrap();
     let c_into_f16_f32 = backend.cast(&c_into_f16, DType::F32).unwrap();
     let c_into_f16_host = backend.copy_to_host_f32(&c_into_f16_f32).unwrap();
@@ -113,11 +115,17 @@ fn into_variants_match_alloc_variants() {
     let sum_alloc_f16_host = backend.copy_to_host_f32(&sum_alloc_f16_f32).unwrap();
 
     let mut sum_into_f16 = backend.allocate_zeros(&shape_v, DType::F16).unwrap();
-    backend.add_into(&mut sum_into_f16, &v1_f16, &v2_f16).unwrap();
+    backend
+        .add_into(&mut sum_into_f16, &v1_f16, &v2_f16)
+        .unwrap();
     backend.synchronize().unwrap();
     let sum_into_f16_f32 = backend.cast(&sum_into_f16, DType::F32).unwrap();
     let sum_into_f16_host = backend.copy_to_host_f32(&sum_into_f16_f32).unwrap();
-    for (i, (got, want)) in sum_into_f16_host.iter().zip(&sum_alloc_f16_host).enumerate() {
+    for (i, (got, want)) in sum_into_f16_host
+        .iter()
+        .zip(&sum_alloc_f16_host)
+        .enumerate()
+    {
         assert!(
             (got - want).abs() < 1e-3,
             "add_into F16 diverges at [{i}]: got {got} want {want}"
@@ -149,7 +157,9 @@ fn into_variants_match_alloc_variants() {
 
     let mut rms_into = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
     for _ in 0..3 {
-        backend.rms_norm_into(&mut rms_into, &x, &weight, eps).unwrap();
+        backend
+            .rms_norm_into(&mut rms_into, &x, &weight, eps)
+            .unwrap();
     }
     backend.synchronize().unwrap();
     let rms_into_host = backend.copy_to_host_f32(&rms_into).unwrap();
@@ -206,7 +216,9 @@ fn into_variants_match_alloc_variants() {
 
     let mut silu_into = backend.allocate_zeros(&[rows, cols], DType::F32).unwrap();
     for _ in 0..3 {
-        backend.fused_silu_mul_into(&mut silu_into, &gate, &up).unwrap();
+        backend
+            .fused_silu_mul_into(&mut silu_into, &gate, &up)
+            .unwrap();
     }
     backend.synchronize().unwrap();
     let silu_into_host = backend.copy_to_host_f32(&silu_into).unwrap();
@@ -234,7 +246,9 @@ fn into_variants_match_alloc_variants() {
         .allocate_zeros(&[indices.len(), embed_dim], DType::F32)
         .unwrap();
     for _ in 0..3 {
-        backend.embedding_into(&mut emb_into, &emb_weight, &indices).unwrap();
+        backend
+            .embedding_into(&mut emb_into, &emb_weight, &indices)
+            .unwrap();
     }
     backend.synchronize().unwrap();
     let emb_into_host = backend.copy_to_host_f32(&emb_into).unwrap();
@@ -265,7 +279,9 @@ fn into_variants_match_alloc_variants() {
     assert_eq!(cast_same_host, x_host);
 
     // ── Validation on the new ops ────────────────────────────────
-    let mut wrong = backend.allocate_zeros(&[rows, cols + 1], DType::F32).unwrap();
+    let mut wrong = backend
+        .allocate_zeros(&[rows, cols + 1], DType::F32)
+        .unwrap();
     let _ = backend
         .rms_norm_into(&mut wrong, &x, &weight, eps)
         .expect_err("rms_norm_into wrong shape rejected");
@@ -301,9 +317,15 @@ fn into_variants_match_alloc_variants() {
     let k_alloc = backend.copy_to_host_f32(&k_a).unwrap();
     let v_alloc = backend.copy_to_host_f32(&v_a).unwrap();
 
-    let mut q_into = backend.allocate_zeros(&[split_rows, q_size], DType::F32).unwrap();
-    let mut k_into = backend.allocate_zeros(&[split_rows, kv_size], DType::F32).unwrap();
-    let mut v_into = backend.allocate_zeros(&[split_rows, kv_size], DType::F32).unwrap();
+    let mut q_into = backend
+        .allocate_zeros(&[split_rows, q_size], DType::F32)
+        .unwrap();
+    let mut k_into = backend
+        .allocate_zeros(&[split_rows, kv_size], DType::F32)
+        .unwrap();
+    let mut v_into = backend
+        .allocate_zeros(&[split_rows, kv_size], DType::F32)
+        .unwrap();
     backend
         .split_qkv_into(&mut q_into, &mut k_into, &mut v_into, &qkv, q_size, kv_size)
         .unwrap();
@@ -313,9 +335,18 @@ fn into_variants_match_alloc_variants() {
     assert_eq!(backend.copy_to_host_f32(&v_into).unwrap(), v_alloc);
 
     // Wrong q_out shape rejected
-    let mut q_wrong = backend.allocate_zeros(&[split_rows, q_size + 1], DType::F32).unwrap();
+    let mut q_wrong = backend
+        .allocate_zeros(&[split_rows, q_size + 1], DType::F32)
+        .unwrap();
     let _ = backend
-        .split_qkv_into(&mut q_wrong, &mut k_into, &mut v_into, &qkv, q_size, kv_size)
+        .split_qkv_into(
+            &mut q_wrong,
+            &mut k_into,
+            &mut v_into,
+            &qkv,
+            q_size,
+            kv_size,
+        )
         .expect_err("split_qkv_into wrong q shape rejected");
 
     // ── slice_rows_into vs slice_rows ────────────────────────────
@@ -326,13 +357,17 @@ fn into_variants_match_alloc_variants() {
     let row_alloc_host = backend.copy_to_host_f32(&row_alloc).unwrap();
 
     let mut row_into = backend.allocate_zeros(&[7, 5], DType::F32).unwrap();
-    backend.slice_rows_into(&mut row_into, &row_src, 5, 7).unwrap();
+    backend
+        .slice_rows_into(&mut row_into, &row_src, 5, 7)
+        .unwrap();
     backend.synchronize().unwrap();
     assert_eq!(backend.copy_to_host_f32(&row_into).unwrap(), row_alloc_host);
 
     // Reuse same buffer: subsequent slices overwrite (and second slice
     // should be different data, proving the buffer reuses cleanly).
-    backend.slice_rows_into(&mut row_into, &row_src, 0, 7).unwrap();
+    backend
+        .slice_rows_into(&mut row_into, &row_src, 0, 7)
+        .unwrap();
     backend.synchronize().unwrap();
     let row_into_host2 = backend.copy_to_host_f32(&row_into).unwrap();
     assert_eq!(row_into_host2, row_src_data[0..35]);
@@ -357,8 +392,12 @@ fn into_variants_match_alloc_variants() {
     let x_rope = backend
         .copy_from_host_f32(&rope_x, &[batch, rseq, heads, dim])
         .unwrap();
-    let cos_t = backend.copy_from_host_f32(&rope_cos, &[rseq, half]).unwrap();
-    let sin_t = backend.copy_from_host_f32(&rope_sin, &[rseq, half]).unwrap();
+    let cos_t = backend
+        .copy_from_host_f32(&rope_cos, &[rseq, half])
+        .unwrap();
+    let sin_t = backend
+        .copy_from_host_f32(&rope_sin, &[rseq, half])
+        .unwrap();
 
     let rope_alloc = backend.rope(&x_rope, &cos_t, &sin_t).unwrap();
     backend.synchronize().unwrap();
@@ -368,7 +407,9 @@ fn into_variants_match_alloc_variants() {
         .allocate_zeros(&[batch, rseq, heads, dim], DType::F32)
         .unwrap();
     for _ in 0..3 {
-        backend.rope_into(&mut rope_into, &x_rope, &cos_t, &sin_t).unwrap();
+        backend
+            .rope_into(&mut rope_into, &x_rope, &cos_t, &sin_t)
+            .unwrap();
     }
     backend.synchronize().unwrap();
     assert_eq!(
@@ -483,7 +524,9 @@ fn into_variants_match_alloc_variants() {
     let bx = backend
         .copy_from_host_f32(&bx_data, &[bias_rows, bias_cols])
         .unwrap();
-    let bias = backend.copy_from_host_f32(&bias_data, &[bias_cols]).unwrap();
+    let bias = backend
+        .copy_from_host_f32(&bias_data, &[bias_cols])
+        .unwrap();
 
     // F32
     let biased = backend.add_bias(&bx, &bias).unwrap();

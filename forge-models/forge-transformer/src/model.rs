@@ -5,6 +5,7 @@ use forge_core::{
 
 use crate::layers::{LlamaDecoderLayer, RMSNorm};
 use crate::persistent_buffers::{LlamaDecodeState, LlamaPersistentBuffers, StagedDecodeMeta};
+use crate::quantized_linear::QuantizedLinear;
 use crate::rope::RopeFreqs;
 
 pub struct TransformerModel<B: Backend> {
@@ -12,7 +13,7 @@ pub struct TransformerModel<B: Backend> {
     embed_tokens: B::Tensor,
     layers: Vec<LlamaDecoderLayer<B>>,
     norm: RMSNorm<B>,
-    lm_head: B::Tensor,
+    lm_head: QuantizedLinear<B>,
     rope_freqs: RopeFreqs<B>,
     backend: B,
 }
@@ -23,7 +24,7 @@ impl<B: Backend> TransformerModel<B> {
         embed_tokens: B::Tensor,
         layers: Vec<LlamaDecoderLayer<B>>,
         norm: RMSNorm<B>,
-        lm_head: B::Tensor,
+        lm_head: QuantizedLinear<B>,
         rope_freqs: RopeFreqs<B>,
         backend: B,
     ) -> Self {
@@ -71,8 +72,19 @@ impl<B: Backend + Clone> TransformerModel<B> {
             )?;
         }
 
+        // Prefill runs the layers over every prompt position, but only the
+        // last position's logits are needed to sample the next token — the
+        // engine slices off the last row and discards the rest (and skips
+        // sampling entirely for non-final chunks). Slicing to the last row
+        // before the LM head turns an [seq_len, vocab] head matmul + D2H copy
+        // into [1, vocab], which is the dominant prefill cost at long prompts.
+        let mut hidden = hidden;
+        if seq_meta.is_prefill && token_ids.len() > 1 {
+            hidden = self.backend.slice_rows(&hidden, token_ids.len() - 1, 1)?;
+        }
+
         hidden = self.norm.forward(&hidden, &self.backend)?;
-        let logits = self.backend.matmul(&hidden, &self.lm_head)?;
+        let logits = self.lm_head.matmul_prefill(&hidden, &self.backend)?;
 
         Ok(ModelOutput { logits })
     }
@@ -105,7 +117,7 @@ impl<B: Backend + Clone> TransformerModel<B> {
         }
 
         hidden = self.norm.forward(&hidden, &self.backend)?;
-        let logits = self.backend.matmul(&hidden, &self.lm_head)?;
+        let logits = self.lm_head.matmul_prefill(&hidden, &self.backend)?;
 
         Ok(ModelOutput { logits })
     }
@@ -185,12 +197,11 @@ impl<B: Backend + Clone> TransformerModel<B> {
             for (j, &b) in bt.iter().enumerate() {
                 // Block ids feed paged attention as i32; a wrap to negative
                 // would silently read garbage KV. Reject oversized pools.
-                block_tables[i * max_blocks_per_seq + j] =
-                    i32::try_from(b).map_err(|_| {
-                        ForgeError::InvalidArgument(format!(
-                            "stage_decode: block id {b} exceeds i32::MAX (KV pool too large)"
-                        ))
-                    })?;
+                block_tables[i * max_blocks_per_seq + j] = i32::try_from(b).map_err(|_| {
+                    ForgeError::InvalidArgument(format!(
+                        "stage_decode: block id {b} exceeds i32::MAX (KV pool too large)"
+                    ))
+                })?;
             }
         }
 
@@ -233,6 +244,26 @@ impl<B: Backend + Clone> TransformerModel<B> {
             meta,
         } = state;
 
+        // stage_decode_inputs already uploaded token indices / RoPE cos-sin /
+        // block tables / kv lens this step, so tell the backend to skip the
+        // per-op re-upload (otherwise those memcpys get captured as redundant
+        // graph nodes, slowing every replay). Cleared before returning — even on
+        // error — so the prefill / eager `forward` path keeps uploading.
+        self.backend.set_decode_inputs_prestaged(true);
+        let result = self.compute_decode_body(buffers, token_ids.as_slice(), meta, kv_cache);
+        self.backend.set_decode_inputs_prestaged(false);
+        result
+    }
+
+    /// Body of [`Self::compute_decode_impl`], run with decode inputs already
+    /// staged. Split out so the prestaged flag is reset on every exit path.
+    fn compute_decode_body(
+        &self,
+        buffers: &mut LlamaPersistentBuffers<B>,
+        token_ids: &[u32],
+        meta: &StagedDecodeMeta,
+        kv_cache: &mut dyn KvCache<T = B::Tensor>,
+    ) -> Result<()> {
         // Embedding lookup → buffers.embeddings → seeds buffers.hidden.
         self.backend
             .embedding_into(&mut buffers.embeddings, &self.embed_tokens, token_ids)?;
@@ -261,10 +292,10 @@ impl<B: Backend + Clone> TransformerModel<B> {
         )?;
         self.backend
             .cast_into(&mut buffers.final_normed_cast, &buffers.final_normed)?;
-        self.backend.matmul_into(
+        self.lm_head.matmul_decode_into(
             &mut buffers.logits,
             &buffers.final_normed_cast,
-            &self.lm_head,
+            &self.backend,
         )?;
         Ok(())
     }

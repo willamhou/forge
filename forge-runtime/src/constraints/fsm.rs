@@ -126,10 +126,7 @@ impl FsmConstraint for TokenFsmIndex {
 /// character) through the DFA. If all characters lead to valid transitions,
 /// the token is allowed from that state, and the resulting DFA state after
 /// the last character is the next state.
-pub fn build_token_index(
-    dfa: &dyn CharDfa,
-    vocab: &TokenVocab,
-) -> Result<TokenFsmIndex> {
+pub fn build_token_index(dfa: &dyn CharDfa, vocab: &TokenVocab) -> Result<TokenFsmIndex> {
     let all_states = dfa.all_states();
     let initial_state = dfa.initial_state();
     let final_states = dfa.final_states();

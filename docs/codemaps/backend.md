@@ -8,6 +8,7 @@
 ```rust
 pub trait Backend: Send + Sync + 'static {
     type Tensor: Tensor;
+    fn preferred_block_size(head_dim, dtype) -> usize  // default 16; CudaBackend → 256 when FA2-eligible (fa2_paged_eligible)
     fn matmul(a, b, trans_a, trans_b) -> Result<Tensor>
     fn matmul_f16(a, b, trans_a, trans_b) -> Result<Tensor>
     fn add(a, b) -> Result<Tensor>

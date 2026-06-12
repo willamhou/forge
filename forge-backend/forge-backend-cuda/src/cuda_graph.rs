@@ -141,7 +141,8 @@ impl CudaGraphCache {
         // cudarc 0.17.8 bindgen omits a `_NONE` (=0) enum variant, and
         // UPLOAD (=2) requires the WithParams API. AUTO_FREE_ON_LAUNCH is a
         // genuine no-op for graphs that contain no graph-internal allocs.
-        let instantiate_flag = CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+        let instantiate_flag =
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
         let graph_result = self.stream.end_capture(instantiate_flag);
 
         // Surface fwd error first — the end_capture failure is downstream
@@ -150,7 +151,9 @@ impl CudaGraphCache {
         let graph = graph_result
             .map_err(|e| ForgeError::Cuda(format!("end_capture: {e}")))?
             .ok_or_else(|| {
-                ForgeError::Cuda("end_capture returned None — closure issued no captureable ops".into())
+                ForgeError::Cuda(
+                    "end_capture returned None — closure issued no captureable ops".into(),
+                )
             })?;
 
         graph

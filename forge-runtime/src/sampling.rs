@@ -53,16 +53,14 @@ impl LogitProcessorPipeline {
     }
 
     fn apply_presence_frequency_penalty(&self, logits: &mut [f32], ctx: &SamplingContext<'_>) {
-        if self.presence_penalty.abs() < f32::EPSILON
-            && self.frequency_penalty.abs() < f32::EPSILON
+        if self.presence_penalty.abs() < f32::EPSILON && self.frequency_penalty.abs() < f32::EPSILON
         {
             return;
         }
         for (&token_id, &count) in ctx.token_counts {
             let idx = token_id as usize;
             if idx < logits.len() {
-                logits[idx] -=
-                    self.presence_penalty + self.frequency_penalty * (count as f32);
+                logits[idx] -= self.presence_penalty + self.frequency_penalty * (count as f32);
             }
         }
     }
@@ -167,9 +165,7 @@ impl CpuSampler {
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| {
-                forge_core::ForgeError::InvalidArgument("empty logits".into())
-            })?;
+            .ok_or_else(|| forge_core::ForgeError::InvalidArgument("empty logits".into()))?;
 
         // Compute logprob from normalized probability (softmax), not raw logit.
         // This is consistent with multinomial sampling which returns ln(p).
@@ -235,10 +231,7 @@ fn count_tokens(tokens: &[u32]) -> HashMap<u32, usize> {
 }
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.into_iter().map(|e| e / sum).collect()
@@ -253,8 +246,7 @@ fn apply_top_k(probs: &mut [f32], k: usize) {
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     // Collect the indices to keep (exactly the top k)
-    let keep: std::collections::HashSet<usize> =
-        indexed[..k].iter().map(|&(idx, _)| idx).collect();
+    let keep: std::collections::HashSet<usize> = indexed[..k].iter().map(|&(idx, _)| idx).collect();
     for (i, p) in probs.iter_mut().enumerate() {
         if !keep.contains(&i) {
             *p = 0.0;
@@ -289,10 +281,7 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
 
 /// Zero out tokens whose probability is less than min_p * max_probability.
 fn apply_min_p(probs: &mut [f32], min_p: f32) {
-    let max_prob = probs
-        .iter()
-        .cloned()
-        .fold(0.0f32, f32::max);
+    let max_prob = probs.iter().cloned().fold(0.0f32, f32::max);
     let threshold = min_p * max_prob;
     for p in probs.iter_mut() {
         if *p < threshold {

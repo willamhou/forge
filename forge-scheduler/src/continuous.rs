@@ -248,13 +248,17 @@ impl Scheduler for ContinuousBatchingScheduler {
 
             // Reject prompts that can never fit in the max prefill budget
             // (only when chunking is disabled — with chunking any prompt can be split).
-            if self.config.prefill_chunk_size.is_none() && prompt_len > self.config.max_prefill_tokens
+            if self.config.prefill_chunk_size.is_none()
+                && prompt_len > self.config.max_prefill_tokens
             {
                 self.waiting.pop_front();
-                to_reject.push((seq_id, format!(
-                    "prompt length ({prompt_len}) exceeds max_prefill_tokens ({})",
-                    self.config.max_prefill_tokens
-                )));
+                to_reject.push((
+                    seq_id,
+                    format!(
+                        "prompt length ({prompt_len}) exceeds max_prefill_tokens ({})",
+                        self.config.max_prefill_tokens
+                    ),
+                ));
                 continue;
             }
 
@@ -284,10 +288,13 @@ impl Scheduler for ContinuousBatchingScheduler {
                 // so it doesn't block all subsequent requests (head-of-line).
                 if blocks_needed > cache_usage.total_blocks {
                     self.waiting.pop_front();
-                    to_reject.push((seq_id, format!(
-                        "prompt requires {blocks_needed} blocks but cache only has {} total",
-                        cache_usage.total_blocks
-                    )));
+                    to_reject.push((
+                        seq_id,
+                        format!(
+                            "prompt requires {blocks_needed} blocks but cache only has {} total",
+                            cache_usage.total_blocks
+                        ),
+                    ));
                     continue;
                 }
                 break;

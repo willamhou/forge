@@ -1,6 +1,4 @@
-use forge_core::{
-    CacheUsage, FinishReason, InferenceRequest, SamplingParams, Scheduler,
-};
+use forge_core::{CacheUsage, FinishReason, InferenceRequest, SamplingParams, Scheduler};
 use forge_scheduler::{ContinuousBatchingScheduler, SchedulerConfig};
 
 fn default_cache() -> CacheUsage {
@@ -9,6 +7,54 @@ fn default_cache() -> CacheUsage {
         used_blocks: 0,
         block_size: 16,
     }
+}
+
+/// Guards the `ceil(prompt_len / block_size)` admission math in
+/// `continuous.rs` against the auto-resolved `block_size=256` default:
+/// a 4096-token prompt needs exactly 16 blocks. With 16 blocks total the
+/// prompt is admitted; with 15 it must be rejected (head-of-line rule).
+/// Together the two cases pin the ceil result to exactly 16.
+/// (This test lives in forge-scheduler because forge-kvcache has no
+/// dependency on the scheduler crate.)
+#[test]
+fn test_4096_token_prompt_needs_exactly_16_blocks_at_block_size_256() {
+    let prompt: Vec<u32> = (0..4_096).collect();
+
+    // Exactly 16 blocks available -> admitted.
+    let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
+    let cache_fits = CacheUsage {
+        total_blocks: 16,
+        used_blocks: 0,
+        block_size: 256,
+    };
+    scheduler
+        .enqueue(make_request("req-fits", prompt.clone()))
+        .unwrap();
+    let batch = scheduler.schedule(&cache_fits).unwrap();
+    assert_eq!(
+        batch.prefill_seqs.len(),
+        1,
+        "16 blocks must admit 4096 tokens"
+    );
+    assert_eq!(batch.prefill_seqs[0].token_ids.len(), 4_096);
+    assert!(batch.rejected.is_empty());
+
+    // One block short -> rejected outright (can never fit in total cache).
+    let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
+    let cache_short = CacheUsage {
+        total_blocks: 15,
+        used_blocks: 0,
+        block_size: 256,
+    };
+    scheduler
+        .enqueue(make_request("req-short", prompt))
+        .unwrap();
+    let batch = scheduler.schedule(&cache_short).unwrap();
+    assert!(
+        batch.prefill_seqs.is_empty(),
+        "15 blocks must not admit 4096 tokens"
+    );
+    assert_eq!(batch.rejected.len(), 1, "expected head-of-line rejection");
 }
 
 fn make_request(id: &str, tokens: Vec<u32>) -> InferenceRequest {
@@ -24,7 +70,9 @@ fn test_enqueue_and_schedule() {
     let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
     let cache = default_cache();
 
-    scheduler.enqueue(make_request("req-1", vec![1, 2, 3, 4, 5])).unwrap();
+    scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3, 4, 5]))
+        .unwrap();
 
     let batch = scheduler.schedule(&cache).unwrap();
     assert_eq!(batch.prefill_seqs.len(), 1);
@@ -37,7 +85,9 @@ fn test_prefill_then_decode() {
     let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
     let cache = default_cache();
 
-    let handle = scheduler.enqueue(make_request("req-1", vec![1, 2, 3])).unwrap();
+    let handle = scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3]))
+        .unwrap();
 
     // First schedule: prefill
     let batch = scheduler.schedule(&cache).unwrap();
@@ -58,10 +108,14 @@ fn test_finish_removes_sequence() {
     let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
     let cache = default_cache();
 
-    let handle = scheduler.enqueue(make_request("req-1", vec![1, 2, 3])).unwrap();
+    let handle = scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3]))
+        .unwrap();
     let _ = scheduler.schedule(&cache).unwrap();
 
-    scheduler.finish(handle.seq_id, FinishReason::EosToken).unwrap();
+    scheduler
+        .finish(handle.seq_id, FinishReason::EosToken)
+        .unwrap();
 
     let batch = scheduler.schedule(&cache).unwrap();
     assert!(batch.is_empty());
@@ -77,7 +131,9 @@ fn test_max_batch_size() {
     let cache = default_cache();
 
     for i in 0..5 {
-        scheduler.enqueue(make_request(&format!("req-{i}"), vec![1, 2, 3])).unwrap();
+        scheduler
+            .enqueue(make_request(&format!("req-{i}"), vec![1, 2, 3]))
+            .unwrap();
     }
 
     let batch = scheduler.schedule(&cache).unwrap();
@@ -89,7 +145,9 @@ fn test_generated_tokens() {
     let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
     let cache = default_cache();
 
-    let handle = scheduler.enqueue(make_request("req-1", vec![1, 2, 3])).unwrap();
+    let handle = scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3]))
+        .unwrap();
     let _ = scheduler.schedule(&cache).unwrap();
 
     scheduler.append_token(handle.seq_id, 10).unwrap();
@@ -105,7 +163,9 @@ fn test_cancel_sequence() {
     let mut scheduler = ContinuousBatchingScheduler::new(Default::default());
     let cache = default_cache();
 
-    let handle = scheduler.enqueue(make_request("req-1", vec![1, 2, 3])).unwrap();
+    let handle = scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3]))
+        .unwrap();
     let _ = scheduler.schedule(&cache).unwrap();
 
     scheduler.cancel(handle.seq_id).unwrap();
@@ -139,7 +199,9 @@ fn test_cache_pressure_limits_prefill() {
     };
 
     // Enqueue a request needing 48 tokens (3 blocks) — won't fit
-    scheduler.enqueue(make_request("req-1", vec![0; 48])).unwrap();
+    scheduler
+        .enqueue(make_request("req-1", vec![0; 48]))
+        .unwrap();
 
     let batch = scheduler.schedule(&cache).unwrap();
     assert!(batch.is_empty()); // can't schedule: not enough cache
@@ -151,12 +213,16 @@ fn test_decode_before_new_prefill() {
     let cache = default_cache();
 
     // Prefill first request
-    let h1 = scheduler.enqueue(make_request("req-1", vec![1, 2, 3])).unwrap();
+    let h1 = scheduler
+        .enqueue(make_request("req-1", vec![1, 2, 3]))
+        .unwrap();
     let _ = scheduler.schedule(&cache).unwrap();
     scheduler.append_token(h1.seq_id, 10).unwrap();
 
     // Enqueue second request
-    scheduler.enqueue(make_request("req-2", vec![4, 5, 6])).unwrap();
+    scheduler
+        .enqueue(make_request("req-2", vec![4, 5, 6]))
+        .unwrap();
 
     // Next schedule should include both: decode for req-1, prefill for req-2
     let batch = scheduler.schedule(&cache).unwrap();
@@ -182,9 +248,15 @@ fn test_prefill_overcommit_protection() {
 
     // Enqueue 3 requests, each needing 2 blocks (20 tokens each)
     // Total need: 6 blocks, but only 3 are available
-    scheduler.enqueue(make_request("req-1", vec![0; 20])).unwrap();
-    scheduler.enqueue(make_request("req-2", vec![0; 20])).unwrap();
-    scheduler.enqueue(make_request("req-3", vec![0; 20])).unwrap();
+    scheduler
+        .enqueue(make_request("req-1", vec![0; 20]))
+        .unwrap();
+    scheduler
+        .enqueue(make_request("req-2", vec![0; 20]))
+        .unwrap();
+    scheduler
+        .enqueue(make_request("req-3", vec![0; 20]))
+        .unwrap();
 
     let batch = scheduler.schedule(&cache).unwrap();
     // Only the first request should be scheduled (2 blocks), leaving 1 free block

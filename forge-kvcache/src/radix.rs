@@ -106,18 +106,28 @@ impl RadixTree {
     }
 
     pub fn evict_lru(&mut self, n: usize) -> Vec<usize> {
-        if n == 0 { return Vec::new(); }
+        if n == 0 {
+            return Vec::new();
+        }
         let mut ev = Vec::new();
         loop {
             let mut cs = Vec::new();
             Self::collect_evictable(&self.root, &mut Vec::new(), &mut cs);
-            if cs.is_empty() { break; }
+            if cs.is_empty() {
+                break;
+            }
             cs.sort_by_key(|(t, _)| *t);
             for (_, p) in cs {
-                if ev.len() >= n { return ev; }
-                if let Some(b) = Self::try_evict_leaf(&mut self.root, &p) { ev.push(b); }
+                if ev.len() >= n {
+                    return ev;
+                }
+                if let Some(b) = Self::try_evict_leaf(&mut self.root, &p) {
+                    ev.push(b);
+                }
             }
-            if ev.len() >= n { break; }
+            if ev.len() >= n {
+                break;
+            }
         }
         ev
     }
@@ -130,17 +140,10 @@ impl RadixTree {
         Self::count_evictable(&self.root)
     }
 
-    fn collect_evictable(
-        node: &RadixNode,
-        path: &mut Vec<u32>,
-        out: &mut Vec<(u64, Vec<u32>)>,
-    ) {
+    fn collect_evictable(node: &RadixNode, path: &mut Vec<u32>, out: &mut Vec<(u64, Vec<u32>)>) {
         for (tok, child) in &node.children {
             path.push(*tok);
-            if child.children.is_empty()
-                && child.ref_count == 0
-                && child.block_id.is_some()
-            {
+            if child.children.is_empty() && child.ref_count == 0 && child.block_id.is_some() {
                 out.push((child.last_access, path.clone()));
             }
             Self::collect_evictable(child, path, out);
@@ -149,7 +152,9 @@ impl RadixTree {
     }
 
     fn try_evict_leaf(root: &mut RadixNode, path: &[u32]) -> Option<usize> {
-        if path.is_empty() { return None; }
+        if path.is_empty() {
+            return None;
+        }
         // Check eligibility first without moving root.
         {
             let leaf = Self::nav_parent(root, path)?;
@@ -168,7 +173,10 @@ impl RadixTree {
                 Some(a) => a,
                 None => break,
             };
-            if ancestor.children.is_empty() && ancestor.block_id.is_none() && ancestor.ref_count == 0 {
+            if ancestor.children.is_empty()
+                && ancestor.block_id.is_none()
+                && ancestor.ref_count == 0
+            {
                 // Remove this dead node from its parent.
                 let par = Self::nav_parent(root, &path[..depth - 1]).unwrap();
                 par.children.remove(&path[depth - 1]);
@@ -198,10 +206,7 @@ impl RadixTree {
     fn count_evictable(node: &RadixNode) -> usize {
         let mut c = 0;
         for child in node.children.values() {
-            if child.children.is_empty()
-                && child.ref_count == 0
-                && child.block_id.is_some()
-            {
+            if child.children.is_empty() && child.ref_count == 0 && child.block_id.is_some() {
                 c += 1;
             }
             c += Self::count_evictable(child);

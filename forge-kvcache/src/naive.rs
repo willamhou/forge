@@ -137,9 +137,7 @@ impl<B: Backend + Clone> KvCache for NaiveKvCache<B> {
             .ok_or(ForgeError::SeqNotFound(seq_id))?;
 
         let layer_cache = seq.layers.get(&layer).ok_or_else(|| {
-            ForgeError::InvalidArgument(format!(
-                "No cached KV for seq {seq_id} layer {layer}"
-            ))
+            ForgeError::InvalidArgument(format!("No cached KV for seq {seq_id} layer {layer}"))
         })?;
 
         let key = layer_cache

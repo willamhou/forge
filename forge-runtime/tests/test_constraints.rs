@@ -84,13 +84,22 @@ fn test_token_fsm_simple() {
     // From initial, "a" (token 0) and "ab" (token 3) should be allowed
     assert!(allowed.contains(&0), "token 'a' should be allowed");
     assert!(allowed.contains(&3), "token 'ab' should be allowed");
-    assert!(!allowed.contains(&1), "token 'b' should NOT be allowed from start");
+    assert!(
+        !allowed.contains(&1),
+        "token 'b' should NOT be allowed from start"
+    );
 
     // After token "a" (0), we should be able to continue with "b" or "bc"
     let next = fsm.next_state(initial, 0).unwrap();
     let allowed2 = fsm.allowed_tokens(next).unwrap();
-    assert!(allowed2.contains(&1), "token 'b' should be allowed after 'a'");
-    assert!(allowed2.contains(&4), "token 'bc' should be allowed after 'a'");
+    assert!(
+        allowed2.contains(&1),
+        "token 'b' should be allowed after 'a'"
+    );
+    assert!(
+        allowed2.contains(&4),
+        "token 'bc' should be allowed after 'a'"
+    );
 }
 
 #[test]
@@ -138,8 +147,14 @@ fn test_fsm_mask_logits() {
 
     // Only "a" (token 0) should remain, others should be -inf
     assert!(logits[0].is_finite(), "token 'a' logit should remain");
-    assert!(logits[1].is_infinite() && logits[1] < 0.0, "token 'b' should be -inf");
-    assert!(logits[2].is_infinite() && logits[2] < 0.0, "token 'c' should be -inf");
+    assert!(
+        logits[1].is_infinite() && logits[1] < 0.0,
+        "token 'b' should be -inf"
+    );
+    assert!(
+        logits[2].is_infinite() && logits[2] < 0.0,
+        "token 'c' should be -inf"
+    );
 }
 
 // ===== Sampler Integration Test =====
@@ -164,7 +179,10 @@ fn test_sampler_with_constraint() {
         .sample_with_constraint(&logits, &params, &[], Some((&fsm, fsm.initial_state())))
         .unwrap();
 
-    assert_eq!(result.token_id, 0, "should select 'a' despite 'c' having higher logit");
+    assert_eq!(
+        result.token_id, 0,
+        "should select 'a' despite 'c' having higher logit"
+    );
 }
 
 #[test]
@@ -182,7 +200,10 @@ fn test_sampler_without_constraint() {
         .sample_with_constraint(&logits, &params, &[], None)
         .unwrap();
 
-    assert_eq!(result.token_id, 2, "should select highest logit without constraint");
+    assert_eq!(
+        result.token_id, 2,
+        "should select highest logit without constraint"
+    );
 }
 
 // ===== JSON Schema Tests =====
@@ -344,8 +365,7 @@ fn test_json_schema_token_fsm() {
 
     // Vocab: individual characters + common tokens
     let vocab = test_vocab(&[
-        "t", "r", "u", "e", "f", "a", "l", "s",
-        "true", "false", "null", "1", "0",
+        "t", "r", "u", "e", "f", "a", "l", "s", "true", "false", "null", "1", "0",
     ]);
 
     use forge_runtime::constraints::json_schema::build_json_schema_fsm;

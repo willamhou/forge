@@ -5,15 +5,15 @@
 //! reference CUDA Task 2.2's kernel will be compared against.
 
 use forge_backend_cpu::CpuBackend;
+use forge_core::KvCache;
 use forge_core::{Backend, DType, Tensor};
 use forge_kvcache::paged_cache::PagedKvCache;
-use forge_core::KvCache;
 
 fn approx_eq(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| (x - y).abs() <= tol || ((x - y).abs() / x.abs().max(y.abs()).max(1e-6)) <= tol)
+        && a.iter().zip(b).all(|(x, y)| {
+            (x - y).abs() <= tol || ((x - y).abs() / x.abs().max(y.abs()).max(1e-6)) <= tol
+        })
 }
 
 #[test]
@@ -54,8 +54,12 @@ fn paged_attention_matches_gather_then_attend_gqa() {
         .append(
             1,
             layer,
-            &backend.copy_from_host_f32(&k1, &[seq1_len, kv_dim]).unwrap(),
-            &backend.copy_from_host_f32(&v1, &[seq1_len, kv_dim]).unwrap(),
+            &backend
+                .copy_from_host_f32(&k1, &[seq1_len, kv_dim])
+                .unwrap(),
+            &backend
+                .copy_from_host_f32(&v1, &[seq1_len, kv_dim])
+                .unwrap(),
         )
         .unwrap();
 
@@ -72,8 +76,12 @@ fn paged_attention_matches_gather_then_attend_gqa() {
         .append(
             2,
             layer,
-            &backend.copy_from_host_f32(&k2, &[seq2_len, kv_dim]).unwrap(),
-            &backend.copy_from_host_f32(&v2, &[seq2_len, kv_dim]).unwrap(),
+            &backend
+                .copy_from_host_f32(&k2, &[seq2_len, kv_dim])
+                .unwrap(),
+            &backend
+                .copy_from_host_f32(&v2, &[seq2_len, kv_dim])
+                .unwrap(),
         )
         .unwrap();
 
@@ -86,8 +94,7 @@ fn paged_attention_matches_gather_then_attend_gqa() {
         .unwrap();
 
     // Batch metadata
-    let (block_tables, kv_lens, max_blocks_per_seq) =
-        cache.batch_block_tables(&[1, 2]).unwrap();
+    let (block_tables, kv_lens, max_blocks_per_seq) = cache.batch_block_tables(&[1, 2]).unwrap();
     assert_eq!(kv_lens, vec![seq1_len as i32, seq2_len as i32]);
 
     // ── Run paged_attention ──────────────────────────────────────────
@@ -161,33 +168,51 @@ fn paged_attention_validates_inputs() {
     let scale = 0.5;
 
     // 1. block_tables length must equal batch * max_blocks_per_seq
-    assert!(backend
-        .paged_attention(&q, &pool, &pool, &[0, -1, 0], &[1], 2, 4, 2, 4, scale)
-        .is_err());
+    assert!(
+        backend
+            .paged_attention(&q, &pool, &pool, &[0, -1, 0], &[1], 2, 4, 2, 4, scale)
+            .is_err()
+    );
 
     // 2. pool kv_dim mismatch (claim head_dim=2 → expected kv_dim=4, pool is 8)
-    assert!(backend
-        .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 2, 2, scale)
-        .is_err());
+    assert!(
+        backend
+            .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 2, 2, scale)
+            .is_err()
+    );
 
     // 3. negative kv_len
-    assert!(backend
-        .paged_attention(&q, &pool, &pool, &[0, -1], &[-1], 2, 4, 2, 4, scale)
-        .is_err());
+    assert!(
+        backend
+            .paged_attention(&q, &pool, &pool, &[0, -1], &[-1], 2, 4, 2, 4, scale)
+            .is_err()
+    );
 
     // 4. num_heads not divisible by num_kv_heads
-    assert!(backend
-        .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 5, 2, 4, scale)
-        .is_err());
+    assert!(
+        backend
+            .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 5, 2, 4, scale)
+            .is_err()
+    );
 
     // 5. num_kv_heads == 0 must error cleanly, NOT panic on the `num_heads %
     //    num_kv_heads` divide-by-zero (Codex review on PR #5).
-    assert!(backend
-        .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 0, 4, scale)
-        .is_err());
+    assert!(
+        backend
+            .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 0, 4, scale)
+            .is_err()
+    );
 
     // 6. Valid call succeeds (1 seq, 1 block, 1 token, all-zeros)
     let _ = backend
         .paged_attention(&q, &pool, &pool, &[0, -1], &[1], 2, 4, 2, 4, scale)
         .unwrap();
+}
+
+#[test]
+fn cpu_preferred_block_size_is_16_for_any_shape() {
+    let b = CpuBackend::new();
+    assert_eq!(b.preferred_block_size(128, DType::F16), 16);
+    assert_eq!(b.preferred_block_size(128, DType::F32), 16);
+    assert_eq!(b.preferred_block_size(64, DType::BF16), 16);
 }

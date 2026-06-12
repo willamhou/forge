@@ -100,9 +100,7 @@ impl IncrementalDecoder {
         // (e.g. whitespace normalization). If the decoded prefix no longer
         // matches what we previously emitted, skip this token's output since
         // we cannot unsend already-streamed text.
-        if decoded.len() < self.prev_text_len
-            || !decoded.starts_with(&self.prev_text)
-        {
+        if decoded.len() < self.prev_text_len || !decoded.starts_with(&self.prev_text) {
             // Update tracking to the full decoded text so subsequent tokens
             // diff correctly against the current decode state.
             self.prev_text_len = decoded.len();
@@ -130,13 +128,12 @@ impl IncrementalDecoder {
         self.pending_ids.clear();
 
         // On rewrite, skip re-emitting already-streamed text.
-        let new_text = if decoded.len() < self.prev_text_len
-            || !decoded.starts_with(&self.prev_text)
-        {
-            String::new()
-        } else {
-            decoded[self.prev_text_len..].to_string()
-        };
+        let new_text =
+            if decoded.len() < self.prev_text_len || !decoded.starts_with(&self.prev_text) {
+                String::new()
+            } else {
+                decoded[self.prev_text_len..].to_string()
+            };
 
         self.prev_text_len = 0;
         self.prev_text.clear();

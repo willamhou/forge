@@ -9,7 +9,9 @@ use forge_backend_cuda::CudaBackend;
 use forge_core::{Backend, DType, Tensor};
 
 fn rng_lcg(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let bits = (*seed >> 33) as u32;
     // Map to roughly (-1, 1)
     (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
@@ -89,8 +91,16 @@ fn paged_attention_cuda_matches_default_impl() {
             .map(|&id| id as usize)
             .collect();
         let kv_len = kv_lens[b] as usize;
-        k_caches.push(backend.paged_gather_kv(&k_pool, &block_ids, kv_len).unwrap());
-        v_caches.push(backend.paged_gather_kv(&v_pool, &block_ids, kv_len).unwrap());
+        k_caches.push(
+            backend
+                .paged_gather_kv(&k_pool, &block_ids, kv_len)
+                .unwrap(),
+        );
+        v_caches.push(
+            backend
+                .paged_gather_kv(&v_pool, &block_ids, kv_len)
+                .unwrap(),
+        );
     }
     let out_ref = backend
         .batched_decode_attention(
@@ -127,10 +137,7 @@ fn paged_attention_cuda_matches_default_impl() {
     // ── Single-batch sanity check ─────────────────────────────────
     // batch_size = 1 should reuse the kernel with grid_dim.x = 1.
     let q1 = backend
-        .copy_from_host_f32(
-            &q_data[..num_heads * head_dim],
-            &[1, num_heads * head_dim],
-        )
+        .copy_from_host_f32(&q_data[..num_heads * head_dim], &[1, num_heads * head_dim])
         .unwrap();
     let out1 = backend
         .paged_attention(
@@ -193,9 +200,7 @@ fn paged_attention_cuda_matches_default_impl() {
         .expect_err("num_kv_heads == 0 should be rejected, not panic");
 
     // ── Rejection: shape mismatch on q ────────────────────────────
-    let q_wrong = backend
-        .copy_from_host_f32(&q_data[..16], &[1, 16])
-        .unwrap();
+    let q_wrong = backend.copy_from_host_f32(&q_data[..16], &[1, 16]).unwrap();
     let _ = backend
         .paged_attention(
             &q_wrong,
@@ -541,4 +546,233 @@ fn paged_attention_cuda_matches_default_impl() {
             scale,
         )
         .expect_err("block_id beyond pool size must fail");
+
+    // ── Split-KV multi-split + full-head_dim coverage ───────────────────
+    //
+    // The shapes above use head_dim=32 (1 dim/lane) and kv_len < 512 →
+    // num_splits=1, so they never exercise the flash-decoding combine step or
+    // the 4-dims/lane path. Re-run with the real Qwen decode geometry:
+    // head_dim=128 (4 dims/lane), GQA group 4, and a kv_len of 1500 that crosses
+    // many blocks and forces num_splits = ceil(1500/512) = 3. Compare the F16
+    // split-KV kernel against the F32 gather + batched_decode_attention reference.
+    {
+        let s_num_heads = 8;
+        let s_num_kv_heads = 2; // group size 4
+        let s_head_dim = 128;
+        let s_kv_dim = s_num_kv_heads * s_head_dim;
+        let s_block_size = 16;
+        let s_kv_len = 1500usize; // ceil(1500/16) = 94 blocks; > 512 → 3 splits
+        let s_blocks_needed = s_kv_len.div_ceil(s_block_size);
+        let s_total_blocks = s_blocks_needed + 4;
+        let s_max_blocks = s_blocks_needed;
+        let s_block_tables: Vec<i32> = (0..s_max_blocks as i32).collect();
+        let s_kv_lens: Vec<i32> = vec![s_kv_len as i32];
+
+        let s_pool_n = s_total_blocks * s_block_size * s_kv_dim;
+        let mut s_seed = 0x5917A11Du64.wrapping_add(0xBEEF);
+        let s_k: Vec<f32> = (0..s_pool_n).map(|_| rng_lcg(&mut s_seed) * 0.2).collect();
+        let s_v: Vec<f32> = (0..s_pool_n).map(|_| rng_lcg(&mut s_seed) * 0.2).collect();
+        let s_q: Vec<f32> = (0..s_num_heads * s_head_dim)
+            .map(|_| rng_lcg(&mut s_seed) * 0.2)
+            .collect();
+
+        let s_k_pool = backend
+            .copy_from_host_f32(&s_k, &[s_total_blocks, s_block_size, s_kv_dim])
+            .unwrap();
+        let s_v_pool = backend
+            .copy_from_host_f32(&s_v, &[s_total_blocks, s_block_size, s_kv_dim])
+            .unwrap();
+        let s_q_t = backend
+            .copy_from_host_f32(&s_q, &[1, s_num_heads * s_head_dim])
+            .unwrap();
+        let s_scale = (s_head_dim as f32).powf(-0.5);
+
+        // Reference (F32): gather the seq's KV then batched_decode_attention.
+        let s_block_ids: Vec<usize> = (0..s_blocks_needed).collect();
+        let s_kc = backend
+            .paged_gather_kv(&s_k_pool, &s_block_ids, s_kv_len)
+            .unwrap();
+        let s_vc = backend
+            .paged_gather_kv(&s_v_pool, &s_block_ids, s_kv_len)
+            .unwrap();
+        let s_ref = backend
+            .batched_decode_attention(
+                &s_q_t,
+                &[s_kc],
+                &[s_vc],
+                s_num_heads,
+                s_num_kv_heads,
+                s_head_dim,
+                s_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        let s_ref_host = backend.copy_to_host_f32(&s_ref).unwrap();
+
+        // F16 split-KV path.
+        let s_k16 = backend.cast(&s_k_pool, DType::F16).unwrap();
+        let s_v16 = backend.cast(&s_v_pool, DType::F16).unwrap();
+        let s_q16 = backend.cast(&s_q_t, DType::F16).unwrap();
+        let s_out16 = backend
+            .paged_attention(
+                &s_q16,
+                &s_k16,
+                &s_v16,
+                &s_block_tables,
+                &s_kv_lens,
+                s_max_blocks,
+                s_num_heads,
+                s_num_kv_heads,
+                s_head_dim,
+                s_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        let s_out_f32 = backend.cast(&s_out16, DType::F32).unwrap();
+        let s_out_host = backend.copy_to_host_f32(&s_out_f32).unwrap();
+
+        let s_max_abs_val = s_ref_host.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let s_diff = s_out_host
+            .iter()
+            .zip(&s_ref_host)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let s_tol = 5e-3_f32.max(s_max_abs_val * 5e-3);
+        assert!(
+            s_diff < s_tol,
+            "split-KV (3 splits, head_dim=128) F16 vs F32 ref: max abs diff {s_diff} > tol {s_tol} (ref max abs {s_max_abs_val})\n  out[0..8] = {:?}\n  ref[0..8] = {:?}",
+            &s_out_host[..s_out_host.len().min(8)],
+            &s_ref_host[..s_ref_host.len().min(8)],
+        );
+    }
+
+    // ── FA2 paged-decode path (default-on; FORGE_FA2_PAGED=0 = kill switch) ──
+    //
+    // Uses Qwen-class GQA geometry (head_dim=128, num_heads=8, num_kv_heads=2)
+    // with the FA2-mandated block_size=256. With kv_len=1280 the seq spans 5
+    // blocks; FA2's split-KV heuristic decides num_splits internally. Runs a
+    // differential check: env unset (FA2 default) and FORGE_FA2_PAGED=0
+    // (split-KV fallback), both compared against the same F32 reference.
+    #[cfg(feature = "flash-attn")]
+    {
+        let f_num_heads = 8;
+        let f_num_kv_heads = 2;
+        let f_head_dim = 128;
+        let f_kv_dim = f_num_kv_heads * f_head_dim;
+        let f_block_size = 256; // FA2 hard requirement: % 256 == 0
+        let f_kv_len = 1280usize;
+        let f_blocks_needed = f_kv_len.div_ceil(f_block_size);
+        let f_total_blocks = f_blocks_needed + 2;
+        let f_max_blocks = f_blocks_needed;
+        let f_block_tables: Vec<i32> = (0..f_max_blocks as i32).collect();
+        let f_kv_lens: Vec<i32> = vec![f_kv_len as i32];
+
+        let f_pool_n = f_total_blocks * f_block_size * f_kv_dim;
+        let mut f_seed = 0xFA2DEC0Du64;
+        let f_k: Vec<f32> = (0..f_pool_n).map(|_| rng_lcg(&mut f_seed) * 0.2).collect();
+        let f_v: Vec<f32> = (0..f_pool_n).map(|_| rng_lcg(&mut f_seed) * 0.2).collect();
+        let f_q: Vec<f32> = (0..f_num_heads * f_head_dim)
+            .map(|_| rng_lcg(&mut f_seed) * 0.2)
+            .collect();
+
+        let f_k_pool = backend
+            .copy_from_host_f32(&f_k, &[f_total_blocks, f_block_size, f_kv_dim])
+            .unwrap();
+        let f_v_pool = backend
+            .copy_from_host_f32(&f_v, &[f_total_blocks, f_block_size, f_kv_dim])
+            .unwrap();
+        let f_q_t = backend
+            .copy_from_host_f32(&f_q, &[1, f_num_heads * f_head_dim])
+            .unwrap();
+        let f_scale = (f_head_dim as f32).powf(-0.5);
+
+        // F32 reference: gather + batched_decode_attention.
+        let f_block_ids: Vec<usize> = (0..f_blocks_needed).collect();
+        let f_kc = backend
+            .paged_gather_kv(&f_k_pool, &f_block_ids, f_kv_len)
+            .unwrap();
+        let f_vc = backend
+            .paged_gather_kv(&f_v_pool, &f_block_ids, f_kv_len)
+            .unwrap();
+        let f_ref = backend
+            .batched_decode_attention(
+                &f_q_t,
+                &[f_kc],
+                &[f_vc],
+                f_num_heads,
+                f_num_kv_heads,
+                f_head_dim,
+                f_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        let f_ref_host = backend.copy_to_host_f32(&f_ref).unwrap();
+
+        // F16 cast inputs. Differential check: first the default path
+        // (FA2 paged when shape is eligible; env unset), then the
+        // kill-switch fallback (FORGE_FA2_PAGED=0 forces split-KV).
+        let f_k16 = backend.cast(&f_k_pool, DType::F16).unwrap();
+        let f_v16 = backend.cast(&f_v_pool, DType::F16).unwrap();
+        let f_q16 = backend.cast(&f_q_t, DType::F16).unwrap();
+
+        // Default behaviour: env unset → FA2 branch runs because the shape
+        // (head_dim=128, dtype=F16, block_size=256) is FA2-eligible.
+        let f_out_fa2 = backend
+            .paged_attention(
+                &f_q16,
+                &f_k16,
+                &f_v16,
+                &f_block_tables,
+                &f_kv_lens,
+                f_max_blocks,
+                f_num_heads,
+                f_num_kv_heads,
+                f_head_dim,
+                f_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+
+        // Kill switch: FORGE_FA2_PAGED=0 forces the split-KV fallback. Same
+        // inputs; output must still match the F32 reference within 1% F16 tol.
+        // SAFETY: cargo test for this crate runs tests in a single binary
+        // serially (no parallel backend access — see file header), so the
+        // temporary env-var mutation is fine.
+        unsafe { std::env::set_var("FORGE_FA2_PAGED", "0") };
+        let f_out_fallback = backend
+            .paged_attention(
+                &f_q16,
+                &f_k16,
+                &f_v16,
+                &f_block_tables,
+                &f_kv_lens,
+                f_max_blocks,
+                f_num_heads,
+                f_num_kv_heads,
+                f_head_dim,
+                f_scale,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+        unsafe { std::env::remove_var("FORGE_FA2_PAGED") };
+
+        let f_max_abs_val = f_ref_host.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        let f_tol = 1e-2_f32.max(f_max_abs_val * 1e-2);
+
+        for (label, out16) in [("FA2", &f_out_fa2), ("fallback", &f_out_fallback)] {
+            let out_f32 = backend.cast(out16, DType::F32).unwrap();
+            let out_host = backend.copy_to_host_f32(&out_f32).unwrap();
+            let diff = out_host
+                .iter()
+                .zip(&f_ref_host)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                diff < f_tol,
+                "paged decode {label} (head_dim=128, block_size=256) F16 vs F32 ref: max abs diff {diff} > tol {f_tol} (ref max abs {f_max_abs_val})\n  out[0..8] = {:?}\n  ref[0..8] = {:?}",
+                &out_host[..out_host.len().min(8)],
+                &f_ref_host[..f_ref_host.len().min(8)],
+            );
+        }
+    }
 }
