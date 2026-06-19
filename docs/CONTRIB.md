@@ -80,6 +80,7 @@ cargo run --release -p forge-server -- --model-path /path/to/model --backend cpu
 | `--num-blocks` | `auto` | Total KV cache blocks (paged only). `auto` → `ceil(32768 / block_size)`, preserving the historic ~32k token capacity. |
 | `--max-batch-size` | `256` | Max sequences in a batch |
 | `--max-prefill-tokens` | `4096` | Max prefill tokens per scheduling step |
+| `--quantize-decode` | `false` | Hold a Q8_0 weight copy and route m==1 (single-stream) decode through a warp-per-row GEMV. m>1 batched decode auto-dispatches to f16 GEMM (`QuantizedLinear::matmul_decode_into` in `forge-models/forge-transformer/src/quantized_linear.rs`). Net: ~1.5× faster single-stream TPOT, batch unchanged. Adds a few seconds to model load (one-shot quantize). |
 
 ## Testing
 

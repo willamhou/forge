@@ -69,6 +69,7 @@ cargo run --release -- --model-path /path/to/model --port 8080
 | `--device` | 0 | CUDA device ordinal |
 | `--block-size` | auto | Paged cache block size (tokens). `auto` picks 256 when CUDA + FA2 + F16 model conditions hold, else 16. Integer overrides. |
 | `--num-blocks` | auto | Total KV cache blocks. `auto` keeps ~32k token capacity: `ceil(32768 / block_size)`. |
+| `--quantize-decode` | off | Q8_0 quantize linear weights for the decode path (CUDA). ~1.5× single-stream TPOT on memory-bound decode; batch (m>1) auto-falls-back to F16 GEMM with no slowdown. See `docs/RUNBOOK.md` for the precision tradeoff. |
 
 ## API
 
