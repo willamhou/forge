@@ -165,6 +165,70 @@ Set the flag explicitly when:
 - **Reproducing FA2 vs split-KV comparisons.** Lock 16 and 256
   explicitly rather than relying on the auto default.
 
+### When to use `--quantize-decode` (Q8_0)
+
+Holds a Q8_0 copy of every linear weight; single-stream decode
+(m==1 batch step) routes through a warp-per-row GEMV that reads
+half the weight bytes per token. Batched decode (m>1) auto-dispatches
+to the original f16 GEMM, so there is no regression at C≥2.
+
+**Measured speedup vs forge default (FP16 cast) on GB10:**
+
+| model / context | C=1 FP16 | C=1 Q8 | speedup | C=8 FP16 | C=8 Q8 |
+|---|---|---|---|---|---|
+| Qwen3-4B prompt 1024 | 42.5 ms | 30.5 ms | **1.40×** | 56.5 ms | 56.5 ms (no change) |
+| Qwen3-8B prompt 1024 | 72.8 ms | 47.4 ms | **1.54×** | 80.7 ms | 79.7 ms (no change) |
+| Qwen3-8B prompt 4096 | 74.0 ms | 49.3 ms | **1.49×** | 98.4 ms | 98.1 ms (no change) |
+
+Single-stream Q8 on Qwen3-8B beats pegainfer's native BF16 path
+(73 ms) by **1.49–1.54×** — currently forge's strongest result on
+8B-class models.
+
+**Precision tradeoff.** Q8_0 effective precision is ~8 mantissa bits
+(32-element block sharing a FP16 scale + 32 INT8 values), vs FP16's
+10 mantissa bits — a ~2-bit loss. This loss is enough to flip top-1
+greedy token decisions when the top-2 candidates are close to a tie.
+A token-level sanity check on Qwen3-8B (8 prompts, greedy 256
+tokens) showed:
+
+- 3/8 prompts produced **character-identical** completions vs FP16
+- 5/8 diverged mid-reply (8% to 99% into the reply) but stayed
+  semantically equivalent — same answer, paraphrased
+
+**Recommended for:**
+
+- Throughput-sensitive deployments where exact token-level reproducibility
+  is not required: chat assistants, summarization, code completion,
+  RAG output generation.
+- Memory-bound workloads (8B+ on consumer hardware) where single-stream
+  TPOT dominates user experience.
+
+**Avoid when:**
+
+- Output reproducibility is contractual: evaluation pipelines, scientific
+  summarization, regulated-domain outputs where token-level audit matters.
+- Numerical-correctness benchmarks (lm-eval-harness, GSM8K, etc.) without
+  comparing against a Q8-specific baseline.
+
+### Why is `--quantize-decode` not the default?
+
+Q8 has no measured per-stream downside vs FP16 (batch auto-falls-back
+to f16 GEMM), and the single-stream win is large. But shipping it
+default requires broader sanity coverage than the current 8-prompt
+spot check:
+
+- Multi-family sanity: at minimum Qwen2.5, Qwen3, Llama-3 across
+  small (~1B) and mid (~8B) sizes.
+- Quantitative quality signal: NLL / perplexity drift vs FP16 on a
+  standard slice (WikiText, C4), not just identity-rate on hand-picked
+  prompts.
+- Failure-mode catalog: characterise what kinds of prompts produce
+  larger Q8 divergence so operators can pin `--quantize-decode false`
+  for those workloads.
+
+Until that evidence is in, ship as opt-in. The flag costs nothing
+to flip and the documentation already calls out when to reach for it.
+
 ### `FORGE_FA2_PAGED=0` kill switch
 
 The FA2 paged-decode dispatch path has no runtime fallback. If a new
