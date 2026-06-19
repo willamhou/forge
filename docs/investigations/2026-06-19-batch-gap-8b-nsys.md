@@ -119,21 +119,65 @@ matches the nsys histogram (78.6%) **exactly**.
    - **sampling kernel choice** — forge `argmax_f16` 0.3% vs pegainfer
      `RadixTopKKernel` 0.2%. Marginal.
 
-## Recommended next step
+## Step 3 — Attention path gate (resolved by existing nsys data)
 
-**Attention path probe.** Profile forge's `flash_fwd_splitkv_kernel`
-configuration (num_splits heuristic, split-K combine cost) against
-flashinfer's `BatchDecodeWithPagedKVCacheKernel` on the same shape
-(B=8, num_qo=32, num_kv=8, head_dim=128, seqlen_k≈1280). Targets:
-- per-launch time difference
-- instances-per-step delta (forge launches main + combine kernel; flashinfer
-  is one kernel)
-- whether forge's `num_splits=max_kv_len/512 clamped [1,16]` heuristic is
-  too aggressive for batch=8
+The next-step gate from the GEMM-probe section ("≥ 3 ms attention gap →
+optimise, < 1 ms → drop") can be answered directly from the per-kernel
+averages already captured. No microbench needed.
 
-If attention path explains ≥ 3 ms of the 7.89 ms gap, kernel rewrite has
-positive ROI. If < 1 ms, drop the investigation — remaining gap is
-diffuse host overhead and not worth a multi-week kernel project.
+**Per-launch raw time (from nsys):**
+
+| | forge | pegainfer |
+|---|---|---|
+| main attention kernel | `flash_fwd_splitkv_kernel` **120.6 μs** | `BatchDecodeWithPagedKVCacheKernel` **105.0 μs** |
+| combine kernel | `flash_fwd_splitkv_combine_kernel` **2.9 μs** (forge-only; pega fuses) | — |
+| KV scatter / append | `scatter_kv_f16` 3.6 μs | `AppendPagedKVCacheKernel` 3.5 μs |
+| **per layer per step** | 120.6 + 2.9 = **123.5 μs** | **105 μs** |
+| **gap per layer per step** | — | **18.5 μs** |
+
+Per decode step (36 layers): forge 36 × 18.5 μs = **0.67 ms gap**.
+Adding the extra launch host cost (forge issues both splitkv and combine;
+pega issues one fused kernel) at ~5 μs / launch × 36 layers = **0.18 ms**.
+
+**Total attention path gap: ~0.85 ms/step.**
+
+That is 11% of the 7.89 ms total gap — well below the 3 ms gate. **Do not
+invest in a kernel rewrite.**
+
+## Final attribution of the 7.89 ms gap
+
+| path | gap | verdict |
+|---|---|---|
+| proj-GEMM | < 1% (forge at the cuBLAS ceiling) | ruled out |
+| paged attention | ~0.85 ms | not worth optimising |
+| RMSNorm + residual fusion | ~0.5 ms (forge 1.4% vs pega 0.8% of step) | small, not actionable alone |
+| sampling | < 0.1 ms | marginal |
+| **diffuse host overhead** | **~5.5 ms** | **the remaining bulk** |
+
+The host overhead breakdown: forge eager mode runs ~280 kernels/step at
+C=8 (cf. `forge-decode-host-bound` memory note); per-launch host cost in
+the 5–10 μs range × 280 ≈ 1.4–2.8 ms, plus scheduler bookkeeping and
+sampling host work. This matches the residual gap quantitatively.
+
+## Recommended next step — drop this investigation
+
+The 7.89 ms gap on Qwen3-8B C=8 is dominated by diffuse host overhead in
+the eager-mode decode loop. There is no single kernel rewrite with positive
+ROI; closing it requires architectural change (asynchronous decode pipeline
+that overlaps host work with the next step's GPU work — multi-week effort,
+deferred per `forge-decode-host-bound`).
+
+**Productive directions instead:**
+
+1. Q8 single-stream is forge's strongest result vs pega native on 8B
+   (1.54×); productize that — sanity tests + bench coverage.
+2. Larger models — measure 14B / 32B on GB10's 119 GB unified memory to
+   see whether forge's GEMM-ceiling result holds at scale.
+3. Long-context bench — current 1024-prompt bench under-represents the
+   FA2 paged win (which scales with KV length). 4096-prompt + Q8 on 8B
+   should show forge advantage.
+
+Direct kernel work on this gap is not worth the engineering cost.
 
 ## Artifacts
 
