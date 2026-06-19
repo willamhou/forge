@@ -1,4 +1,4 @@
-//! cuBLAS vs cuBLASLt probe for forge's M=8 decode GEMM shapes (Qwen3-4B).
+//! cuBLAS vs cuBLASLt probe for forge's M=8 decode GEMM shapes (Qwen3-4B and 8B).
 //!
 //! Goal: find out whether cuBLASLt's heuristic picks `nvjet_sm121_*_tmaAB`
 //! (Blackwell-native + TMA) instead of `cutlass_80_wmma_*` for the shapes that
@@ -32,18 +32,25 @@ use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::f16;
 
-// Qwen3-4B decode GEMM shapes at M=8 (C=8 batch step).
+// Qwen3-{4B,8B} decode GEMM shapes at M=8 (C=8 batch step).
 // Each is (m, k, n) where C[m,n] = A[m,k] · B[k,n].
+//
+// 8B shapes(2026-06-19 added): hidden=4096, intermediate=12288, qkv_concat=6144,
+// q_proj_size=4096. Run the 8B set when investigating the C=8 batch gap on 8B
+// (memory: gb10-qwen3-8b-bench).
 const SHAPES: &[(usize, usize, usize, &str)] = &[
-    (8, 2560, 6144, "qkv_proj (M=8, K=2560 hidden, N=4096+1024+1024)"),
-    (8, 4096, 2560, "attn_proj (M=8, K=q_proj_size, N=hidden)"),
-    (8, 2560, 9728, "gate_proj/up_proj (M=8, K=hidden, N=intermediate)"),
-    (8, 9728, 2560, "down_proj (M=8, K=intermediate, N=hidden)"),
-    (8, 2560, 151936, "lm_head (M=8, K=hidden, N=vocab) — largest output"),
-    (2, 2560, 6144, "qkv_proj (M=2)"),
-    (2, 4096, 2560, "attn_proj (M=2)"),
-    (2, 9728, 2560, "down_proj (M=2)"),
-    (2, 2560, 151936, "lm_head (M=2)"),
+    // Qwen3-8B M=8 (focus of 2026-06-19 investigation)
+    (8, 4096, 6144, "8B qkv_proj (M=8, K=4096 hidden, N=qkv=6144)"),
+    (8, 4096, 4096, "8B attn_proj (M=8, K=q_proj=4096, N=hidden=4096)"),
+    (8, 4096, 12288, "8B gate/up_proj (M=8, K=hidden=4096, N=intermediate=12288)"),
+    (8, 12288, 4096, "8B down_proj (M=8, K=intermediate=12288, N=hidden=4096)"),
+    (8, 4096, 151936, "8B lm_head (M=8, K=hidden=4096, N=vocab=151936)"),
+    // Qwen3-4B M=8 (kept for cross-model comparison)
+    (8, 2560, 6144, "4B qkv_proj (M=8, K=2560 hidden, N=6144)"),
+    (8, 4096, 2560, "4B attn_proj (M=8, K=q_proj=4096, N=hidden=2560)"),
+    (8, 2560, 9728, "4B gate/up_proj (M=8, K=hidden=2560, N=intermediate=9728)"),
+    (8, 9728, 2560, "4B down_proj (M=8, K=intermediate=9728, N=hidden=2560)"),
+    (8, 2560, 151936, "4B lm_head (M=8, K=hidden=2560, N=vocab=151936)"),
 ];
 
 fn alloc_f16(stream: &Arc<CudaStream>, n: usize) -> CudaSlice<f16> {
