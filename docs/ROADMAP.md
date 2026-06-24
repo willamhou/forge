@@ -15,7 +15,9 @@ what to do — see §"Non-goals" with rejection reasons.
 
 Measured baselines (GB10 sm_121 / Qwen3-8B BF16 → F16 cast at load
 / greedy / 3 runs per concurrency, locked in
-`/tmp/bench-2026-06-{09,15,19,21}/*.jsonl`):
+`/tmp/bench-2026-06-{09,15,19,21}/*.jsonl` for the 8B rows; 4B Q8 row
+is from `docs/benchmarks/2026-05-27-3way-qwen3-4b.md` and reflects the
+post-token-parallel-split-KV numbers):
 
 | workload | forge default | forge `--quantize-decode` | pegainfer | forge_def vs pega |
 |---|---|---|---|---|
@@ -101,8 +103,16 @@ Mixing them has historically been a category error.
 
 - **Server line** competes against pegainfer / vLLM / SGLang on
   8B–32B Blackwell / Hopper serving. Phases A → B → C below.
+  TensorRT-LLM is the silent comparable at the high end (enterprise
+  Hopper / Blackwell deployments default to it); track its serving
+  benchmark numbers as a north star even if forge does not target
+  enterprise procurement.
 - **Edge line** is Apple Silicon / ARM / WebGPU single-user
-  inference. Phase D, parallel.
+  inference. Phase D, parallel. llama.cpp and MLC are the incumbents
+  here; the differentiation forge needs is *not* "faster than
+  llama.cpp on Mac" (it won't be, single-engineer-quarter) but
+  "embeddable as a Rust library with the same model code as the
+  server line."
 
 ## Phase A — Single-GPU production readiness (now → +6 weeks)
 
@@ -113,10 +123,9 @@ positive ROI.
 | Item | Gate / exit | Anchor |
 |---|---|---|
 | **Q8 broader sanity → default-on** | NLL drift vs FP16 within 0.5% on WikiText / C4 slice across Qwen3 / Llama-3 / Qwen2.5 × {~1B, ~8B}; identity rate ≥ existing 8-prompt level on the same; failure-mode catalogue. Then flip `--quantize-decode` default. | `docs/investigations/2026-06-19-q8-vs-fp16-sanity.md` |
-| **flashinfer vendoring** | `BatchDecodeWithPagedKVCacheKernel` lands behind a feature flag; Qwen3-8B C=8 long-context within 5% of pega TPOT. Keep FA2 path; dispatch by shape if both stay competitive. | nsys evidence in PR #12 (pega uses flashinfer; forge uses FA2 splitkv + combine) |
+| **flashinfer vendoring** | `BatchDecodeWithPagedKVCacheKernel` lands behind a feature flag; Qwen3-8B C=8 long-context within 5% of pega TPOT; **Qwen3-8B C=1 single-stream (both 1024 and 4096 prompts) within ±2% of pre-vendoring TPOT** (no single-stream regression). Keep FA2 path; dispatch by shape if both stay competitive. | nsys evidence in PR #12 (pega uses flashinfer; forge uses FA2 splitkv + combine) |
 | **14B / 32B baseline** | `/tmp/bench-2026-06-XX/*.jsonl` style; locked into memory `gb10-qwen3-NB-bench`. | retired Phase 1 item from prior draft |
 | **`FORGE_DECODE_TIMING` t_d2h split** | currently lumped into t_sample; separation unblocks future gates. | PR #15 |
-| **Finish CUDA Graphs handling** | **deferred to non-goals** based on GB10 evidence; see below. | retired item |
 | **FA2 GB10 test-fixture leak** | single-test workaround → CI tightening. | Task #4, still open |
 | **Paged attention BF16** | unblock pega-style BF16 native path on demand. Defer to spec round if user pull doesn't appear. | latent demand only |
 
@@ -152,7 +161,8 @@ service level.
 |---|---|
 | **Tensor Parallelism (TP)** | Required for ≥30B at FP16 on consumer / Spark hardware. Row/col-linear shard + NCCL all-reduce. Start single-machine, then RDMA cross-machine. |
 | **MLA + GQA generalization** | DeepSeek-V2 / V3 / V4 are MLA. Qwen2.5 ≥7B is GQA-only at scale. GQA partially in place; MLA needs new attention kernel + tensor layout. |
-| **FP8 KV cache (Blackwell)** | Halves KV footprint → 2× concurrent sequences at the same memory. Hopper / Blackwell only; pair with the paged-attention BF16 work. |
+| **FP8 KV cache (Blackwell)** | Halves KV footprint → 2× concurrent sequences at the same memory. Hopper / Blackwell only; pair with the paged-attention BF16 work. Concrete deliverable: F8E5M2 KV layout in `forge-kvcache/src/paged_cache.rs` behind a feature flag; matmul dispatch in CUDA backend reads F8 KV via cvt to F16 inside the attention kernel. Gate: Qwen3-8B with FP8 KV runs at ≥1.8× the C=8 concurrent sequences vs FP16 KV at the same `--num-blocks`, no measured accuracy regression. |
+| **FP8 weight + activation GEMM (W8A8, Hopper / Blackwell)** | Concrete deliverable, not just a matrix row: vendor a cuBLASLt or CUTLASS F8 GEMM path for the proj GEMMs (qkv / o / gate / up / down), behind `--fp8-decode`. Gate: lm-eval parity (perplexity within 0.5% of FP16 on a standard slice) AND Qwen3-8B C=8 TPOT improvement of ≥1.3× vs FP16. Phase B item, not Phase C, because it interacts with TP sharding and KV dtype choices. |
 | **Cross-machine KV migration** | Foundation for disaggregated prefill / decode in Phase C. |
 
 Model coverage ladder remains the one from
@@ -173,6 +183,8 @@ forge's 27.6k).
 | **Scheduler upgrade** | Priority queues, preemption, SLO-aware admission, per-tenant fairness. Today's FCFS will not survive contention. |
 | **Observability** | Prometheus metrics (TTFT, TPOT, queue depth, cache hit, KV usage), structured logs, OpenTelemetry traces. Block on this before any external user. |
 | **MTP / Medusa speculative upgrades** | n-gram is a floor; MTP (DeepSeek-style) and Medusa heads raise the ceiling. |
+| **Multi-tenant operational features** | Auth (bearer / API key), per-key rate limits, request quotas, tenant isolation in scheduling priority, hot model reload without dropping in-flight requests, model lifecycle endpoints (`/v1/models` already exists; `/v1/models/load`, `/v1/models/unload` for live ops). Block on these before any multi-tenant deployment. |
+| **Benchmark parity wiring** | HuggingFace `lm-eval-harness` adapter (so accuracy numbers reproduce against published baselines) and an MLPerf-inference-compatible bench script. Picks one or both depending on what external comparison feedback requires; both are inexpensive once the standing CI harness exists. |
 
 **Pega comparison once more:** pega has separate crates per model
 (`pegainfer-{qwen3-4b,qwen35-4b,deepseek-v4,kimi-k2,...}`, 89.3k LOC
@@ -247,10 +259,17 @@ research direction with that. See
 
 Items considered and rejected, with reasons. Future readers see why.
 
-- **BF16 end-to-end widening.** Sanity (2026-06-15) shows forge's
-  BF16 → F16 cast at load is effectively lossless; forge cast vs pega
-  BF16 native gave 5/8 character-identical greedy outputs.
-  Multi-week engineering for no measurable user-visible win.
+- **BF16 end-to-end widening.** Sanity (2026-06-15) is **consistent
+  with** the loader's BF16 → F16 cast being effectively lossless for
+  inference output: 5 of 8 prompts produced character-identical
+  greedy completions when comparing forge cast vs pega BF16 native.
+  The remaining three diverged mid-reply but stayed semantically
+  equivalent (the same shape as Q8 vs FP16 drift in
+  `docs/investigations/2026-06-19-q8-vs-fp16-sanity.md`). This is a
+  spot-check, not a proof — broader NLL evidence is the standard for
+  flipping a default. As a multi-week investment decision, an
+  8-prompt sanity that finds no measurable regression is enough to
+  retire the project; the lossless claim is left provisional.
   Memory `forge-fa2-paged-decode` records the retraction.
 - **Async decode pipeline.** Direct instrumentation
   (2026-06-21, PR #15) shows host work = 0.65 ms / 0.6% of step time
@@ -258,7 +277,16 @@ Items considered and rejected, with reasons. Future readers see why.
   recover at most 0.65 ms per step. Below the 3 ms gate threshold.
 - **Per-model crate split (pegainfer-style).** Doubles LOC without
   doubling capability; loses the architectural property that keeps
-  forge maintainable at 27.6k vs pega 89.3k.
+  forge maintainable. As of 2026-06-24, forge totals 27.6k Rust LOC
+  across 14 top-level workspace crates; pegainfer totals 89.3k Rust
+  LOC across 14 top-level workspace crates (with an additional 14
+  `pegainfer-comm/*` sub-crates inside the comm subtree —
+  `docs/research/2026-05-24-pegainfer-comparison.md` counts these
+  separately and arrives at 30 total). The relevant comparison is
+  the per-architecture optimisation surface area, not the bare
+  workspace crate count; pega ships one full executor + scheduler +
+  kernel-plan per model, forge will keep one generic transformer with
+  architecture-specific attention / projection / KV adapters.
 - **CUDA Graph on GB10.** Net +3 ms per step
   (memory `forge-decode-host-bound`, multiple bench passes).
   GB10-specific driver behaviour; `cuGraphLaunch` loses the
