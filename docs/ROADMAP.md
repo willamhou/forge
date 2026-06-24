@@ -13,11 +13,13 @@ what to do — see §"Non-goals" with rejection reasons.
 
 ## Where we are today
 
-Measured baselines (GB10 sm_121 / Qwen3-8B BF16 → F16 cast at load
-/ greedy / 3 runs per concurrency, locked in
-`/tmp/bench-2026-06-{09,15,19,21}/*.jsonl` for the 8B rows; 4B Q8 row
-is from `docs/benchmarks/2026-05-27-3way-qwen3-4b.md` and reflects the
-post-token-parallel-split-KV numbers):
+Measured baselines (GB10 sm_121 / greedy / 3 runs per concurrency,
+locked in `/tmp/bench-2026-06-{09,15,19,21}/*.jsonl` for the 8B rows
+and in `docs/benchmarks/2026-05-27-3way-qwen3-4b.md` for the 4B rows;
+the 4B numbers below reflect the post-token-parallel-split-KV state).
+Per-row dtype reality: forge runs the F16 path (BF16 weights cast to
+F16 at load); pegainfer runs the BF16 native path; both engines on
+the same physical weights:
 
 | workload | forge default | forge `--quantize-decode` | pegainfer | forge_def vs pega |
 |---|---|---|---|---|
@@ -43,8 +45,10 @@ Q8 single-stream is currently forge's strongest result vs pega native:
   per-token barriers in the F16 paged-attention kernel
 - **cuBLASLt nvjet path** (commit `aaa38cb`) — col-major descriptor +
   tiled transpose for the decode GEMM path
-- **8 docs/investigations reports** preserving negative results +
-  reproducer scripts (`scripts/q8_sanity.py`, `cublaslt_decode_gemm_probe.rs`)
+- **3 docs/investigations reports** preserving negative results +
+  reproducer scripts (`scripts/q8_sanity.py`,
+  `cublaslt_decode_gemm_probe.rs`); the broader plan / spec / bench
+  set lives under `docs/{superpowers/specs,plans,benchmarks}/`
 
 ### Functional strengths (carried from May draft, still true)
 
