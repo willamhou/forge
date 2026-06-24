@@ -127,7 +127,7 @@ positive ROI.
 | **14B / 32B baseline** | `/tmp/bench-2026-06-XX/*.jsonl` style; locked into memory `gb10-qwen3-NB-bench`. | retired Phase 1 item from prior draft |
 | **`FORGE_DECODE_TIMING` t_d2h split** | currently lumped into t_sample; separation unblocks future gates. | PR #15 |
 | **FA2 GB10 test-fixture leak** | single-test workaround → CI tightening. | Task #4, still open |
-| **Paged attention BF16** | unblock pega-style BF16 native path on demand. Defer to spec round if user pull doesn't appear. | latent demand only |
+| **Paged attention BF16** | unblock pega-style BF16 native path on demand. Defer to spec round if user pull doesn't appear. **Note:** Phase B FP8 KV cache shares this dispatch surface; if FP8 KV is greenlit before BF16 demand materialises, this row gets pulled forward as a hard prerequisite — they cannot be sequenced as two independent items because both modify `paged_attention_into` in `forge-backend-cuda/src/backend.rs`. | latent demand only |
 
 **Why this comes first:** Q8 default-on is a marketing-equivalent
 upgrade for users without code change; flashinfer vendoring directly
@@ -161,8 +161,8 @@ service level.
 |---|---|
 | **Tensor Parallelism (TP)** | Required for ≥30B at FP16 on consumer / Spark hardware. Row/col-linear shard + NCCL all-reduce. Start single-machine, then RDMA cross-machine. |
 | **MLA + GQA generalization** | DeepSeek-V2 / V3 / V4 are MLA. Qwen2.5 ≥7B is GQA-only at scale. GQA partially in place; MLA needs new attention kernel + tensor layout. |
-| **FP8 KV cache (Blackwell)** | Halves KV footprint → 2× concurrent sequences at the same memory. Hopper / Blackwell only; pair with the paged-attention BF16 work. Concrete deliverable: F8E5M2 KV layout in `forge-kvcache/src/paged_cache.rs` behind a feature flag; matmul dispatch in CUDA backend reads F8 KV via cvt to F16 inside the attention kernel. Gate: Qwen3-8B with FP8 KV runs at ≥1.8× the C=8 concurrent sequences vs FP16 KV at the same `--num-blocks`, no measured accuracy regression. |
-| **FP8 weight + activation GEMM (W8A8, Hopper / Blackwell)** | Concrete deliverable, not just a matrix row: vendor a cuBLASLt or CUTLASS F8 GEMM path for the proj GEMMs (qkv / o / gate / up / down), behind `--fp8-decode`. Gate: lm-eval parity (perplexity within 0.5% of FP16 on a standard slice) AND Qwen3-8B C=8 TPOT improvement of ≥1.3× vs FP16. Phase B item, not Phase C, because it interacts with TP sharding and KV dtype choices. |
+| **FP8 KV cache (Blackwell)** | Halves KV bytes-per-token → ~2× concurrent sequences at the same KV memory budget. Hopper / Blackwell only. Concrete deliverable: F8E5M2 KV layout in `forge-kvcache/src/paged_cache.rs` behind a feature flag; the paged-attention kernel in `forge-backend-cuda` reads F8 KV via cvt to F16 inside the kernel inner loop. Gate: at a fixed KV memory budget (i.e. auto-derived `--num-blocks` for the new bytes-per-token), Qwen3-8B sustains ≥1.8× the C=8 concurrent sequences vs FP16 KV, no measured accuracy regression on a downstream task slice. Prerequisite: Phase A paged-attention BF16 lands (or is explicitly dropped) — they share the dispatch surface and must be sequenced. |
+| **FP8 weight + activation GEMM (W8A8, Hopper / Blackwell)** | Concrete deliverable, not just a matrix row: vendor a cuBLASLt or CUTLASS F8 GEMM path for the proj GEMMs (qkv / o / gate / up / down), behind `--fp8-decode`. Gate: **NLL/perplexity within 0.5% of FP16** on a fixed WikiText/C4 slice (the *accuracy proxy*) AND Qwen3-8B C=8 TPOT improvement of ≥1.3× vs FP16 (the *speed gate*). lm-eval-harness downstream-task parity is a Phase C ops/parity item, not part of this perf gate. Phase B item, not Phase C, because it interacts with TP sharding and KV dtype choices. |
 | **Cross-machine KV migration** | Foundation for disaggregated prefill / decode in Phase C. |
 
 Model coverage ladder remains the one from
@@ -172,8 +172,10 @@ DeepSeek-V2-Lite → DeepSeek-V3 → DeepSeek-V4-Flash.
 ## Phase C — Production-grade serving + MoE / VLM (months 5-8)
 
 Goal: ops-credible serving and model-family expansion **without** the
-per-model-crate explosion that brought pegainfer to 89.3k LOC (3.2×
-forge's 27.6k).
+per-model-crate explosion that brought pegainfer to 89.3k Rust LOC
+across 14 top-level crates (≈ 3.2× forge's 27.6k); see the same
+definition caveat in §"Non-goals" (`docs/research/2026-05-24-pegainfer-comparison.md`
+counts 30 total once the `pegainfer-comm/*` subtree is expanded).
 
 | Item | Gate / exit |
 |---|---|
@@ -187,11 +189,13 @@ forge's 27.6k).
 | **Benchmark parity wiring** | HuggingFace `lm-eval-harness` adapter (so accuracy numbers reproduce against published baselines) and an MLPerf-inference-compatible bench script. Picks one or both depending on what external comparison feedback requires; both are inexpensive once the standing CI harness exists. |
 
 **Pega comparison once more:** pega has separate crates per model
-(`pegainfer-{qwen3-4b,qwen35-4b,deepseek-v4,kimi-k2,...}`, 89.3k LOC
-total). forge **does not** adopt this architecture. A single generic
-transformer crate with architecture-specific attention / projection /
-KV layout adapters is the forge property to preserve. Adding a model
-should be ~ a few hundred LOC, not a new crate.
+(`pegainfer-{qwen3-4b,qwen35-4b,deepseek-v4,kimi-k2,...}`) and the
+89.3k Rust LOC includes those plus the comm subtree (see the metric
+caveat in §"Non-goals"). forge **does not** adopt this architecture.
+A single generic transformer crate with architecture-specific
+attention / projection / KV layout adapters is the forge property to
+preserve. Adding a model should be ~ a few hundred LOC, not a new
+crate.
 
 ## Phase D — Edge line (parallel, months 3-9)
 
