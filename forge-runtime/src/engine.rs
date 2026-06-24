@@ -430,6 +430,18 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
     /// `[N, hidden_size]` for the forward pass, then logits are split per-sequence
     /// for independent sampling.
     fn process_decode_batch(&mut self, seqs: &[ScheduledSeq]) -> Result<()> {
+        // Env-gated three-phase timing: opt in with FORGE_DECODE_TIMING=1 to
+        // log per-step `t_gpu` (stage+compute+synchronize), `t_sample`
+        // (device argmax/sample or copy_to_host), and `t_emit` (per-seq host
+        // emit loop). Used for diagnosing whether the C=8 long-ctx batch gap
+        // sits in host overhead (in which case an async pipeline pays off)
+        // or stays in GPU forward (no architectural lever).
+        let timing_enabled = std::env::var("FORGE_DECODE_TIMING")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+            .is_some();
+        let t_start = std::time::Instant::now();
+
         // Filter out sequences that have already hit max_tokens
         let mut active_seqs = Vec::with_capacity(seqs.len());
         for seq in seqs {
@@ -519,6 +531,8 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
         // run `compute_decode` directly — eager, but allocation-free.
         let use_persistent = self.model.supports_capture_decode();
         let use_graph = use_persistent && self.decode_runner.is_some() && self.is_decode_bucket(n);
+        let mut t_gpu_done = t_start; // sentinel; overwritten below post-sync
+        let mut t_sample_done = t_start;
         let decode_out: DecodeOut = if use_persistent {
             // Lazily allocate this bucket's persistent decode state.
             if !self.decode_states.contains_key(&n) {
@@ -569,10 +583,11 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 }
             }
             self.backend.synchronize()?;
+            t_gpu_done = std::time::Instant::now();
 
             let state = self.decode_states.get(&n).unwrap();
             let logits = self.model.decode_logits(state);
-            if all_argmax {
+            let out = if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(logits)?)
             } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
                 DecodeOut::Ids(
@@ -581,11 +596,14 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 )
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(logits)?)
-            }
+            };
+            t_sample_done = std::time::Instant::now();
+            out
         } else {
             let output = self.model.forward(&input, &mut *self.kv_cache)?;
             self.backend.synchronize()?;
-            if all_argmax {
+            t_gpu_done = std::time::Instant::now();
+            let out = if all_argmax {
                 DecodeOut::Ids(self.backend.argmax(&output.logits)?)
             } else if let Some((temps, min_ps, top_ks, top_ps, seeds, steps)) = &sample_params {
                 DecodeOut::Ids(self.backend.sample(
@@ -599,7 +617,9 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 )?)
             } else {
                 DecodeOut::Logits(self.backend.copy_to_host_f32(&output.logits)?)
-            }
+            };
+            t_sample_done = std::time::Instant::now();
+            out
         };
         let vocab_size = self.model.config().vocab_size;
 
@@ -634,6 +654,19 @@ impl<B: Backend + Clone, M: Model<T = B::Tensor>> Engine<B, M> {
                 self.constraints.remove(&seq.seq_id);
                 self.stop_buffers.remove(&seq.seq_id);
             }
+        }
+
+        if timing_enabled {
+            let t_end = std::time::Instant::now();
+            tracing::info!(
+                target: "forge_runtime::decode_timing",
+                "decode n={} t_gpu={:.3}ms t_sample={:.3}ms t_emit={:.3}ms total={:.3}ms",
+                n,
+                (t_gpu_done - t_start).as_secs_f64() * 1e3,
+                (t_sample_done - t_gpu_done).as_secs_f64() * 1e3,
+                (t_end - t_sample_done).as_secs_f64() * 1e3,
+                (t_end - t_start).as_secs_f64() * 1e3,
+            );
         }
 
         Ok(())

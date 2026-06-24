@@ -229,6 +229,44 @@ spot check:
 Until that evidence is in, ship as opt-in. The flag costs nothing
 to flip and the documentation already calls out when to reach for it.
 
+### `FORGE_DECODE_TIMING=1` decode-step instrumentation
+
+Per-step three-phase timing of `process_decode_batch` for diagnosing
+whether the GPU/host balance leaves room for an async pipeline. Logs
+one line per decode step at `target=forge_runtime::decode_timing` info
+level:
+
+```text
+decode n=8 t_gpu=101.165ms t_sample=0.630ms t_emit=0.017ms total=101.812ms
+```
+
+- `t_gpu` — stage + `compute_decode` + `synchronize`. The full GPU
+  forward including the post-launch sync wait.
+- `t_sample` — device argmax / on-device sampling / D2H of ids or
+  full logits. Includes any logits memcpy.
+- `t_emit` — per-sequence host emit loop (token append, FSM advance,
+  stop check, detok, send_event).
+- `n` — active sequence count in this batch.
+
+Enable with:
+
+```bash
+FORGE_DECODE_TIMING=1 RUST_LOG=info,forge_runtime::decode_timing=info \
+  ./target/release/forge-server ...
+```
+
+Disable: unset the env var (or set `=0` / `=false`). The check is one
+env lookup per step; no measured perf overhead in production.
+
+**When to use:** before sinking time into an async decode pipeline or
+any host-side restructuring, confirm `t_sample + t_emit` is actually
+large enough to be worth pursuing. On GB10 / Qwen3-8B / C=8 /
+prompt~4096 the host phases sum to ~0.65 ms out of a 101 ms step
+(0.6%) — well below any reasonable architectural-change threshold.
+
+See `docs/investigations/2026-06-21-decode-timing-gate.md` for the
+gate analysis that retired the multi-week async-pipeline plan.
+
 ### `FORGE_FA2_PAGED=0` kill switch
 
 The FA2 paged-decode dispatch path has no runtime fallback. If a new
