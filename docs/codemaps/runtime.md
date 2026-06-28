@@ -141,14 +141,24 @@ pub struct AppState {
 - `IncrementalDecoder` handles multi-byte UTF-8 across BPE token boundaries
 - Flushes pending bytes on stream finish
 
-## forge-models/forge-model-llama — Llama Model
+## forge-models/forge-transformer — Decoder-Transformer Model
+
+Generic decoder-only transformer covering `LlamaForCausalLM`, `Qwen2ForCausalLM`,
+`Qwen3ForCausalLM`, `MistralForCausalLM`. One parameterized impl — Qwen2 QKV
+bias and Qwen3 per-head QK-norm are loaded only when the corresponding weight
+keys exist in the safetensors set (see `loader.rs`).
 
 ### Files
 | File | Purpose |
 |------|---------|
-| `src/lib.rs` | `LlamaModel<B>`, `load_llama_model()` |
-| `src/attention.rs` | Multi-head attention with GQA, RoPE |
-| `src/layers.rs` | `TransformerBlock`, `RMSNorm`, `FeedForward` |
+| `src/lib.rs` | Public re-exports |
+| `src/model.rs` | `TransformerModel<B>` — generic decoder-transformer + `Model` impl |
+| `src/registry.rs` | `SUPPORTED_ARCHITECTURES` + `load_model()` dispatch |
+| `src/loader.rs` | `load_transformer()` — parameterized weight loading with optional QKV-bias / QK-norm detection |
+| `src/layers.rs` | `LlamaAttention` (with optional QKV bias + QK-norm), `LlamaMLP`, `RMSNorm`, decoder block |
+| `src/rope.rs` | `RopeFreqs` (precomputed cos/sin tables) |
+| `src/persistent_buffers.rs` | Capture-safe decode staging buffers |
+| `src/quantized_linear.rs` | Q8_0 + FP16 dual-path linear (m=1 GEMV / m>1 GEMM dispatch) |
 
 ### `Model` trait (`forge-core`)
 ```rust

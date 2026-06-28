@@ -42,7 +42,7 @@ The workspace is layered top-to-bottom; each layer only depends on the ones belo
 forge-server   HTTP/SSE (axum) → tokenize → ChatTemplate → push EngineRequest into mpsc
 forge-runtime  Engine loop: drain → schedule → forward → sample → emit EngineEvent
 forge-scheduler ContinuousBatchingScheduler: FCFS, cache-aware, chunked prefill
-forge-models/forge-model-llama  Llama transformer (GQA, RoPE) generic over Backend
+forge-models/forge-transformer  Decoder-transformer (Llama / Qwen2 / Qwen3 / Mistral) generic over Backend; one parameterized impl, optional QKV bias + QK-norm detected from weights
 forge-kvcache  Naive (CPU vectors) and Paged (GPU block manager) implementations
 forge-backend-cuda / forge-backend-cpu  Tensor compute (Backend trait)
 forge-kernels  CUDA C++ kernel source strings, compiled to PTX via NVRTC at backend init

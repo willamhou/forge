@@ -13,7 +13,7 @@ Engine Layer     forge-runtime (engine loop, sampling, FSM constraints)
                       │
 Scheduling       forge-scheduler (continuous batching)
                       │
-Model Layer      forge-models/forge-model-llama (Llama transformer)
+Model Layer      forge-models/forge-transformer (Llama / Qwen2 / Qwen3 / Mistral)
                       │
 Storage          forge-kvcache (naive CPU-side, paged GPU block manager)
                       │
@@ -31,7 +31,7 @@ Other            forge-transport (stub) │ forge-quantize (stub)
 ## Crate Dependency Graph
 
 ```
-forge-server ──→ forge-runtime, forge-loader, forge-model-llama,
+forge-server ──→ forge-runtime, forge-loader, forge-transformer,
                  forge-backend-cuda, forge-backend-cpu, forge-scheduler,
                  forge-kvcache, forge-transport, forge-core
 
@@ -39,7 +39,7 @@ forge-runtime ──→ forge-core, regex-automata, serde_json
 
 forge-scheduler ──→ forge-core
 
-forge-model-llama ──→ forge-core, forge-kernels
+forge-transformer ──→ forge-core, forge-kernels
 
 forge-kvcache ──→ forge-core
 

@@ -47,7 +47,7 @@
 | 自定义内核覆盖 | 🔴 | pegainfer 约 20 个内核族,forge 约 7 个 |
 | KV cache 设计 | 🟡 | 两边都是设备端 paged。pegainfer 的 `KvPool::padding_permit`(`pegainfer-core/src/kv_pool.rs:64`)正是 forge Task 5 所需要的 bucket-padding 技巧 |
 | 注意力内核覆盖 | 🔴 | pegainfer:FlashInfer paged、hd128/hd256 prefill、gated-delta-rule linear、DSv4 sparse + indexer、Kimi MLA。forge:FA2 + paged + naive,F32/F16 |
-| 模型覆盖 | 🔴 | 1 个(Llama) vs 4 个架构,含 MoE/MLA/linear |
+| 模型覆盖 | 🔴 | 1 个(Llama) vs 4 个架构,含 MoE/MLA/linear *(写于 2026-05-24;见末尾 Amendment 2026-06-26)* |
 | 运行时量化 | 🔴 | Marlin W4 / FP8 / FP4 vs 无(仅 GGUF 加载期量化) |
 | 多 GPU / TP / EP | 🔴 | 基于 IB Verbs+GDRCopy 的 14 crate `pegainfer-comm` vs 无 |
 | 调度器 | 🟡 | forge 有 chunked prefill 准入门;pegainfer 有 CUDA-graph bucket 规划 |
@@ -60,8 +60,8 @@
 
 ## 4. forge 可以借鉴的点
 
-- **以模型为边界的 executor crate**(`pegainfer-qwen3-4b/src/{scheduler,executor,kernel_plan}.rs`)——加入 Qwen3 时就采用这种划分,不要塞进 `forge-model-llama`。
-- **`KvPool::padding_permit`**(`pegainfer-core/src/kv_pool.rs:64`)——让 CUDA Graph 捕获在变化 batch size 下也能复用的具体模式。**这正是阻塞 forge Task 5 的点**(graph 捕获所需的持久化 buffer)。
+- **以模型为边界的 executor crate**(`pegainfer-qwen3-4b/src/{scheduler,executor,kernel_plan}.rs`)——加入 Qwen3 时就采用这种划分,不要塞进 `forge-model-llama`。 *(2026-06-26 撤回,见末尾 Amendment)*
+- **`KvPool::padding_permit`**(`pegainfer-core/src/kv_pool.rs:64`)——让 CUDA Graph 捕获在变化 batch size 下也能复用的具体模式。**这正是阻塞 forge Task 5 的点**(graph 捕获所需的持久化 buffer)。 *(2026-06-26 撤回,见末尾 Amendment)*
 - **`tikv-jemallocator` 全局分配器**(`pegainfer-server/src/main.rs:11`)——直接落地的吞吐提升。
 - **AOT Triton 内核模式**(`pegainfer-kernels/build.rs` + `tools/triton/`)——如果 forge 哪天想做 linear attention,这是最干净的先例。但要注意它会把 Python 引入构建链。
 - **`kernel-call-trace` feature flag**——可发布的诊断能力,以 feature 门控。
@@ -81,3 +81,33 @@
 **杠杆率最高的差距**:加入第二个模型架构——Qwen3 是显而易见的选择——同时引入 pegainfer 的按模型 crate 划分。基于 forge 已有的 `Backend` trait + `PagedKvCache`,一名工程师估计需要 2–3 周。多 GPU TP/EP 的工作量大得多(pegainfer 用了 14 个 crate + IB Verbs/GDRCopy 绑定),应当等到双 DGX-Spark 互联就绪后再做。
 
 **ROADMAP.md 不需要改变方向**,但 Phase A 的优先级应重排:完成 CUDA Graphs(进行中)→ **加入 Qwen3 + 按模型 crate 拆分** → W4A16 量化 → 多 GPU。
+
+---
+
+## Amendment (2026-06-26)
+
+本文写于 2026-05-24,5 周后回看,两条结论因事实更新而失效。原文保留作 snapshot,修订集中在此。
+
+### A1. 模型覆盖(第 3 节表 / 第 6 节"杠杆率最高的差距")
+
+原文判定"forge 1 个(Llama)"是错的——写文档时没读 [forge-models/forge-transformer/src/registry.rs](../../forge-models/forge-transformer/src/registry.rs)。实际 forge 已支持 4 个 dense decoder 架构:`LlamaForCausalLM` / `Qwen2ForCausalLM` / `Qwen3ForCausalLM` / `MistralForCausalLM`,共享一份参数化 `TransformerModel`,Qwen2 的 QKV bias 与 Qwen3 的 per-head QK-norm 都通过权重存在性检测启用(见 [docs/architecture-coverage.md](../architecture-coverage.md))。
+
+**真正的模型覆盖差距**:不是"forge 缺 Qwen3",而是"forge 缺 *异构* 架构"——MoE(Mixtral / Qwen3-MoE / DeepSeek-V2-Lite)、MLA(DSv2/V3)、hybrid linear+full attention(Qwen3.5)。dense decoder 这一档已经追平。
+
+**对原文第 4 节"以模型为边界的 executor crate"的影响**:撤回。pega 的极致 per-model 拆分是为 DSv4 MoE / MLA / FP8 这种结构性异构服务的;在 forge 当前只跑 dense decoder + GQA 的情况下,拆 per-model crate 是 over-engineering。等到加 MoE 才是真分叉契机。
+
+### A2. CUDA Graphs / `KvPool::padding_permit`(第 4 节第 2 条 / 第 6 节优先级)
+
+原文把 CUDA Graphs 列入 Phase A 优先级,并把 pega 的 `KvPool::padding_permit` 当作 forge Task 5 的关键 unblock。
+
+**ROADMAP.md 已把 GB10 上的 CUDA Graphs 列为 Non-goal**:`cuGraphLaunch` 在 GB10 上 +3 ms/step(eager 模式靠 host-GPU 提交/执行重叠摊销 launch cost;graph 一次性提交反而失这种重叠)。这是 GB10 驱动行为,不是 forge bug。证据见 memory `forge-decode-host-bound`。
+
+**对策**:`padding_permit` 模式只在 Hopper / Blackwell 上线后才值得借鉴;"finish CUDA Graphs (in progress)" 的建议作废。
+
+### A3. 修订后的 Phase A 优先级
+
+1. ~~CUDA Graphs~~(GB10 上 Non-goal)→ 改攻 **MoE 架构**(Mixtral 最自然,因为 pega 的 Qwen3.5 / DSv4 / Kimi-K2 都是 MoE,且 MoE 是逼出 per-model crate 边界的真契机)
+2. **W4A16 / Marlin 量化**(forge 当前 Q8_0 单流胜出 1.54×,W4A16 是 batch serving 主流)
+3. **多 GPU TP/EP**(等双 DGX-Spark 链路就绪)
+
+**未变化的判定**:第 2 节 "CUDA 集成纯度" + 第 5 节 "pegainfer 可以从 forge 借鉴" + 多 GPU 工作量评估,事实上都仍然成立。

@@ -34,7 +34,7 @@ Forge is a Rust workspace with 13 crates:
 | `forge-runtime` | Engine runtime loop, sampling, FSM constraints |
 | `forge-scheduler` | Continuous batching scheduler |
 | `forge-kvcache` | KV cache (naive + paged block manager) |
-| `forge-models/forge-model-llama` | Llama model implementation |
+| `forge-models/forge-transformer` | Decoder-transformer impl (Llama / Qwen2 / Qwen3 / Mistral); see `forge-transformer::registry::SUPPORTED_ARCHITECTURES` |
 | `forge-loader` | SafeTensors weight loader (F32, F16, BF16→F16) |
 | `forge-kernels` | CUDA C++ kernels + FFI bindings |
 | `forge-transport` | Communication abstraction (in-process, future: gRPC) |

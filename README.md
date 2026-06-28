@@ -12,7 +12,7 @@ A from-scratch LLM inference server written in Rust with CUDA acceleration.
 - **GPU-native attention** — extract/mask/interleave ops run as CUDA kernels with no CPU roundtrip
 - **GGUF model loading** with Q4_K_M and Q8_0 dequantization
 - **CUDA + CPU backends** — feature-gated CUDA for CPU-only builds
-- **Llama model family** support (Llama 2/3, TinyLlama, etc.)
+- **Decoder-transformer family** support — `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `MistralForCausalLM` share one parameterized implementation; optional features (Qwen2 QKV bias, Qwen3 per-head QK-norm) are detected from the weight set
 
 ## Architecture
 
@@ -24,7 +24,7 @@ forge-backend-cuda  CUDA backend (cuBLAS + custom kernels)
 forge-kernels       CUDA kernel sources (elementwise, norm, positional, memory, attention)
 forge-kvcache       Naive and paged KV cache implementations
 forge-loader        SafeTensors + GGUF model loaders
-forge-model-llama   Llama model (attention, FFN, RoPE, GQA)
+forge-transformer   Decoder-transformer model (Llama / Qwen2 / Qwen3 / Mistral): attention, FFN, RoPE, GQA, optional QKV bias + QK-norm
 forge-runtime       Engine loop, sampling, FSM constraints, speculative decoding
 forge-scheduler     Continuous batching scheduler
 forge-server        Axum HTTP server, OpenAI-compatible API
@@ -38,7 +38,7 @@ forge-quantize      Quantization scaffolding
 
 - Rust stable (see `rust-toolchain.toml`)
 - CUDA toolkit 12.x+ (for GPU backend)
-- A Llama-family model in SafeTensors or GGUF format
+- A supported decoder-transformer model in SafeTensors or GGUF format (Llama 2/3, Qwen2, Qwen3, Mistral, etc.)
 
 ### Build
 
